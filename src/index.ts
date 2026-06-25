@@ -23,7 +23,7 @@ declare const Modes: { animate?: boolean; edit?: boolean } | undefined
 declare const THREE: any
 
 const PLUGIN_ID = 'spring_bone'
-const PLUGIN_VERSION = '0.0.5'
+const PLUGIN_VERSION = '0.0.6'
 
 // Phase 1 PoC 設定。 Phase 3 で per-bone UI / property に置き換える。
 const BONE_NAME_PREFIX = 'spring_'
