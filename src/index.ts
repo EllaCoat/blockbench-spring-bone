@@ -23,7 +23,7 @@ declare const Modes: { animate?: boolean; edit?: boolean } | undefined
 declare const THREE: any
 
 const PLUGIN_ID = 'spring_bone'
-const PLUGIN_VERSION = '0.0.4'
+const PLUGIN_VERSION = '0.0.5'
 
 // Phase 1 PoC 設定。 Phase 3 で per-bone UI / property に置き換える。
 const BONE_NAME_PREFIX = 'spring_'
@@ -42,7 +42,6 @@ interface BoneEntry {
 	config: SpringConfig
 	state: SpringState
 	restLocalDir: any
-	restEulerDeg: [number, number, number]  // animate モード外で rest pose に戻すための保存値
 }
 
 const registry = new Map<string, BoneEntry>()
@@ -92,27 +91,12 @@ function registerGroup(group: any): void {
 			restLocalDir = d.dir
 		}
 	}
-	const r = group.rotation
-	const restEulerDeg: [number, number, number] =
-		Array.isArray(r) && r.length === 3 ? [r[0], r[1], r[2]] : [0, 0, 0]
 	registry.set(group.uuid, {
 		group,
 		config: { ...DEFAULT_CONFIG, restLength },
 		state: createState(),
 		restLocalDir,
-		restEulerDeg,
 	})
-}
-
-// animate モード外では物理結果を rest pose に戻す (= Edit / Paint / Display タブで原典姿勢を保つ)
-function restoreRestPose(): void {
-	for (const entry of registry.values()) {
-		const r = entry.group?.rotation
-		if (!Array.isArray(r) || r.length !== 3) continue
-		r[0] = entry.restEulerDeg[0]
-		r[1] = entry.restEulerDeg[1]
-		r[2] = entry.restEulerDeg[2]
-	}
 }
 
 function rescanRegistry(): void {
@@ -175,7 +159,6 @@ function stepAll(dt: number): void {
 
 function applyAll(): void {
 	if (registry.size === 0) return
-	const RAD2DEG = 180 / Math.PI
 	const anchorWorld = new THREE.Vector3()
 	const forward = new THREE.Vector3()
 	const up = new THREE.Vector3()
@@ -189,8 +172,7 @@ function applyAll(): void {
 
 	for (const entry of registry.values()) {
 		if (!entry.state.initialized) continue
-		const g = entry.group
-		const mesh = g.mesh
+		const mesh = entry.group?.mesh
 		const parent = mesh?.parent
 		if (!mesh || !parent) continue
 
@@ -218,17 +200,16 @@ function applyAll(): void {
 		parentInv.copy(parentQuat).invert()
 		quat.premultiply(parentInv)
 
-		// BB Group の rotation は ZYX Euler / 度数表記 (= AJ interaction.ts:336 と整合)
-		euler.setFromQuaternion(quat, 'ZYX')
-		const rx = euler.x * RAD2DEG
-		const ry = euler.y * RAD2DEG
-		const rz = euler.z * RAD2DEG
-
-		if (Array.isArray(g.rotation) && g.rotation.length === 3) {
-			g.rotation[0] = rx
-			g.rotation[1] = ry
-			g.rotation[2] = rz
-		}
+		// **BB の anim 経路は mesh.rotation (= Three.js Euler ラジアン) を直接いじる**
+		// (= timeline_animators.js:750 が `mesh.rotation.x += ...` で書く / showDefaultPose が
+		// `mesh.rotation.copy(mesh.fix_rotation)` で rest 復元)。
+		// Group.rotation 配列 (= 度数 JSON 値) は触らない (= edit mode の rest 値として温存)。
+		// mesh.rotation.order は format 依存 (= Format.euler_order、 ZYX or XYZ)、 既存値を温存。
+		const order = mesh.rotation.order || 'ZYX'
+		euler.setFromQuaternion(quat, order)
+		mesh.rotation.x = euler.x
+		mesh.rotation.y = euler.y
+		mesh.rotation.z = euler.z
 	}
 }
 
@@ -330,15 +311,9 @@ function installTickLoop(): () => void {
 		rescanRegistry()
 	}
 	const onModeChange = (): void => {
-		// animate モード以外に切り替わった瞬間 = 物理結果を rest pose に戻す
-		// (= keyframe が無い spring bone は applyPoseAt 経由では戻らない、 自前で書き戻し)
-		if (!Modes?.animate) {
-			restoreRestPose()
-			simTime = -1
-		} else {
-			// animate モードに入った瞬間 = sim を再初期化 (= 次 tick で replayFromStart 走る)
-			simTime = -1
-		}
+		// mode 切替 = sim 状態を捨てる (= 次 animate モード復帰時に頭から replay)
+		// mesh.rotation は BB 側が animate leave / showDefaultPose 経路で自動 rest 復帰するので触らない
+		simTime = -1
 	}
 
 	Blockbench.on('display_animation_frame', onAnimFrame)
@@ -351,8 +326,6 @@ function installTickLoop(): () => void {
 		Blockbench.removeListener?.('select_project', onProjectSwitch)
 		Blockbench.removeListener?.('update_selection', onUpdateSelection)
 		Blockbench.removeListener?.('select_mode', onModeChange)
-		// plugin unload 時にも物理結果を rest に戻す (= cleanup として)
-		restoreRestPose()
 		registry.clear()
 		simTime = -1
 	}
