@@ -42,6 +42,7 @@ interface BoneEntry {
 	config: SpringConfig
 	state: SpringState
 	restLocalDir: any
+	lastRight: any | null  // 前 frame の right vector (= basis hysteresis、 z flip 対策)
 }
 
 const registry = new Map<string, BoneEntry>()
@@ -96,6 +97,7 @@ function registerGroup(group: any): void {
 		config: { ...DEFAULT_CONFIG, restLength },
 		state: createState(),
 		restLocalDir,
+		lastRight: null,
 	})
 }
 
@@ -181,18 +183,33 @@ function applyAll(): void {
 		if (forward.lengthSq() < 1e-8) continue
 		forward.normalize()
 
-		// 親の world Y を Up として採用 (= 親の roll に追従する自然な挙動)
 		parent.getWorldQuaternion(parentQuat)
-		up.set(0, 1, 0).applyQuaternion(parentQuat)
-		if (Math.abs(forward.dot(up)) > 0.999) {
-			// forward と up がほぼ平行ならジンバル方向、 fallback で local Z 軸
-			up.set(0, 0, 1).applyQuaternion(parentQuat)
-		}
 
-		// 基底 : right = up × forward, trueUp = forward × right
-		// Group の local Y を forward 方向に向ける
-		right.crossVectors(up, forward).normalize()
+		// basis 構築 : 前 frame の right を forward 直交平面に投影する parallel transport で
+		// 連続性を担保 (= 旧 fallback の硬切替で Euler.z=180 flip が出ていた対策)。
+		// 初回 / 投影縮退時のみ 親 Y 軸 fallback (= 親 roll への追従)、 さらに forward と
+		// 並行ならば 親 Z 軸 fallback。
+		let basisOk = false
+		if (entry.lastRight) {
+			const fDotR = forward.dot(entry.lastRight)
+			right.copy(entry.lastRight).addScaledVector(forward, -fDotR)
+			if (right.lengthSq() > 1e-4) {
+				right.normalize()
+				basisOk = true
+			}
+		}
+		if (!basisOk) {
+			up.set(0, 1, 0).applyQuaternion(parentQuat)
+			if (Math.abs(forward.dot(up)) > 0.999) {
+				up.set(0, 0, 1).applyQuaternion(parentQuat)
+			}
+			right.crossVectors(up, forward).normalize()
+		}
 		trueUp.crossVectors(forward, right).normalize()
+
+		// 次 frame の hysteresis 用に right を保存
+		if (!entry.lastRight) entry.lastRight = new THREE.Vector3()
+		entry.lastRight.copy(right)
 		mat.makeBasis(right, forward, trueUp)
 		quat.setFromRotationMatrix(mat)
 
@@ -236,7 +253,10 @@ function advanceSimTo(targetTime: number, maxSteps: number): void {
 }
 
 function replayFromStart(targetTime: number): void {
-	for (const entry of registry.values()) entry.state.initialized = false
+	for (const entry of registry.values()) {
+		entry.state.initialized = false
+		entry.lastRight = null
+	}
 	simTime = 0
 	// 各 entry の state を rest tip 位置で初期化 (= simTime=0 での rig を当ててから)
 	applyPoseAt(0)
