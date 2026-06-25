@@ -1,7 +1,18 @@
 // blockbench-spring-bone — Blockbench plugin
 // Spring bone physics simulation for hair / cloth / accessory bones.
-// Verlet integration + spring + damper、 リアルタイム editor preview。
-// AnimatedJava の export bake は Phase 5 で別経路を作る。
+// v0.0.9 で deterministic replay 方式に切替 :
+//   - 物理 sim 進行を simTime (= 0 基準の sim 内部時刻) ベースに変更
+//   - 毎 tick で currentTime を FIXED_DT 単位に snap、 0 → targetSimTime まで FIXED_DT で完走
+//   - 通常前進は cache (= 前 simTime) から進める軽量化、 逆行 / 大ジャンプは 0 から replay
+//   - 結果 = frame ごとに値固定、 scrub 速度 / 履歴に依存しない、 巨大 dt 爆発なし
+//   - 旧 accumulator (leftoverTime) + scrub_reset 機構は全廃 (= 履歴依存で deterministic でなかった)
+//   - rescanRegistry を idempotent 化 (= 既存 entry の state を保持、 ボーンクリック時のリセット解消)
+//   - applyAll は v0.0.8 の setFromUnitVectors 経路 (= 反射 basis half-lock 真因 fix) を維持
+//   - 物理は v0.0.7 の VRM SpringBone 風 force injection (= boneAxis * stiffness * dt 注入) を維持
+// Loop 連続性 = keyframe 側責任。 deterministic replay の構造上 loop wrap (= time 2.0 → 0) で
+//   spring 慣性 state は rest に戻る (= replayFromStartTo(0) で resetAllToRest)。 周期境界での
+//   ガクつきを避けるには「アニメ末端で物理が rest に収まる長さ」 で設計する必要あり。
+//   残った場合は Phase 5 のベイク機能で微調整する方針 (= 過剰な loop seamless 機構は入れない)。
 
 import { createState, resetState, step, type SpringConfig, type SpringState } from './springSim'
 
@@ -23,31 +34,30 @@ declare const Modes: { animate?: boolean; edit?: boolean } | undefined
 declare const THREE: any
 
 const PLUGIN_ID = 'spring_bone'
-const PLUGIN_VERSION = '0.0.6'
+const PLUGIN_VERSION = '0.0.9'
 
 // Phase 1 PoC 設定。 Phase 3 で per-bone UI / property に置き換える。
 const BONE_NAME_PREFIX = 'spring_'
+
+// 物理パラ (= VRM SpringBone デフォルト相当)
 const FIXED_DT = 1 / 60
-const MAX_SUBSTEPS_PER_TICK = 16  // 通常 tick 内の上限 (= 大きく遅延した時の暴走防止)
+// 0.5s 超の前進は cache 経路が重くなる + scrub の大ジャンプ判定なので 0 から replay に流す
+const FAST_FORWARD_THRESHOLD = 0.5
 const DEFAULT_CONFIG: Omit<SpringConfig, 'restLength'> = {
-	mass: 1.0,
-	stiffness: 50.0,
-	damping: 4.0,
+	drag: 0.05,        // 速度減衰 = 5% / step (= ふんわり残響、 VRM デフォルト相当)
+	stiffness: 1.0,    // 親方向への引力係数
 }
-// scrub 判定 : 前回 tick から time が逆行 / 大ジャンプしたら頭から replay
-const SCRUB_FORWARD_THRESHOLD = 0.25
 
 interface BoneEntry {
 	group: any
 	config: SpringConfig
 	state: SpringState
 	restLocalDir: any
-	lastRight: any | null  // 前 frame の right vector (= basis hysteresis、 z flip 対策)
 }
 
 const registry = new Map<string, BoneEntry>()
-let simTime = -1            // sim 状態が表現してる animation 内部時刻 (= 秒、 -1 = 未初期化)
-let inhibitTick = false      // applyPoseAt 由来の再描画で tick が再入するのを防ぐ
+let simTime = -1          // 現在 sim 状態が表現してる時刻 (= 秒)、 -1 = 未初期化
+let inhibitTick = false   // applyPoseAt 由来の再描画で tick が再入するのを防ぐ
 
 function isSpringGroup(group: unknown): boolean {
 	const name = (group as { name?: unknown } | null)?.name
@@ -97,7 +107,6 @@ function registerGroup(group: any): void {
 		config: { ...DEFAULT_CONFIG, restLength },
 		state: createState(),
 		restLocalDir,
-		lastRight: null,
 	})
 }
 
@@ -138,24 +147,23 @@ function getAnchorWorld(entry: BoneEntry, out: any): boolean {
 	return true
 }
 
-function getRestTipWorld(entry: BoneEntry, anchorWorld: any, out: any): boolean {
+function getBoneAxisWorld(entry: BoneEntry, out: any): boolean {
 	const parent = entry.group.mesh?.parent
 	if (!parent) return false
 	const parentQuat = new THREE.Quaternion()
 	parent.getWorldQuaternion(parentQuat)
-	const restDirWorld = entry.restLocalDir.clone().applyQuaternion(parentQuat)
-	out.copy(anchorWorld).addScaledVector(restDirWorld, entry.config.restLength)
+	out.copy(entry.restLocalDir).applyQuaternion(parentQuat)
 	return true
 }
 
 function stepAll(dt: number): void {
 	if (registry.size === 0) return
 	const anchorWorld = new THREE.Vector3()
-	const restTipWorld = new THREE.Vector3()
+	const boneAxisWorld = new THREE.Vector3()
 	for (const entry of registry.values()) {
 		if (!getAnchorWorld(entry, anchorWorld)) continue
-		if (!getRestTipWorld(entry, anchorWorld, restTipWorld)) continue
-		step(entry.state, anchorWorld, restTipWorld, entry.config, dt)
+		if (!getBoneAxisWorld(entry, boneAxisWorld)) continue
+		step(entry.state, anchorWorld, boneAxisWorld, entry.config, dt)
 	}
 }
 
@@ -163,13 +171,10 @@ function applyAll(): void {
 	if (registry.size === 0) return
 	const anchorWorld = new THREE.Vector3()
 	const forward = new THREE.Vector3()
-	const up = new THREE.Vector3()
-	const right = new THREE.Vector3()
-	const trueUp = new THREE.Vector3()
 	const parentQuat = new THREE.Quaternion()
 	const parentInv = new THREE.Quaternion()
-	const mat = new THREE.Matrix4()
-	const quat = new THREE.Quaternion()
+	const localForward = new THREE.Vector3()
+	const localQuat = new THREE.Quaternion()
 	const euler = new THREE.Euler()
 
 	for (const entry of registry.values()) {
@@ -184,92 +189,53 @@ function applyAll(): void {
 		forward.normalize()
 
 		parent.getWorldQuaternion(parentQuat)
-
-		// basis 構築 : 前 frame の right を forward 直交平面に投影する parallel transport で
-		// 連続性を担保 (= 旧 fallback の硬切替で Euler.z=180 flip が出ていた対策)。
-		// 初回 / 投影縮退時のみ 親 Y 軸 fallback (= 親 roll への追従)、 さらに forward と
-		// 並行ならば 親 Z 軸 fallback。
-		let basisOk = false
-		if (entry.lastRight) {
-			const fDotR = forward.dot(entry.lastRight)
-			right.copy(entry.lastRight).addScaledVector(forward, -fDotR)
-			if (right.lengthSq() > 1e-4) {
-				right.normalize()
-				basisOk = true
-			}
-		}
-		if (!basisOk) {
-			up.set(0, 1, 0).applyQuaternion(parentQuat)
-			if (Math.abs(forward.dot(up)) > 0.999) {
-				up.set(0, 0, 1).applyQuaternion(parentQuat)
-			}
-			right.crossVectors(up, forward).normalize()
-		}
-		trueUp.crossVectors(forward, right).normalize()
-
-		// 次 frame の hysteresis 用に right を保存
-		if (!entry.lastRight) entry.lastRight = new THREE.Vector3()
-		entry.lastRight.copy(right)
-		mat.makeBasis(right, forward, trueUp)
-		quat.setFromRotationMatrix(mat)
-
-		// world → local 化 : 親 world quat の inverse を premultiply
 		parentInv.copy(parentQuat).invert()
-		quat.premultiply(parentInv)
 
-		// **BB の anim 経路は mesh.rotation (= Three.js Euler ラジアン) を直接いじる**
-		// (= timeline_animators.js:750 が `mesh.rotation.x += ...` で書く / showDefaultPose が
-		// `mesh.rotation.copy(mesh.fix_rotation)` で rest 復元)。
-		// Group.rotation 配列 (= 度数 JSON 値) は触らない (= edit mode の rest 値として温存)。
-		// mesh.rotation.order は format 依存 (= Format.euler_order、 ZYX or XYZ)、 既存値を温存。
+		// world forward を parent local 化 → restLocalDir からこの方向に向ける最短回転を直接計算。
+		// 旧 basis 構築 (= forward / right / trueUp + lastRight parallel transport) は
+		// trueUp = forward × right が left-handed (= 反射) basis を生み、 setFromRotationMatrix
+		// が非単位 quat を返し、 Euler 抽出で角度が「正確に半分」 になっていた (= half-lock の真因)。
+		// setFromUnitVectors は restLocalDir → localForward の最短回転を直接計算するので、
+		// 反射トラップ + +Y 軸固定仮定 + lastRight hysteresis を一気に解消、 連続性も自然に担保。
+		localForward.copy(forward).applyQuaternion(parentInv)
+		localQuat.setFromUnitVectors(entry.restLocalDir, localForward)
+
 		const order = mesh.rotation.order || 'ZYX'
-		euler.setFromQuaternion(quat, order)
+		euler.setFromQuaternion(localQuat, order)
 		mesh.rotation.x = euler.x
 		mesh.rotation.y = euler.y
 		mesh.rotation.z = euler.z
 	}
 }
 
-// simTime → targetTime まで固定 dt で sub-step。 各 step で applyPoseAt(time) で
-// その時刻の親 rig を当ててから stepAll を呼ぶ (= deterministic replay)。
-function advanceSimTo(targetTime: number, maxSteps: number): void {
-	if (registry.size === 0) {
-		simTime = targetTime
-		return
-	}
-	let count = 0
-	while (simTime < targetTime - 1e-6 && count < maxSteps) {
-		const dt = Math.min(FIXED_DT, targetTime - simTime)
-		simTime += dt
-		applyPoseAt(simTime)
-		stepAll(dt)
-		count++
-	}
-	if (count >= maxSteps && simTime < targetTime - 1e-3) {
-		// 上限到達 = 残り取りこぼし、 強制的に追いつかせる (= safety)
-		simTime = targetTime
-		applyPoseAt(simTime)
+// 全 entry の state を「現時刻 frame の rest 位置」 にリセット (= scrub / 初回 invoke 時)
+function resetAllToRest(): void {
+	const anchorWorld = new THREE.Vector3()
+	const boneAxisWorld = new THREE.Vector3()
+	const restTip = new THREE.Vector3()
+	for (const entry of registry.values()) {
+		if (!getAnchorWorld(entry, anchorWorld)) continue
+		if (!getBoneAxisWorld(entry, boneAxisWorld)) continue
+		restTip.copy(anchorWorld).addScaledVector(boneAxisWorld, entry.config.restLength)
+		resetState(entry.state, restTip)
 	}
 }
 
-function replayFromStart(targetTime: number): void {
-	for (const entry of registry.values()) {
-		entry.state.initialized = false
-		entry.lastRight = null
-	}
-	simTime = 0
-	// 各 entry の state を rest tip 位置で初期化 (= simTime=0 での rig を当ててから)
+// 0 → targetTime まで FIXED_DT 単位で fixed-dt sub-step 完走 (= deterministic replay の起点)
+function replayFromStartTo(targetTime: number): void {
 	applyPoseAt(0)
-	const anchorWorld = new THREE.Vector3()
-	const restTipWorld = new THREE.Vector3()
-	for (const entry of registry.values()) {
-		if (!getAnchorWorld(entry, anchorWorld)) continue
-		if (!getRestTipWorld(entry, anchorWorld, restTipWorld)) continue
-		resetState(entry.state, restTipWorld)
+	resetAllToRest()
+	simTime = 0
+	advanceSimTo(targetTime)
+}
+
+// 現 simTime から targetTime まで FIXED_DT 単位で sub-step (= cache 経路 + replay の共通実装)
+function advanceSimTo(targetTime: number): void {
+	while (simTime + FIXED_DT <= targetTime + 1e-6) {
+		applyPoseAt(simTime + FIXED_DT)
+		stepAll(FIXED_DT)
+		simTime += FIXED_DT
 	}
-	// 0 → targetTime まで sub-step 上限なしで一気に進める (= 60fps × 数秒なら数百 step、 軽い)
-	const maxSteps = Math.ceil(Math.max(targetTime, 0) / FIXED_DT) + 4
-	advanceSimTo(targetTime, maxSteps)
 }
 
 function tick(): void {
@@ -278,34 +244,24 @@ function tick(): void {
 		simTime = -1
 		return
 	}
-	// animate モード外 = 物理シム走らせない、 sim 状態もリセット (= 次回戻り時は頭から)
 	if (!Modes?.animate) {
 		simTime = -1
 		return
 	}
 	const currentTime = (Timeline?.time as number) ?? 0
 
-	if (simTime < 0) {
-		// 初回 / project 切替直後 = 頭から replay
-		replayFromStart(currentTime)
-		applyAll()
-		return
-	}
+	// currentTime を FIXED_DT 単位に snap (= frame ごとの値固定、 deterministic 確保)
+	const targetSimTime = Math.max(0, Math.floor(currentTime / FIXED_DT) * FIXED_DT)
 
-	const delta = currentTime - simTime
-	if (delta < -1e-6 || delta > SCRUB_FORWARD_THRESHOLD) {
-		// 逆行 or 大ジャンプ = スクラブ扱い、 頭から replay
-		replayFromStart(currentTime)
-	} else if (delta > 1e-6) {
-		// 通常前進 = simTime から currentTime まで sub-step
-		advanceSimTo(currentTime, MAX_SUBSTEPS_PER_TICK)
+	if (simTime < 0 || targetSimTime < simTime - 1e-6 || targetSimTime - simTime > FAST_FORWARD_THRESHOLD) {
+		// 初回 / 逆行 / 大ジャンプ = 0 から replay (= deterministic 完全保証)
+		replayFromStartTo(targetSimTime)
+	} else if (targetSimTime > simTime + 1e-6) {
+		// 通常前進 = cache (= 前 simTime) から進める (= 軽量化、 1 tick で 1-3 step)
+		advanceSimTo(targetSimTime)
 	}
-	// delta == 0 = 一時停止中の同 frame 再描画、 step なし
+	// 同時刻 (= |targetSimTime - simTime| < 1e-6) = sim 進めない (= state 不変、 描画のみ)
 
-	// applyPoseAt は advanceSimTo / replayFromStart 内の最後の sub-step で
-	// currentTime に rig を戻している。 ここで再度呼ぶと spring_tail に rest pose を
-	// 上書きしてしまう (= keyframe 無いと stackAnimations が rest で塗り直す)
-	// ので tick 末尾では呼ばない。
 	applyAll()
 }
 
@@ -328,11 +284,11 @@ function installTickLoop(): () => void {
 		simTime = -1
 	}
 	const onUpdateSelection = (): void => {
+		// idempotent rescan で既存 entry の state は保持、 simTime もそのまま (= 物理継続)。
 		rescanRegistry()
 	}
 	const onModeChange = (): void => {
-		// mode 切替 = sim 状態を捨てる (= 次 animate モード復帰時に頭から replay)
-		// mesh.rotation は BB 側が animate leave / showDefaultPose 経路で自動 rest 復帰するので触らない
+		// mode 切替で sim 状態を捨てる (= 次 animate モード復帰時に頭から replay)
 		simTime = -1
 	}
 
@@ -355,7 +311,7 @@ Plugin.register(PLUGIN_ID, {
 	title: 'Spring Bone',
 	author: 'EllaCoat',
 	description:
-		'Spring bone physics (Verlet + spring + damper) for hair / cloth / accessory bones. Real-time preview in the editor and AnimatedJava export bake.',
+		'Spring bone physics (deterministic replay + VRM SpringBone 風 force injection) for hair / cloth / accessory bones. Real-time preview in the editor and AnimatedJava export bake.',
 	icon: 'gesture',
 	variant: 'desktop',
 	version: PLUGIN_VERSION,

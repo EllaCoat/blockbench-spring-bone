@@ -1,12 +1,14 @@
-// Verlet integration + spring force + length constraint。
-// BB / AJ / THREE の API には依存しない pure な物理 step を提供する。
+// VRM SpringBone / Dynamic Bone 風 Verlet。 BB / AJ / THREE の API には依存しない pure な物理 step。
+// v0.0.7 で「親 rotation を spring 加速度の "位置目標" に流し込む」 旧設計を廃止し、
+// 「親 rotation を希望方向 (= boneAxis) として "力" で毎 step 注入する」 産業標準パターンに変更。
+// 旧設計は anchor が curved path で動くため snap が中途半端な代数的固定点を作り、
+// 「parent.x × −0.5 で同位相の半分張り付き」 + 慣性余韻ゼロ という挙動になっていた。
 
 declare const THREE: any
 
 export interface SpringConfig {
-	mass: number       // 質量 (= 既定 1.0)
-	stiffness: number  // 仮想末端を rest 方向に引き戻すバネ係数
-	damping: number    // 速度減衰係数 (= 1/秒 単位、 exp(-damping*dt) で適用)
+	drag: number       // 速度減衰係数 (= 0 = 完全慣性、 1 = 即停止)、 既定 0.05
+	stiffness: number  // 親方向への引力係数、 既定 1.0
 	restLength: number // 親 pivot から仮想末端までの距離 (= tipDistance)
 }
 
@@ -30,57 +32,60 @@ export function resetState(state: SpringState, restTipWorld: any): void {
 	state.initialized = true
 }
 
-// Verlet 1 step。 入力 :
-//   state         = 仮想末端の現在 / 前 step world 位置
-//   anchorWorld   = 親 Group pivot の world 座標
-//   restTipWorld  = 親 pivot + (親 rotation * 親→子方向 * restLength) で得る、 静止時に末端が居るべき world 座標
-//   config        = mass / stiffness / damping / restLength
-//   dt            = 時間刻み (= 1/60 想定)
+// VRM SpringBone 風 1 step :
+//   state          = 仮想末端の現在 / 前 step world 位置
+//   anchorWorld    = 親 bone の world pos (= sim 全体で「中心」、 length constraint の中心)
+//   boneAxisWorld  = 親 world quat × restLocalDir = 親が回ると変化する「希望方向」
+//                    (= 親 +X 回転で boneAxis が +X 旋回、 spring tip がここに向かう力で引かれる)
+//   config         = drag / stiffness / restLength
+//   dt             = 時間刻み (= 1/60 想定)
+//
+// 設計 :
+//   - 慣性 = (curr - prev) * (1 - drag) で自然に維持 (= velocity を陽に持たず Verlet で暗黙)
+//   - 親回転由来の力 = boneAxis * stiffness * dt を nextTail に毎 step 加算 (= 産業標準)
+//   - length constraint = anchor からの距離を restLength に hard snap
+//   - 旧設計の「親 rotation で動いた rest tip 位置を spring 加速度の目標にする」 は廃止
 export function step(
 	state: SpringState,
 	anchorWorld: any,
-	restTipWorld: any,
+	boneAxisWorld: any,
 	config: SpringConfig,
 	dt: number,
 ): void {
 	if (!state.initialized) {
-		resetState(state, restTipWorld)
+		const restTip = new THREE.Vector3()
+			.copy(anchorWorld)
+			.addScaledVector(boneAxisWorld, config.restLength)
+		resetState(state, restTip)
 		return
 	}
 
-	// spring 加速度 = (restTip - pos) * stiffness / mass
-	const accel = new THREE.Vector3()
-		.subVectors(restTipWorld, state.pos)
-		.multiplyScalar(config.stiffness / Math.max(config.mass, 1e-6))
-
-	// 速度減衰 (= 指数減衰、 dt 変動に強い)
-	const decay = Math.exp(-config.damping * dt)
-	const displacement = new THREE.Vector3()
+	// 慣性 = 前 step displacement を drag で減衰
+	const inertia = new THREE.Vector3()
 		.subVectors(state.pos, state.prevPos)
-		.multiplyScalar(decay)
+		.multiplyScalar(1 - config.drag)
 
-	// Verlet : nextPos = pos + displacement + accel * dt^2
+	// 親回転由来の力 = boneAxis 方向に毎 step 引き寄せる
+	// (= 親が回ると boneAxis が変わる → spring tip が次第に新方向に追従、 慣性 lag が出る)
+	const stiffnessForce = new THREE.Vector3()
+		.copy(boneAxisWorld)
+		.multiplyScalar(config.stiffness * dt)
+
 	const next = new THREE.Vector3()
 		.copy(state.pos)
-		.add(displacement)
-		.addScaledVector(accel, dt * dt)
+		.add(inertia)
+		.add(stiffnessForce)
 
-	// length constraint : anchor からの距離を restLength に強制
+	// length constraint : anchor からの距離を restLength に hard snap
 	const dir = new THREE.Vector3().subVectors(next, anchorWorld)
 	const len = dir.length()
 	if (len > 1e-6) {
 		dir.multiplyScalar(config.restLength / len)
 		next.copy(anchorWorld).add(dir)
 	} else {
-		next.copy(restTipWorld)
+		next.copy(anchorWorld).addScaledVector(boneAxisWorld, config.restLength)
 	}
 
-	// 前進更新 (= 旧版の偽速度補正は廃止)。
-	// 静止 anchor 想定では「constraint snap を velocity に変えない」 偽速度補正が
-	// 安定化に効くが、 動 anchor (= 親回転で anchor が curved path で動く) では
-	// snap 量 ≈ ΔAnchor が物理的に意味のある velocity (= 振り子が手の動きに
-	// 引っ張られる成分) になる。 旧版で snap 量を velocity から消すと anchor 並進
-	// も同時に消えて「rest tip に剛体追従する半分張り付き」状態になっていた。
 	state.prevPos.copy(state.pos)
 	state.pos.copy(next)
 }
