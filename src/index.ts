@@ -110,10 +110,25 @@ function registerGroup(group: any): void {
 	})
 }
 
+// idempotent rescan : 既存 entry の state は保持、 不在 group のみ削除、 新規 group のみ追加。
+// 旧版は registry.clear() で全滅 → 再 register で state がリセットされていた
+// (= update_selection event 経由のボーンクリックで物理状態が初期化される問題の真因)。
 function rescanRegistry(): void {
-	registry.clear()
 	const groups = (Project as { groups?: unknown[] } | null)?.groups
-	if (!Array.isArray(groups)) return
+	if (!Array.isArray(groups)) {
+		registry.clear()
+		return
+	}
+	const currentUuids = new Set<string>()
+	for (const g of groups) {
+		if (isSpringGroup(g)) {
+			const uuid = (g as any).uuid
+			if (typeof uuid === 'string') currentUuids.add(uuid)
+		}
+	}
+	for (const uuid of Array.from(registry.keys())) {
+		if (!currentUuids.has(uuid)) registry.delete(uuid)
+	}
 	for (const g of groups) {
 		if (isSpringGroup(g)) registerGroup(g as any)
 	}
