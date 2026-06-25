@@ -65,9 +65,6 @@ export function step(
 		.add(displacement)
 		.addScaledVector(accel, dt * dt)
 
-	// constraint 適用前の位置を保存 (= 偽速度補正のため)
-	const preConstraint = next.clone()
-
 	// length constraint : anchor からの距離を restLength に強制
 	const dir = new THREE.Vector3().subVectors(next, anchorWorld)
 	const len = dir.length()
@@ -78,11 +75,12 @@ export function step(
 		next.copy(restTipWorld)
 	}
 
-	// 偽速度補正 (= length constraint で snap した分、 prevPos も同方向にシフト
-	// しないと次 step で「強制移動 = 巨大速度」 として誤検出され爆発する)
-	const correction = new THREE.Vector3().subVectors(next, preConstraint)
-
+	// 前進更新 (= 旧版の偽速度補正は廃止)。
+	// 静止 anchor 想定では「constraint snap を velocity に変えない」 偽速度補正が
+	// 安定化に効くが、 動 anchor (= 親回転で anchor が curved path で動く) では
+	// snap 量 ≈ ΔAnchor が物理的に意味のある velocity (= 振り子が手の動きに
+	// 引っ張られる成分) になる。 旧版で snap 量を velocity から消すと anchor 並進
+	// も同時に消えて「rest tip に剛体追従する半分張り付き」状態になっていた。
 	state.prevPos.copy(state.pos)
-	state.prevPos.add(correction)
 	state.pos.copy(next)
 }
