@@ -53,9 +53,17 @@ interface BoneEntry {
 	config: SpringConfig
 	state: SpringState
 	restLocalDir: any
+	// chain 情報。 parentUuid = 直上の spring group の uuid (= root なら null)、
+	// depth = chain root からの距離 (= root なら 0、 rebuildTopoOrder で再計算)。
+	parentUuid: string | null
+	depth: number
 }
 
 const registry = new Map<string, BoneEntry>()
+// topoOrder = registry のキーを chain root → leaf の順に並べた配列。
+// depth 昇順、 tie-break は Project.groups の出現順 (= deterministic 確保)。
+// Phase 2 で stepAll / applyAll の逐次 pass の iteration 順に使う。
+let topoOrder: string[] = []
 let simTime = -1          // 現在 sim 状態が表現してる時刻 (= 秒)、 -1 = 未初期化
 let inhibitTick = false   // applyPoseAt 由来の再描画で tick が再入するのを防ぐ
 
@@ -102,21 +110,80 @@ function registerGroup(group: any): void {
 			restLocalDir = d.dir
 		}
 	}
+	// 親 group が spring group (= 名前が spring_ prefix) なら chain 中間、
+	// でなければ chain root。 parent が "root" 文字列や null のケースも root 扱い。
+	const parent = (group as { parent?: unknown }).parent
+	const parentUuid =
+		parent && typeof parent === 'object' && isSpringGroup(parent)
+			? (typeof (parent as { uuid?: unknown }).uuid === 'string'
+					? (parent as { uuid: string }).uuid
+					: null)
+			: null
 	registry.set(group.uuid, {
 		group,
 		config: { ...DEFAULT_CONFIG, restLength },
 		state: createState(),
 		restLocalDir,
+		parentUuid,
+		depth: 0, // rebuildTopoOrder で再計算される
 	})
+}
+
+// registry の各 entry に depth を割り付けつつ topoOrder を再構築する。
+// - depth = 自 entry から chain root までの距離 (= parentUuid を辿った回数)
+// - topoOrder = depth 昇順、 tie-break は Project.groups の出現順で deterministic
+// register 順が親 → 子とは限らないため、 rescan 完了後にまとめて計算する。
+function rebuildTopoOrder(groups: unknown[]): void {
+	const orderIndex = new Map<string, number>()
+	groups.forEach((g, i) => {
+		const uuid = (g as { uuid?: unknown } | null)?.uuid
+		if (typeof uuid === 'string') orderIndex.set(uuid, i)
+	})
+
+	const depthCache = new Map<string, number>()
+	const depthOf = (uuid: string, seen: Set<string>): number => {
+		const cached = depthCache.get(uuid)
+		if (cached !== undefined) return cached
+		if (seen.has(uuid)) {
+			// 万一 chain がループしていたら root 扱いで打ち切る (= 安全側)
+			depthCache.set(uuid, 0)
+			return 0
+		}
+		const entry = registry.get(uuid)
+		if (!entry || entry.parentUuid === null || !registry.has(entry.parentUuid)) {
+			depthCache.set(uuid, 0)
+			return 0
+		}
+		seen.add(uuid)
+		const d = 1 + depthOf(entry.parentUuid, seen)
+		seen.delete(uuid)
+		depthCache.set(uuid, d)
+		return d
+	}
+
+	for (const [uuid, entry] of registry) {
+		entry.depth = depthOf(uuid, new Set())
+	}
+
+	const uuids = Array.from(registry.keys())
+	uuids.sort((a, b) => {
+		const da = depthCache.get(a) ?? 0
+		const db = depthCache.get(b) ?? 0
+		if (da !== db) return da - db
+		return (orderIndex.get(a) ?? Number.MAX_SAFE_INTEGER) - (orderIndex.get(b) ?? Number.MAX_SAFE_INTEGER)
+	})
+	topoOrder = uuids
 }
 
 // idempotent rescan : 既存 entry の state は保持、 不在 group のみ削除、 新規 group のみ追加。
 // 旧版は registry.clear() で全滅 → 再 register で state がリセットされていた
 // (= update_selection event 経由のボーンクリックで物理状態が初期化される問題の真因)。
+// rescan の末尾で parentUuid を最新の group.parent から refresh し、 topoOrder を再構築する。
 function rescanRegistry(): void {
 	const groups = (Project as { groups?: unknown[] } | null)?.groups
 	if (!Array.isArray(groups)) {
 		registry.clear()
+		topoOrder = []
 		return
 	}
 	const currentUuids = new Set<string>()
@@ -132,6 +199,20 @@ function rescanRegistry(): void {
 	for (const g of groups) {
 		if (isSpringGroup(g)) registerGroup(g as any)
 	}
+
+	// 既存 entry の parentUuid を最新の group.parent から refresh。
+	// registerGroup は idempotent スキップで state を保持するが、 chain 構造
+	// (= 親子関係) は「rig を編集した瞬間」 の最新値を反映すべきなのでここで更新する。
+	for (const entry of registry.values()) {
+		const parent = (entry.group as { parent?: unknown }).parent
+		entry.parentUuid =
+			parent && typeof parent === 'object' && isSpringGroup(parent)
+				? (typeof (parent as { uuid?: unknown }).uuid === 'string'
+						? (parent as { uuid: string }).uuid
+						: null)
+				: null
+	}
+	rebuildTopoOrder(groups)
 }
 
 // 任意の animation 時刻に rig を当てる (= anim_ux Onion Skin / AJ updatePreview と同パターン)。
@@ -318,6 +399,7 @@ function installTickLoop(): () => void {
 		Blockbench.removeListener?.('update_selection', onUpdateSelection)
 		Blockbench.removeListener?.('select_mode', onModeChange)
 		registry.clear()
+		topoOrder = []
 		simTime = -1
 	}
 }
