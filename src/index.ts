@@ -49,8 +49,9 @@ declare const Undo: any
 const PLUGIN_ID = 'spring_bone'
 const PLUGIN_VERSION = '0.0.10'
 
-// per-bone UI / Property panel は今後の Phase で追加予定 (= 現行 plan では
-// Phase 1 chain graph + Phase 2 ordered pass + Phase 3 gravity まで済、 UI は未着手)。
+// name prefix `spring_` = spring 化の唯一の truth (= per-group で spring 化を判定する gesture)。
+// per-bone UI (= drag / stiffness / gravity の Property + Panel + 右クリ rename sugar) は
+// この prefix を前提に register される。
 const BONE_NAME_PREFIX = 'spring_'
 
 // 物理パラ (= VRM SpringBone デフォルト相当)
@@ -91,10 +92,18 @@ function onSpringPropertyChange(): void {
 	// (= 次 tick の rescanRegistry で fp !== lastGraphFingerprint 判定が真になる)。
 	lastGraphFingerprint = ''
 	simTime = -1
-	try {
-		Animator?.preview?.()
-	} catch (e) {
-		console.warn(`[${PLUGIN_ID}] Animator.preview failed`, e)
+	// **animate モード限定で** Animator.preview を呼ぶ (= Round 2 review MUST-1 regression fix)。
+	// element_panel の onChange 経路は modes: ['edit'] で edit 専用、 その場合 Animator.preview は
+	// (a) tick() が !Modes?.animate で early-return するため意味がない、 加えて
+	// (b) Animator.preview 内の stackAnimations が playing=true の Animation を edit viewport に
+	//     適用してしまい pose 破壊 (= animation.js:230 で Animation.select が playing=true を設定、
+	//     mode 切替後も flag 保持)。 animate モードのみで呼ぶことで両方回避。
+	if (Modes?.animate) {
+		try {
+			Animator?.preview?.()
+		} catch (e) {
+			console.warn(`[${PLUGIN_ID}] Animator.preview failed`, e)
+		}
 	}
 }
 
