@@ -84,11 +84,14 @@ export function registerSpringPanel(onChange: () => void): () => void {
 
 	// form_config に NumSlider 3 個を dynamic 追加してから buildForm。 element_panel.ts の
 	// updateElementForm() と同 pattern (= form_config オブジェクト直接書き換え + buildForm)。
+	// type: 'num_slider' = BB 5.1.4 の NumSlider (= slider 内蔵 + Ctrl/Shift 倍率変更 modifier
+	// 対応)。 UX 要件 (= 数値入力 + スライドバーで直感的に連続調整) を満たす。 'number' 型は
+	// NumericInput (= slider なし) で不適。
 	const form_config = form.form_config
 	for (const meta of PANEL_INPUTS) {
 		form_config[meta.key] = {
 			label: meta.label,
-			type: 'number',
+			type: 'num_slider',
 			min: meta.min,
 			max: meta.max,
 			step: meta.step,
@@ -108,11 +111,10 @@ export function registerSpringPanel(onChange: () => void): () => void {
 		const g = Group.first_selected
 		try {
 			Undo?.initEdit?.({ groups: [g] })
+			// changed_keys は PANEL_INPUTS の key (= drag / stiffness / gravity) から来るので
+			// 追加の whitelist ガードは不要 (= 元の or チェーン常に true で冗長だった)。
 			for (const key of changed_keys) {
-				const propKey = `spring_${key}`
-				if (typeof g[propKey] !== 'undefined' || key === 'drag' || key === 'stiffness' || key === 'gravity') {
-					g[propKey] = result[key]
-				}
+				g[`spring_${key}`] = result[key]
 			}
 			Undo?.finishEdit?.('Change spring config')
 		} catch (e) {

@@ -29,6 +29,9 @@ declare const Timeline: { time?: number; playing?: boolean }
 declare const Animator: {
 	showDefaultPose?(reduced?: boolean): void
 	stackAnimations?(stack: unknown[], in_loop: boolean, blend?: number): void
+	// paused 中の即時反映用 (= Property 値変更で display_animation_frame を強制 fire、
+	// 停止中でも Panel slider の効果が視覚に出る)。
+	preview?(): void
 }
 declare const Animation: { selected?: any; all?: any[] } | undefined
 declare const Modes: { animate?: boolean; edit?: boolean } | undefined
@@ -75,6 +78,9 @@ function readSpringProp(group: unknown, key: SpringPropertyKey, fallback: number
 // Property 変更時の同期 hook。 element_panel input の onChange から呼ばれる。
 // - 全 registered spring group の Property 値を entry.config に反映
 // - fingerprint invalidate (= 次 tick で 0 replay 経路が走り、 preview 即反映)
+// - `Animator.preview()` 明示呼び : playback 停止中は display_animation_frame が
+//   自然発火しないため、 fingerprint invalidate だけでは scrub まで値が反映されない。
+//   `Animator.preview()` を明示的に呼ぶことで停止中の即時反映を確保する (= 受け入れ条件 (c))。
 function onSpringPropertyChange(): void {
 	for (const entry of registry.values()) {
 		entry.config.drag = readSpringProp(entry.group, 'spring_drag', DEFAULT_CONFIG.drag)
@@ -85,13 +91,31 @@ function onSpringPropertyChange(): void {
 	// (= 次 tick の rescanRegistry で fp !== lastGraphFingerprint 判定が真になる)。
 	lastGraphFingerprint = ''
 	simTime = -1
+	try {
+		Animator?.preview?.()
+	} catch (e) {
+		console.warn(`[${PLUGIN_ID}] Animator.preview failed`, e)
+	}
 }
 
 // spring group name prefix 判定 (= BB 側 condition callback から呼ばれる)。
-// Property.condition に function を渡すと Group 各インスタンス単位で判定される
-// (= 対象 group だけに Property が生えて汚染しない)。
-function isSpringGroupForProperty(group: unknown): boolean {
-	const name = (group as { name?: unknown } | null)?.name
+// **context 2 経路** :
+//   (1) Property.merge / copy 経路 = BB core が instance を渡す (= 引数あり)
+//   (2) element_panel input.condition 経路 = BB core が **context 無し** で呼ぶ
+//       (element_panel.ts:56-58 `method: () => Condition(property.condition)` = 引数省略)
+// 引数省略時は Group.first_selected (= 現在 UI で選択中の group) を参照する。
+// これで edit モード element_panel でも「選択中 group が spring_ prefix ならば表示」 となる。
+// なお、 Property.merge の load 時ordering 問題 (= properties merge → name merge の順、
+// group.js:29-33) は本 condition では解消不可 (= merge 時点で name = default 'group')。
+// そのため Property 各 instance の `.merge` を override して condition 迂回する
+// (= registerProperties 内で instance method 直接差し替え)。
+function isSpringGroupForProperty(group?: unknown): boolean {
+	if (group === undefined || group === null) {
+		// context 無し呼び出し = 現在選択中 group で判定
+		const first = (Group as { first_selected?: { name?: unknown } })?.first_selected
+		return !!(first && typeof first.name === 'string' && first.name.startsWith(BONE_NAME_PREFIX))
+	}
+	const name = (group as { name?: unknown }).name
 	return typeof name === 'string' && name.startsWith(BONE_NAME_PREFIX)
 }
 
@@ -109,15 +133,38 @@ function registerProperties(): void {
 		condition: isSpringGroupForProperty,
 		inputs: {
 			element_panel: {
-				input: { label, type: 'number', min, max, step },
+				// BB 5.1.4 の NumSlider は type: 'num_slider' で生成される (= 'number' は
+				// NumericInput = 数値のみで slider なし)。 UX 要件 (= NumSlider で連続調整) 準拠。
+				// value を明示することで element_panel の初期表示が 0 でなく defaultValue になる
+				// (= form.ts の value ?? default fallback に確実な値を渡す)。
+				input: { label, type: 'num_slider', min, max, step, value: defaultValue },
 				onChange: onSpringPropertyChange,
 			},
 		},
 	})
 
-	new Property(Group, 'number', 'spring_drag', makeConfig('Spring drag', DEFAULT_CONFIG.drag, 0, 1, 0.01))
-	new Property(Group, 'number', 'spring_stiffness', makeConfig('Spring stiffness', DEFAULT_CONFIG.stiffness, 0, 10, 0.1))
-	new Property(Group, 'number', 'spring_gravity', makeConfig('Spring gravity', DEFAULT_CONFIG.gravity, 0, 100, 1))
+	// Property.merge の load 時 ordering 問題 (= properties merge → name merge の順、
+	// group.js:29-33) を回避するため、 各 Property の .merge を override して condition 迂回。
+	// data 側に値がある (= 元々 spring_ prefix の group を save した証拠) 場合は無条件 copy。
+	// これで .bbmodel reload で 3 パラ値が復帰する (= 受け入れ条件 (a) を満たす)。
+	// copy / element_panel visibility は元の condition (= isSpringGroupForProperty) が保持
+	// (= 非 spring group への Property 汚染ゼロ)。
+	const patchMerge = (prop: any, key: string): void => {
+		prop.merge = function (instance: any, data: any) {
+			if (data?.[key] === undefined) return
+			if (typeof data[key] === 'number' && Number.isFinite(data[key])) {
+				instance[key] = data[key]
+			}
+		}
+	}
+
+	const drag_prop = new Property(Group, 'number', 'spring_drag', makeConfig('Spring drag', DEFAULT_CONFIG.drag, 0, 1, 0.01))
+	const stiffness_prop = new Property(Group, 'number', 'spring_stiffness', makeConfig('Spring stiffness', DEFAULT_CONFIG.stiffness, 0, 10, 0.1))
+	const gravity_prop = new Property(Group, 'number', 'spring_gravity', makeConfig('Spring gravity', DEFAULT_CONFIG.gravity, 0, 100, 1))
+
+	patchMerge(drag_prop, 'spring_drag')
+	patchMerge(stiffness_prop, 'spring_stiffness')
+	patchMerge(gravity_prop, 'spring_gravity')
 }
 
 // plugin onunload で Property を Group.properties から delete。 unload → reload で
@@ -171,6 +218,14 @@ function registerContextMenuActions(): void {
 			} catch (e) {
 				console.warn(`[${PLUGIN_ID}] springify failed`, e)
 			}
+			// rename 直後に registry を再構築 (= 新規 spring group を pick up、 fingerprint 変化で
+			// 次 tick に 0 replay 起動)。 これで context menu 直後の物理追従が selection 変更を
+			// 待たずに即発火する (= 受け入れ条件 (f) の物理側)。
+			try {
+				rescanRegistry()
+			} catch (e) {
+				console.warn(`[${PLUGIN_ID}] rescanRegistry failed after springify`, e)
+			}
 		},
 	})
 
@@ -182,8 +237,12 @@ function registerContextMenuActions(): void {
 			return hasSpringPrefix((Group as { first_selected?: { name?: unknown } })?.first_selected?.name)
 		},
 		click() {
+			// prefix 除去後に空文字にならない (= 「spring_」 だけの group を弾く、 N-3 guard) 条件込みで filter。
 			const groups = ((Group as { multi_selected?: unknown[] })?.multi_selected ?? []).filter(
-				(g) => hasSpringPrefix((g as { name?: unknown } | null)?.name),
+				(g) => {
+					const n = (g as { name?: unknown } | null)?.name
+					return typeof n === 'string' && n.startsWith(BONE_NAME_PREFIX) && n.length > BONE_NAME_PREFIX.length
+				},
 			) as Array<{ name: string }>
 			if (groups.length === 0) return
 			try {
@@ -192,6 +251,13 @@ function registerContextMenuActions(): void {
 				Undo?.finishEdit?.('Spring 解除')
 			} catch (e) {
 				console.warn(`[${PLUGIN_ID}] unspringify failed`, e)
+			}
+			// rename 直後に registry を再構築 (= 解除された group を registry から除外、 fingerprint 変化で
+			// 次 tick に replay 起動)。 これで残存 spring group の物理が selection 変更を待たずに継続する。
+			try {
+				rescanRegistry()
+			} catch (e) {
+				console.warn(`[${PLUGIN_ID}] rescanRegistry failed after unspringify`, e)
 			}
 		},
 	})
@@ -297,6 +363,14 @@ function findChildGroup(group: { children?: unknown[] }): { origin?: number[] } 
 function registerGroup(group: any): void {
 	if (typeof group?.uuid !== 'string') return
 	if (registry.has(group.uuid)) return
+	// element_panel の setValues stale value 問題対策 (= Round 1 review W-2)。
+	// instance property が undefined だと form.setValues が「値 undefined = skip」 で
+	// 前の group の値を form に残してしまう。 spring 化した新規 group に対し
+	// DEFAULT_CONFIG 値を明示的に生やすことで setValues が確実に上書きできる状態にする。
+	// blueprint 側の値は custom .merge で復元済のためここでは既存値を上書きしない。
+	if (typeof group.spring_drag !== 'number') group.spring_drag = DEFAULT_CONFIG.drag
+	if (typeof group.spring_stiffness !== 'number') group.spring_stiffness = DEFAULT_CONFIG.stiffness
+	if (typeof group.spring_gravity !== 'number') group.spring_gravity = DEFAULT_CONFIG.gravity
 	const child = findChildGroup(group)
 	let restLength = 16
 	let restLocalDir = new THREE.Vector3(0, 1, 0)
