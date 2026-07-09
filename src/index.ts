@@ -85,8 +85,13 @@ function isSpringGroup(group: unknown): boolean {
 // は中間 plain group を通して子孫まで伝播するので、 depth / topo 順さえ正しければ
 // anchor / boneAxis の read は正しく親の物理反映後を見る。
 function getSpringParentUuid(group: unknown): string | null {
+	// visited Set で cycle 防御。 BB outliner の tree 構造では通常 cycle は作れないが、
+	// 非 spring group 同士で parent 循環が存在する malformed state でも無限ループしない。
+	const visited = new Set<object>()
 	let cursor = (group as { parent?: unknown } | null)?.parent
 	while (cursor && typeof cursor === 'object') {
+		if (visited.has(cursor)) return null
+		visited.add(cursor)
 		if (isSpringGroup(cursor)) {
 			const uuid = (cursor as { uuid?: unknown }).uuid
 			return typeof uuid === 'string' ? uuid : null
@@ -199,13 +204,15 @@ function rebuildTopoOrder(groups: unknown[]): void {
 }
 
 // chain 構造の fingerprint 計算 (= topology 変化検知用)。 uuid 昇順に整列した
-// 「uuid:parentUuid:restLength」 の連結。 restLength は小数丸めで安定化。
+// 「uuid:parentUuid:restLength:restLocalDir」 の連結。 数値は小数丸めで安定化。
+// restLocalDir も含めることで「同長で方向だけ変わった origin 編集」 でも invalidate する。
 function computeGraphFingerprint(): string {
 	const uuids = Array.from(registry.keys()).sort()
 	return uuids
 		.map((u) => {
 			const e = registry.get(u)!
-			return `${u}:${e.parentUuid ?? '-'}:${e.config.restLength.toFixed(4)}`
+			const d = e.restLocalDir
+			return `${u}:${e.parentUuid ?? '-'}:${e.config.restLength.toFixed(4)}:${d.x.toFixed(3)},${d.y.toFixed(3)},${d.z.toFixed(3)}`
 		})
 		.join('|')
 }
