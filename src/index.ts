@@ -46,6 +46,7 @@ const FAST_FORWARD_THRESHOLD = 0.5
 const DEFAULT_CONFIG: Omit<SpringConfig, 'restLength'> = {
 	drag: 0.05,        // 速度減衰 = 5% / step (= ふんわり残響、 VRM デフォルト相当)
 	stiffness: 1.0,    // 親方向への引力係数
+	gravity: 0,        // 重力加速度 (world -Y)、 既定 = 無効。 Phase 4 実機で値調整予定
 }
 
 interface BoneEntry {

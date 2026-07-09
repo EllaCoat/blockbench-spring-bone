@@ -10,6 +10,7 @@ export interface SpringConfig {
 	drag: number       // 速度減衰係数 (= 0 = 完全慣性、 1 = 即停止)、 既定 0.05
 	stiffness: number  // 親方向への引力係数、 既定 1.0
 	restLength: number // 親 pivot から仮想末端までの距離 (= tipDistance)
+	gravity: number    // world -Y 方向への加速度 (= 常時働く重力)、 既定 0 = 無効
 }
 
 export interface SpringState {
@@ -71,10 +72,16 @@ export function step(
 		.copy(boneAxisWorld)
 		.multiplyScalar(config.stiffness * dt)
 
+	// 重力 = world -Y 方向に常時働く加速度。 dt スケーリング (= stiffness と同じ「force per dt」 慣習)。
+	// 既定 0 で無効、 値を入れると t=0 直後に垂れ下がる settle 過渡が deterministic に出現する
+	// (= replay 起点で rest tip 位置から始まり、 gravity で平衡点まで自然落下)。
+	const gravityForce = new THREE.Vector3(0, -config.gravity * dt, 0)
+
 	const next = new THREE.Vector3()
 		.copy(state.pos)
 		.add(inertia)
 		.add(stiffnessForce)
+		.add(gravityForce)
 
 	// length constraint : anchor からの距離を restLength に hard snap
 	const dir = new THREE.Vector3().subVectors(next, anchorWorld)
