@@ -39,6 +39,9 @@ declare const THREE: any
 // element_panel は edit モード限定なので animate モードでは自然に消え、 animate 時の
 // 値編集は本 plugin の専用 Panel (= Phase 3 Commit 2) 側で提供する。
 declare const Property: any
+declare const Action: any
+declare const MenuSeparator: any
+declare const Undo: any
 
 const PLUGIN_ID = 'spring_bone'
 const PLUGIN_VERSION = '0.0.10'
@@ -126,6 +129,92 @@ function unregisterProperties(): void {
 	for (const key of PROPERTY_KEYS) {
 		delete props[key]
 	}
+}
+
+// Group 右クリ context menu に「Spring 化 / Spring 解除」 の 2 action を追加する。
+// 実装 gesture (= 唯一の truth) は依然 name prefix (= `spring_`) の付け外し。
+// action は BB core の Group.prototype.menu.structure に append され、 group 右クリで表示される。
+// condition で「対象 group の prefix 状態」 に応じて片方のみを visible にする (= mutually exclusive)。
+let registeredMenuEntries: unknown[] = []
+
+function hasSpringPrefix(name: unknown): boolean {
+	return typeof name === 'string' && name.startsWith(BONE_NAME_PREFIX)
+}
+
+function registerContextMenuActions(): void {
+	if (typeof Action !== 'function' || typeof MenuSeparator !== 'function') {
+		console.warn(`[${PLUGIN_ID}] Action or MenuSeparator not available, skipping context menu registration`)
+		return
+	}
+	const menu = (Group as { prototype?: { menu?: { structure?: unknown[] } } })?.prototype?.menu
+	if (!menu || !Array.isArray(menu.structure)) {
+		console.warn(`[${PLUGIN_ID}] Group.prototype.menu.structure not available, skipping context menu registration`)
+		return
+	}
+
+	const springify = new Action(`${PLUGIN_ID}_springify`, {
+		name: 'Spring 化',
+		icon: 'gesture',
+		condition: () => {
+			// first_selected が非 spring group のときのみ表示 (= 「化」 が意味を持つ場面)。
+			return !hasSpringPrefix((Group as { first_selected?: { name?: unknown } })?.first_selected?.name)
+		},
+		click() {
+			const groups = ((Group as { multi_selected?: unknown[] })?.multi_selected ?? []).filter(
+				(g) => !hasSpringPrefix((g as { name?: unknown } | null)?.name),
+			) as Array<{ name: string }>
+			if (groups.length === 0) return
+			try {
+				Undo?.initEdit?.({ groups })
+				for (const g of groups) g.name = `${BONE_NAME_PREFIX}${g.name}`
+				Undo?.finishEdit?.('Spring 化')
+			} catch (e) {
+				console.warn(`[${PLUGIN_ID}] springify failed`, e)
+			}
+		},
+	})
+
+	const unspringify = new Action(`${PLUGIN_ID}_unspringify`, {
+		name: 'Spring 解除',
+		icon: 'link_off',
+		condition: () => {
+			// first_selected が spring group のときのみ表示 (= 「解除」 が意味を持つ場面)。
+			return hasSpringPrefix((Group as { first_selected?: { name?: unknown } })?.first_selected?.name)
+		},
+		click() {
+			const groups = ((Group as { multi_selected?: unknown[] })?.multi_selected ?? []).filter(
+				(g) => hasSpringPrefix((g as { name?: unknown } | null)?.name),
+			) as Array<{ name: string }>
+			if (groups.length === 0) return
+			try {
+				Undo?.initEdit?.({ groups })
+				for (const g of groups) g.name = g.name.slice(BONE_NAME_PREFIX.length)
+				Undo?.finishEdit?.('Spring 解除')
+			} catch (e) {
+				console.warn(`[${PLUGIN_ID}] unspringify failed`, e)
+			}
+		},
+	})
+
+	// Group.prototype.menu.structure に append (= 「rename」「delete」 の末尾に並ぶ)。
+	const sep = new MenuSeparator(`${PLUGIN_ID}_actions`)
+	menu.structure.push(sep, springify, unspringify)
+	registeredMenuEntries.push(sep, springify, unspringify)
+}
+
+function unregisterContextMenuActions(): void {
+	const menu = (Group as { prototype?: { menu?: { structure?: unknown[] } } })?.prototype?.menu
+	if (menu?.structure && Array.isArray(menu.structure)) {
+		menu.structure = menu.structure.filter((entry) => !registeredMenuEntries.includes(entry))
+	}
+	for (const entry of registeredMenuEntries) {
+		try {
+			;(entry as { delete?: () => void })?.delete?.()
+		} catch (e) {
+			console.warn(`[${PLUGIN_ID}] action.delete failed`, e)
+		}
+	}
+	registeredMenuEntries = []
 }
 
 interface BoneEntry {
@@ -636,6 +725,9 @@ Plugin.register(PLUGIN_ID, {
 		// animate モード用の専用 Panel を register (= edit モードは element_panel input に任せる)。
 		// 値変更時は onSpringPropertyChange 経由で registry sync + fingerprint invalidate される。
 		cleanups.push(registerSpringPanel(onSpringPropertyChange))
+		// Group 右クリ context menu に「Spring 化 / 解除」 の rename sugar action を追加。
+		// gesture (= 唯一の truth) は依然 name prefix 「spring_」 の付け外し。
+		registerContextMenuActions()
 	},
 	onunload() {
 		for (const fn of cleanups) {
@@ -649,6 +741,8 @@ Plugin.register(PLUGIN_ID, {
 		// Property を Group.properties から delete (= reload 時の二重登録警告回避)。
 		// blueprint 側にはシリアライズされた値が残るため、 再 register で自動復帰する。
 		unregisterProperties()
+		// context menu action + separator を Group.prototype.menu.structure から削除。
+		unregisterContextMenuActions()
 		console.log(`[${PLUGIN_ID}] unloaded`)
 	},
 })
