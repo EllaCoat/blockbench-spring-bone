@@ -252,18 +252,70 @@ function getBoneAxisWorld(entry: BoneEntry, out: any): boolean {
 	return true
 }
 
-function stepAll(dt: number): void {
+// Phase 2 : chain 対応の逐次 topo 順 融合 pass。 stepAll + applyAll を 1 つに統合し、
+// sub-step 内で「applyPoseAt(t) で全 bone を keyframe pose にリセット」 → 各 entry を
+// topo 順に「anchor/boneAxis 読み → step → rotation 書き → updateMatrixWorld(true)」
+// で処理する。 これにより chain 子の anchor は「親 spring の物理変位反映後」 の world pos
+// を読める。 一斉 stepAll → 一斉 applyAll だと applyPoseAt が全 bone を keyframe pose に
+// 戻すため、 chain 子は親の spring 変位を「永遠に見ない」 (= 無限 lag) 問題があった。
+// updateMatrixWorld(true) は自分 + 子孫の matrixWorld を伝播 (Blockbench 同梱 Three r129
+// の getWorldQuaternion は内部で ancestor 更新するが、 版依存吸収のため明示的に呼ぶ)。
+function stepAndApplyOrdered(dt: number): void {
 	if (registry.size === 0) return
 	const anchorWorld = new THREE.Vector3()
 	const boneAxisWorld = new THREE.Vector3()
-	for (const entry of registry.values()) {
+	const forward = new THREE.Vector3()
+	const parentQuat = new THREE.Quaternion()
+	const parentInv = new THREE.Quaternion()
+	const localForward = new THREE.Vector3()
+	const localQuat = new THREE.Quaternion()
+	const euler = new THREE.Euler()
+
+	for (const uuid of topoOrder) {
+		const entry = registry.get(uuid)
+		if (!entry) continue
+		const mesh = entry.group?.mesh
+		const meshParent = mesh?.parent
+		if (!mesh || !meshParent) continue
+
 		if (!getAnchorWorld(entry, anchorWorld)) continue
 		if (!getBoneAxisWorld(entry, boneAxisWorld)) continue
+
 		step(entry.state, anchorWorld, boneAxisWorld, entry.config, dt)
+
+		if (!entry.state.initialized) continue
+
+		// world forward を parent local 化 → restLocalDir からこの方向に向ける最短回転を直接計算。
+		// 旧 basis 構築 (= forward / right / trueUp + lastRight parallel transport) は
+		// trueUp = forward × right が left-handed (= 反射) basis を生み、 setFromRotationMatrix
+		// が非単位 quat を返し、 Euler 抽出で角度が「正確に半分」 になっていた (= half-lock の真因)。
+		// setFromUnitVectors は restLocalDir → localForward の最短回転を直接計算するので、
+		// 反射トラップ + +Y 軸固定仮定 + lastRight hysteresis を一気に解消、 連続性も自然に担保。
+		forward.subVectors(entry.state.pos, anchorWorld)
+		if (forward.lengthSq() < 1e-8) continue
+		forward.normalize()
+
+		meshParent.getWorldQuaternion(parentQuat)
+		parentInv.copy(parentQuat).invert()
+		localForward.copy(forward).applyQuaternion(parentInv)
+		localQuat.setFromUnitVectors(entry.restLocalDir, localForward)
+
+		const order = mesh.rotation.order || 'ZYX'
+		euler.setFromQuaternion(localQuat, order)
+		mesh.rotation.x = euler.x
+		mesh.rotation.y = euler.y
+		mesh.rotation.z = euler.z
+
+		// mesh の matrixWorld を伝播 → 次 topo entry (= 子孫方向) が最新の world pos / quat を読める。
+		mesh.updateMatrixWorld(true)
 	}
 }
 
-function applyAll(): void {
+// 同時刻パス (= tick で sim 進めない、 state 不変で描画のみ更新する経路)。
+// applyPoseAt は既に一度走って全 bone が keyframe pose に、 matrixWorld も伝播済み前提。
+// あとは topo 順に「anchor 読み → rotation 書き → updateMatrixWorld(true)」 で
+// 各 entry の物理 state に対応した pose を描画に反映する。
+function applyOnlyOrdered(): void {
 	if (registry.size === 0) return
 	const anchorWorld = new THREE.Vector3()
 	const forward = new THREE.Vector3()
@@ -273,26 +325,20 @@ function applyAll(): void {
 	const localQuat = new THREE.Quaternion()
 	const euler = new THREE.Euler()
 
-	for (const entry of registry.values()) {
-		if (!entry.state.initialized) continue
+	for (const uuid of topoOrder) {
+		const entry = registry.get(uuid)
+		if (!entry || !entry.state.initialized) continue
 		const mesh = entry.group?.mesh
-		const parent = mesh?.parent
-		if (!mesh || !parent) continue
+		const meshParent = mesh?.parent
+		if (!mesh || !meshParent) continue
 
-		anchorWorld.setFromMatrixPosition(mesh.matrixWorld)
+		if (!getAnchorWorld(entry, anchorWorld)) continue
 		forward.subVectors(entry.state.pos, anchorWorld)
 		if (forward.lengthSq() < 1e-8) continue
 		forward.normalize()
 
-		parent.getWorldQuaternion(parentQuat)
+		meshParent.getWorldQuaternion(parentQuat)
 		parentInv.copy(parentQuat).invert()
-
-		// world forward を parent local 化 → restLocalDir からこの方向に向ける最短回転を直接計算。
-		// 旧 basis 構築 (= forward / right / trueUp + lastRight parallel transport) は
-		// trueUp = forward × right が left-handed (= 反射) basis を生み、 setFromRotationMatrix
-		// が非単位 quat を返し、 Euler 抽出で角度が「正確に半分」 になっていた (= half-lock の真因)。
-		// setFromUnitVectors は restLocalDir → localForward の最短回転を直接計算するので、
-		// 反射トラップ + +Y 軸固定仮定 + lastRight hysteresis を一気に解消、 連続性も自然に担保。
 		localForward.copy(forward).applyQuaternion(parentInv)
 		localQuat.setFromUnitVectors(entry.restLocalDir, localForward)
 
@@ -301,15 +347,21 @@ function applyAll(): void {
 		mesh.rotation.x = euler.x
 		mesh.rotation.y = euler.y
 		mesh.rotation.z = euler.z
+
+		mesh.updateMatrixWorld(true)
 	}
 }
 
-// 全 entry の state を「現時刻 frame の rest 位置」 にリセット (= scrub / 初回 invoke 時)
+// 全 entry の state を「現時刻 frame の rest 位置」 にリセット (= scrub / 初回 invoke 時)。
+// topo 順で走らせて deterministic を確保する (= 単独 bone では順序が意味を持たないが、
+// chain の場合は将来的な拡張 (= gravity settle 事前計算等) で親の rest 反映が要る)。
 function resetAllToRest(): void {
 	const anchorWorld = new THREE.Vector3()
 	const boneAxisWorld = new THREE.Vector3()
 	const restTip = new THREE.Vector3()
-	for (const entry of registry.values()) {
+	for (const uuid of topoOrder) {
+		const entry = registry.get(uuid)
+		if (!entry) continue
 		if (!getAnchorWorld(entry, anchorWorld)) continue
 		if (!getBoneAxisWorld(entry, boneAxisWorld)) continue
 		restTip.copy(anchorWorld).addScaledVector(boneAxisWorld, entry.config.restLength)
@@ -325,11 +377,14 @@ function replayFromStartTo(targetTime: number): void {
 	advanceSimTo(targetTime)
 }
 
-// 現 simTime から targetTime まで FIXED_DT 単位で sub-step (= cache 経路 + replay の共通実装)
+// 現 simTime から targetTime まで FIXED_DT 単位で sub-step (= cache 経路 + replay の共通実装)。
+// Phase 2 以降 : stepAll + applyAll を融合した stepAndApplyOrdered を呼ぶ。
+// sub-step ごとに applyPoseAt が keyframe pose を反映してから、 topo 順に物理を進めて
+// mesh.rotation を書き込む。 これで chain 子は親の物理変位反映後の world pos を anchor に読める。
 function advanceSimTo(targetTime: number): void {
 	while (simTime + FIXED_DT <= targetTime + 1e-6) {
 		applyPoseAt(simTime + FIXED_DT)
-		stepAll(FIXED_DT)
+		stepAndApplyOrdered(FIXED_DT)
 		simTime += FIXED_DT
 	}
 }
@@ -358,7 +413,7 @@ function tick(): void {
 	}
 	// 同時刻 (= |targetSimTime - simTime| < 1e-6) = sim 進めない (= state 不変、 描画のみ)
 
-	applyAll()
+	applyOnlyOrdered()
 }
 
 let cleanups: Array<() => void> = []
