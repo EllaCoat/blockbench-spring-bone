@@ -1,0 +1,148 @@
+// Spring Bone plugin の animate モード用 sidebar Panel。
+// edit モードは BB 標準 Element panel (= element_panel.ts) に任せる (= Property の
+// element_panel input が自動で出る)。 element_panel は condition: {modes: ['edit']}
+// で animate モード非表示のため、 animate 中の値編集を本 Panel が担う。
+//
+// 実装 pattern は BB 5.1.4 の element_panel.ts 実装を踏襲 :
+//   - new InputForm({}) + form_config への input 追加 + buildForm() で dynamic 生成
+//   - form.on('input', ...) で group[key] = result[key] を Undo wrap で反映
+//   - Blockbench.on('update_selection', ...) で選択追従の form.setValues()
+//
+// mode 制約 = animate のみ表示にすることで edit モードは element_panel、 animate モードは
+// 本 Panel が担う分業。 UX 上の重複を回避しつつ両モードで NumSlider 編集を提供できる。
+
+declare const Panel: any
+declare const InputForm: any
+declare const Blockbench: any
+declare const Group: any
+declare const Undo: any
+
+const BONE_NAME_PREFIX = 'spring_'
+
+// Property 3 パラの UI メタ情報 (= registerProperties と 1:1 対応、 range / step も同値)。
+const PANEL_INPUTS = [
+	{ key: 'drag', label: 'Drag', min: 0, max: 1, step: 0.01, defaultValue: 0.05 },
+	{ key: 'stiffness', label: 'Stiffness', min: 0, max: 10, step: 0.1, defaultValue: 1.0 },
+	{ key: 'gravity', label: 'Gravity', min: 0, max: 100, step: 1, defaultValue: 0 },
+] as const
+
+// Panel 単一インスタンス + selection listener を管理する module state。
+// register / unregister は plugin onload / onunload から 1 回ずつ呼ばれる想定。
+let spring_panel: any = null
+let selection_listener: ((...args: unknown[]) => void) | null = null
+
+function isSpringSelectionActive(): boolean {
+	const g = Group.first_selected
+	return !!(g && typeof g.name === 'string' && g.name.startsWith(BONE_NAME_PREFIX))
+}
+
+// 選択中 group の Property 値を form にプッシュ (= 選択切替時の値同期)。
+// group が spring_ でない場合は何もしない (= Panel は display_condition で自動非表示)。
+function pushValuesFromSelectedGroup(form: any): void {
+	if (!isSpringSelectionActive()) return
+	const g = Group.first_selected
+	const values: Record<string, number> = {}
+	for (const meta of PANEL_INPUTS) {
+		const raw = g?.[`spring_${meta.key}`]
+		values[meta.key] = typeof raw === 'number' && Number.isFinite(raw) ? raw : meta.defaultValue
+	}
+	try {
+		form.setValues?.(values)
+		form.update?.(values)
+	} catch (e) {
+		console.warn('[spring_bone] panel setValues failed', e)
+	}
+}
+
+// Panel + form + selection listener を register して cleanup 関数を返す。
+// onChange = index.ts の onSpringPropertyChange (= registry sync + simTime = -1 invalidate)。
+export function registerSpringPanel(onChange: () => void): () => void {
+	if (typeof Panel !== 'function' || typeof InputForm !== 'function') {
+		console.warn('[spring_bone] Panel or InputForm not available, skipping panel registration')
+		return () => {}
+	}
+
+	const form = new InputForm({})
+
+	spring_panel = new Panel('spring_bone', {
+		icon: 'gesture',
+		name: 'Spring Bone',
+		// animate モード限定 = edit モードは element_panel input に任せて重複回避。
+		condition: { modes: ['animate'] },
+		// display_condition = spring_ prefix group が単独選択されているときのみ Panel 内容表示。
+		// 非選択時は Panel が collapse or 非表示になる (= BB core 側の挙動)。
+		display_condition: isSpringSelectionActive,
+		default_position: {
+			slot: 'right_bar',
+			float_position: [0, 0],
+			float_size: [300, 200],
+			height: 200,
+			sidebar_index: 3,
+		},
+		form,
+	})
+
+	// form_config に NumSlider 3 個を dynamic 追加してから buildForm。 element_panel.ts の
+	// updateElementForm() と同 pattern (= form_config オブジェクト直接書き換え + buildForm)。
+	const form_config = form.form_config
+	for (const meta of PANEL_INPUTS) {
+		form_config[meta.key] = {
+			label: meta.label,
+			type: 'number',
+			min: meta.min,
+			max: meta.max,
+			step: meta.step,
+			value: meta.defaultValue,
+		}
+	}
+	try {
+		form.buildForm?.()
+	} catch (e) {
+		console.warn('[spring_bone] form.buildForm failed', e)
+	}
+
+	// form input event : 値変更を group Property に反映 + Undo wrap + registry sync。
+	// element_panel.ts:76-91 と同 pattern を単純化 (= 選択 group が spring_ prefix の 1 個のみ想定)。
+	form.on('input', ({ result, changed_keys }: { result: Record<string, number>; changed_keys: string[] }) => {
+		if (!isSpringSelectionActive()) return
+		const g = Group.first_selected
+		try {
+			Undo?.initEdit?.({ groups: [g] })
+			for (const key of changed_keys) {
+				const propKey = `spring_${key}`
+				if (typeof g[propKey] !== 'undefined' || key === 'drag' || key === 'stiffness' || key === 'gravity') {
+					g[propKey] = result[key]
+				}
+			}
+			Undo?.finishEdit?.('Change spring config')
+		} catch (e) {
+			console.warn('[spring_bone] panel input handler failed', e)
+		}
+		// registry sync + fingerprint invalidate (= 次 tick で 0 replay、 preview 即反映)
+		try {
+			onChange()
+		} catch (e) {
+			console.warn('[spring_bone] onChange failed', e)
+		}
+	})
+
+	// selection tracker : 選択 group 変わったら form 値を再同期。
+	selection_listener = () => pushValuesFromSelectedGroup(form)
+	Blockbench.on('update_selection', selection_listener)
+
+	// 初回値同期 (= plugin load 時に既に spring group を選択済ケース)。
+	pushValuesFromSelectedGroup(form)
+
+	return () => {
+		try {
+			if (selection_listener) {
+				Blockbench.removeListener?.('update_selection', selection_listener)
+				selection_listener = null
+			}
+			spring_panel?.delete?.()
+			spring_panel = null
+		} catch (e) {
+			console.warn('[spring_bone] panel unregister failed', e)
+		}
+	}
+}

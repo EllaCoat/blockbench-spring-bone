@@ -15,6 +15,7 @@
 //   残った場合は Phase 5 のベイク機能で微調整する方針 (= 過剰な loop seamless 機構は入れない)。
 
 import { createState, resetState, step, type SpringConfig, type SpringState } from './springSim'
+import { registerSpringPanel } from './ui'
 
 declare const Plugin: { register(id: string, opts: Record<string, unknown>): void }
 declare const Blockbench: {
@@ -632,6 +633,9 @@ Plugin.register(PLUGIN_ID, {
 		// tick loop は Property が生えている前提で config 値を読むため、 Property 登録が先。
 		registerProperties()
 		cleanups.push(installTickLoop())
+		// animate モード用の専用 Panel を register (= edit モードは element_panel input に任せる)。
+		// 値変更時は onSpringPropertyChange 経由で registry sync + fingerprint invalidate される。
+		cleanups.push(registerSpringPanel(onSpringPropertyChange))
 	},
 	onunload() {
 		for (const fn of cleanups) {
