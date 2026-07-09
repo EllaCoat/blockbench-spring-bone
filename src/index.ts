@@ -32,6 +32,12 @@ declare const Animator: {
 declare const Animation: { selected?: any; all?: any[] } | undefined
 declare const Modes: { animate?: boolean; edit?: boolean } | undefined
 declare const THREE: any
+// BB 5.1.4 の Property class (= js/util/property.ts)。 Group.properties[name] に登録され
+// blueprint (.bbmodel) の save/load、 Undo、 multi-select、 削除 cleanup、 Element panel
+// input 自動生成 (= condition: {modes: ['edit']} 越しに edit モードのみ表示) が本体側で担保。
+// element_panel は edit モード限定なので animate モードでは自然に消え、 animate 時の
+// 値編集は本 plugin の専用 Panel (= Phase 3 Commit 2) 側で提供する。
+declare const Property: any
 
 const PLUGIN_ID = 'spring_bone'
 const PLUGIN_VERSION = '0.0.10'
@@ -48,6 +54,77 @@ const DEFAULT_CONFIG: Omit<SpringConfig, 'restLength'> = {
 	drag: 0.05,        // 速度減衰 = 5% / step (= ふんわり残響、 VRM デフォルト相当)
 	stiffness: 1.0,    // 親方向への per-step force coefficient
 	gravity: 0,        // world -Y への per-step force、 既定 = 無効。 実機検証で値調整予定
+}
+
+// Property key list (= register / unregister / read で共有)。 key 名は
+// `spring_<field>` にして、 name prefix (= BONE_NAME_PREFIX = 'spring_') と統一感を持たせる。
+const PROPERTY_KEYS = ['spring_drag', 'spring_stiffness', 'spring_gravity'] as const
+type SpringPropertyKey = (typeof PROPERTY_KEYS)[number]
+
+// Group instance に自動で生える Property 値を読む helper。 Property が未定義
+// or 未 register or NaN の場合は fallback を返す (= DEFAULT_CONFIG 値)。
+function readSpringProp(group: unknown, key: SpringPropertyKey, fallback: number): number {
+	const raw = (group as Record<string, unknown> | null)?.[key]
+	return typeof raw === 'number' && Number.isFinite(raw) ? raw : fallback
+}
+
+// Property 変更時の同期 hook。 element_panel input の onChange から呼ばれる。
+// - 全 registered spring group の Property 値を entry.config に反映
+// - fingerprint invalidate (= 次 tick で 0 replay 経路が走り、 preview 即反映)
+function onSpringPropertyChange(): void {
+	for (const entry of registry.values()) {
+		entry.config.drag = readSpringProp(entry.group, 'spring_drag', DEFAULT_CONFIG.drag)
+		entry.config.stiffness = readSpringProp(entry.group, 'spring_stiffness', DEFAULT_CONFIG.stiffness)
+		entry.config.gravity = readSpringProp(entry.group, 'spring_gravity', DEFAULT_CONFIG.gravity)
+	}
+	// fingerprint を空文字にすることで rescanRegistry 経由の invalidate を必ずトリガする
+	// (= 次 tick の rescanRegistry で fp !== lastGraphFingerprint 判定が真になる)。
+	lastGraphFingerprint = ''
+	simTime = -1
+}
+
+// spring group name prefix 判定 (= BB 側 condition callback から呼ばれる)。
+// Property.condition に function を渡すと Group 各インスタンス単位で判定される
+// (= 対象 group だけに Property が生えて汚染しない)。
+function isSpringGroupForProperty(group: unknown): boolean {
+	const name = (group as { name?: unknown } | null)?.name
+	return typeof name === 'string' && name.startsWith(BONE_NAME_PREFIX)
+}
+
+// Property 3 個を Group に register。 plugin onload で 1 回だけ呼ぶ。
+// element_panel input は edit モードのみ表示 (= BB 本体側の element_panel.ts condition)、
+// animate モードでは自然に消える。 animate モード用の値編集は Commit 2 の専用 Panel で提供。
+function registerProperties(): void {
+	if (typeof Property !== 'function') {
+		console.warn(`[${PLUGIN_ID}] Property class not available, skipping property registration`)
+		return
+	}
+
+	const makeConfig = (label: string, defaultValue: number, min: number, max: number, step: number) => ({
+		default: defaultValue,
+		condition: isSpringGroupForProperty,
+		inputs: {
+			element_panel: {
+				input: { label, type: 'number', min, max, step },
+				onChange: onSpringPropertyChange,
+			},
+		},
+	})
+
+	new Property(Group, 'number', 'spring_drag', makeConfig('Spring drag', DEFAULT_CONFIG.drag, 0, 1, 0.01))
+	new Property(Group, 'number', 'spring_stiffness', makeConfig('Spring stiffness', DEFAULT_CONFIG.stiffness, 0, 10, 0.1))
+	new Property(Group, 'number', 'spring_gravity', makeConfig('Spring gravity', DEFAULT_CONFIG.gravity, 0, 100, 1))
+}
+
+// plugin onunload で Property を Group.properties から delete。 unload → reload で
+// 二重登録警告が出るのを避ける。 Group instance 側の値は blueprint 側に既に serialize
+// されていれば reload 時に自動で復帰する。
+function unregisterProperties(): void {
+	const props = (Group as { properties?: Record<string, unknown> } | undefined)?.properties
+	if (!props) return
+	for (const key of PROPERTY_KEYS) {
+		delete props[key]
+	}
 }
 
 interface BoneEntry {
@@ -142,7 +219,14 @@ function registerGroup(group: any): void {
 	}
 	registry.set(group.uuid, {
 		group,
-		config: { ...DEFAULT_CONFIG, restLength },
+		// Property 値を初期 config に反映 (= Property 未 register / 未設定なら DEFAULT_CONFIG fallback)。
+		// registerGroup は idempotent スキップで state を保持するため、 このパスは新規 register 時のみ通る。
+		config: {
+			drag: readSpringProp(group, 'spring_drag', DEFAULT_CONFIG.drag),
+			stiffness: readSpringProp(group, 'spring_stiffness', DEFAULT_CONFIG.stiffness),
+			gravity: readSpringProp(group, 'spring_gravity', DEFAULT_CONFIG.gravity),
+			restLength,
+		},
 		state: createState(),
 		restLocalDir,
 		parentUuid: getSpringParentUuid(group),
@@ -203,16 +287,20 @@ function rebuildTopoOrder(groups: unknown[]): void {
 	topoOrder = uuids
 }
 
-// chain 構造の fingerprint 計算 (= topology 変化検知用)。 uuid 昇順に整列した
-// 「uuid:parentUuid:restLength:restLocalDir」 の連結。 数値は小数丸めで安定化。
-// restLocalDir も含めることで「同長で方向だけ変わった origin 編集」 でも invalidate する。
+// chain 構造 + Property パラの fingerprint 計算 (= topology / config 変化検知用)。 uuid
+// 昇順に整列した「uuid:parentUuid:restLength:restLocalDir:drag,stiffness,gravity」 の連結。
+// 数値は小数丸めで安定化。 restLocalDir も含めることで「同長で方向だけ変わった origin 編集」
+// でも invalidate する。 drag / stiffness / gravity を含めることで、 Property 値変更が
+// 「topology 変化と同じ扱い」 で next tick に 0 replay をトリガする (= 値変更が scrub
+// を待たずに即 preview に反映される、 element_panel input の onChange と両輪で動作)。
 function computeGraphFingerprint(): string {
 	const uuids = Array.from(registry.keys()).sort()
 	return uuids
 		.map((u) => {
 			const e = registry.get(u)!
 			const d = e.restLocalDir
-			return `${u}:${e.parentUuid ?? '-'}:${e.config.restLength.toFixed(4)}:${d.x.toFixed(3)},${d.y.toFixed(3)},${d.z.toFixed(3)}`
+			const c = e.config
+			return `${u}:${e.parentUuid ?? '-'}:${c.restLength.toFixed(4)}:${d.x.toFixed(3)},${d.y.toFixed(3)},${d.z.toFixed(3)}:${c.drag.toFixed(3)},${c.stiffness.toFixed(3)},${c.gravity.toFixed(3)}`
 		})
 		.join('|')
 }
@@ -243,13 +331,19 @@ function rescanRegistry(): void {
 		if (isSpringGroup(g)) registerGroup(g as any)
 	}
 
-	// 既存 entry の chain link + rest 系を最新の rig 状態から refresh。
+	// 既存 entry の chain link + rest 系 + Property 由来の物理パラを最新の rig 状態から refresh。
 	// registerGroup は idempotent スキップで state (= 慣性など) を保持するが、
 	// 構造情報 (= parentUuid / restLocalDir / restLength) は「rig 編集の瞬間」 の
 	// 最新値を反映する。 rest 系の反映は length constraint が新値に合わせて hard snap
 	// するため若干のジャンプが出るが、 構造整合を優先する。
+	// Property 値 (= drag / stiffness / gravity) も同時に読み直す。 これで
+	// blueprint reload / Undo / 別チャネル (= 例 : 将来の専用 Panel) からの変更が
+	// tick 経路で自然に取り込まれる。
 	for (const entry of registry.values()) {
 		entry.parentUuid = getSpringParentUuid(entry.group)
+		entry.config.drag = readSpringProp(entry.group, 'spring_drag', DEFAULT_CONFIG.drag)
+		entry.config.stiffness = readSpringProp(entry.group, 'spring_stiffness', DEFAULT_CONFIG.stiffness)
+		entry.config.gravity = readSpringProp(entry.group, 'spring_gravity', DEFAULT_CONFIG.gravity)
 		const child = findChildGroup(entry.group)
 		if (child) {
 			const d = originDelta(entry.group, child)
@@ -533,6 +627,10 @@ Plugin.register(PLUGIN_ID, {
 	version: PLUGIN_VERSION,
 	onload() {
 		console.log(`[${PLUGIN_ID}] loaded v${PLUGIN_VERSION}`)
+		// Property 3 個 (= spring_drag / spring_stiffness / spring_gravity) を Group に register。
+		// element_panel input (= 数値 + NumSlider) が edit モードで自動生成される。
+		// tick loop は Property が生えている前提で config 値を読むため、 Property 登録が先。
+		registerProperties()
 		cleanups.push(installTickLoop())
 	},
 	onunload() {
@@ -544,6 +642,9 @@ Plugin.register(PLUGIN_ID, {
 			}
 		}
 		cleanups = []
+		// Property を Group.properties から delete (= reload 時の二重登録警告回避)。
+		// blueprint 側にはシリアライズされた値が残るため、 再 register で自動復帰する。
+		unregisterProperties()
 		console.log(`[${PLUGIN_ID}] unloaded`)
 	},
 })
