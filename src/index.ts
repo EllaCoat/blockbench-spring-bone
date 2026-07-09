@@ -34,9 +34,10 @@ declare const Modes: { animate?: boolean; edit?: boolean } | undefined
 declare const THREE: any
 
 const PLUGIN_ID = 'spring_bone'
-const PLUGIN_VERSION = '0.0.9'
+const PLUGIN_VERSION = '0.0.10'
 
-// Phase 1 PoC 設定。 Phase 3 で per-bone UI / property に置き換える。
+// per-bone UI / Property panel は今後の Phase で追加予定 (= 現行 plan では
+// Phase 1 chain graph + Phase 2 ordered pass + Phase 3 gravity まで済、 UI は未着手)。
 const BONE_NAME_PREFIX = 'spring_'
 
 // 物理パラ (= VRM SpringBone デフォルト相当)
@@ -45,8 +46,8 @@ const FIXED_DT = 1 / 60
 const FAST_FORWARD_THRESHOLD = 0.5
 const DEFAULT_CONFIG: Omit<SpringConfig, 'restLength'> = {
 	drag: 0.05,        // 速度減衰 = 5% / step (= ふんわり残響、 VRM デフォルト相当)
-	stiffness: 1.0,    // 親方向への引力係数
-	gravity: 0,        // 重力加速度 (world -Y)、 既定 = 無効。 Phase 4 実機で値調整予定
+	stiffness: 1.0,    // 親方向への per-step force coefficient
+	gravity: 0,        // world -Y への per-step force、 既定 = 無効。 実機検証で値調整予定
 }
 
 interface BoneEntry {
@@ -63,14 +64,36 @@ interface BoneEntry {
 const registry = new Map<string, BoneEntry>()
 // topoOrder = registry のキーを chain root → leaf の順に並べた配列。
 // depth 昇順、 tie-break は Project.groups の出現順 (= deterministic 確保)。
-// Phase 2 で stepAll / applyAll の逐次 pass の iteration 順に使う。
+// stepAndApplyOrdered / applyOnlyOrdered / resetAllToRest の iteration 順に使う。
 let topoOrder: string[] = []
+// chain 構造の指紋 (= uuid:parentUuid:restLength の連結)。 rescan で fingerprint が
+// 変わった = topology が変化 (= reparent / rename / restLength / add / remove) と判定、
+// 変化時に simTime = -1 で次 tick の 0 replay をトリガする。 update_selection の
+// クリック保持は「構造不変 = fingerprint 不変」 のため simTime 影響なし。
+let lastGraphFingerprint = ''
 let simTime = -1          // 現在 sim 状態が表現してる時刻 (= 秒)、 -1 = 未初期化
 let inhibitTick = false   // applyPoseAt 由来の再描画で tick が再入するのを防ぐ
 
 function isSpringGroup(group: unknown): boolean {
 	const name = (group as { name?: unknown } | null)?.name
 	return typeof name === 'string' && name.startsWith(BONE_NAME_PREFIX)
+}
+
+// outliner 上を上に辿って最寄りの spring 祖先を返す。 中間に非 spring group を
+// 挟んだ chain (= spring_a > plain > spring_c) でも spring_c の parent を spring_a
+// と解釈するため。 chain root (= spring 祖先なし) は null。 updateMatrixWorld(true)
+// は中間 plain group を通して子孫まで伝播するので、 depth / topo 順さえ正しければ
+// anchor / boneAxis の read は正しく親の物理反映後を見る。
+function getSpringParentUuid(group: unknown): string | null {
+	let cursor = (group as { parent?: unknown } | null)?.parent
+	while (cursor && typeof cursor === 'object') {
+		if (isSpringGroup(cursor)) {
+			const uuid = (cursor as { uuid?: unknown }).uuid
+			return typeof uuid === 'string' ? uuid : null
+		}
+		cursor = (cursor as { parent?: unknown }).parent
+	}
+	return null
 }
 
 function originDelta(parent: { origin?: number[] }, child: { origin?: number[] }): {
@@ -100,6 +123,7 @@ function findChildGroup(group: { children?: unknown[] }): { origin?: number[] } 
 }
 
 function registerGroup(group: any): void {
+	if (typeof group?.uuid !== 'string') return
 	if (registry.has(group.uuid)) return
 	const child = findChildGroup(group)
 	let restLength = 16
@@ -111,21 +135,12 @@ function registerGroup(group: any): void {
 			restLocalDir = d.dir
 		}
 	}
-	// 親 group が spring group (= 名前が spring_ prefix) なら chain 中間、
-	// でなければ chain root。 parent が "root" 文字列や null のケースも root 扱い。
-	const parent = (group as { parent?: unknown }).parent
-	const parentUuid =
-		parent && typeof parent === 'object' && isSpringGroup(parent)
-			? (typeof (parent as { uuid?: unknown }).uuid === 'string'
-					? (parent as { uuid: string }).uuid
-					: null)
-			: null
 	registry.set(group.uuid, {
 		group,
 		config: { ...DEFAULT_CONFIG, restLength },
 		state: createState(),
 		restLocalDir,
-		parentUuid,
+		parentUuid: getSpringParentUuid(group),
 		depth: 0, // rebuildTopoOrder で再計算される
 	})
 }
@@ -146,8 +161,13 @@ function rebuildTopoOrder(groups: unknown[]): void {
 		const cached = depthCache.get(uuid)
 		if (cached !== undefined) return cached
 		if (seen.has(uuid)) {
-			// 万一 chain がループしていたら root 扱いで打ち切る (= 安全側)
+			// cycle 検出。 該当 entry の parentUuid を null 化して cycle を破り、
+			// depth 0 (= root 扱い) に確定させる。 BB outliner の tree 構造では
+			// cycle は通常発生しないが、 万一の防御と検知のため console.warn を 1 発。
+			const entry = registry.get(uuid)
+			if (entry) entry.parentUuid = null
 			depthCache.set(uuid, 0)
+			console.warn(`[${PLUGIN_ID}] cycle detected in spring chain at ${uuid}, breaking as root`)
 			return 0
 		}
 		const entry = registry.get(uuid)
@@ -166,14 +186,28 @@ function rebuildTopoOrder(groups: unknown[]): void {
 		entry.depth = depthOf(uuid, new Set())
 	}
 
+	// topoOrder = depth 昇順 (= root → leaf)、 tie-break は Project.groups 出現順。
+	// sort 内 depth は entry.depth を直接参照 (= depthCache はローカル実装詳細に閉じる)。
 	const uuids = Array.from(registry.keys())
 	uuids.sort((a, b) => {
-		const da = depthCache.get(a) ?? 0
-		const db = depthCache.get(b) ?? 0
+		const da = registry.get(a)?.depth ?? 0
+		const db = registry.get(b)?.depth ?? 0
 		if (da !== db) return da - db
 		return (orderIndex.get(a) ?? Number.MAX_SAFE_INTEGER) - (orderIndex.get(b) ?? Number.MAX_SAFE_INTEGER)
 	})
 	topoOrder = uuids
+}
+
+// chain 構造の fingerprint 計算 (= topology 変化検知用)。 uuid 昇順に整列した
+// 「uuid:parentUuid:restLength」 の連結。 restLength は小数丸めで安定化。
+function computeGraphFingerprint(): string {
+	const uuids = Array.from(registry.keys()).sort()
+	return uuids
+		.map((u) => {
+			const e = registry.get(u)!
+			return `${u}:${e.parentUuid ?? '-'}:${e.config.restLength.toFixed(4)}`
+		})
+		.join('|')
 }
 
 // idempotent rescan : 既存 entry の state は保持、 不在 group のみ削除、 新規 group のみ追加。
@@ -185,6 +219,7 @@ function rescanRegistry(): void {
 	if (!Array.isArray(groups)) {
 		registry.clear()
 		topoOrder = []
+		lastGraphFingerprint = ''
 		return
 	}
 	const currentUuids = new Set<string>()
@@ -201,19 +236,32 @@ function rescanRegistry(): void {
 		if (isSpringGroup(g)) registerGroup(g as any)
 	}
 
-	// 既存 entry の parentUuid を最新の group.parent から refresh。
-	// registerGroup は idempotent スキップで state を保持するが、 chain 構造
-	// (= 親子関係) は「rig を編集した瞬間」 の最新値を反映すべきなのでここで更新する。
+	// 既存 entry の chain link + rest 系を最新の rig 状態から refresh。
+	// registerGroup は idempotent スキップで state (= 慣性など) を保持するが、
+	// 構造情報 (= parentUuid / restLocalDir / restLength) は「rig 編集の瞬間」 の
+	// 最新値を反映する。 rest 系の反映は length constraint が新値に合わせて hard snap
+	// するため若干のジャンプが出るが、 構造整合を優先する。
 	for (const entry of registry.values()) {
-		const parent = (entry.group as { parent?: unknown }).parent
-		entry.parentUuid =
-			parent && typeof parent === 'object' && isSpringGroup(parent)
-				? (typeof (parent as { uuid?: unknown }).uuid === 'string'
-						? (parent as { uuid: string }).uuid
-						: null)
-				: null
+		entry.parentUuid = getSpringParentUuid(entry.group)
+		const child = findChildGroup(entry.group)
+		if (child) {
+			const d = originDelta(entry.group, child)
+			if (d.dir && d.length > 0) {
+				entry.restLocalDir = d.dir
+				entry.config.restLength = d.length
+			}
+		}
 	}
 	rebuildTopoOrder(groups)
+
+	// topology (= chain 構造 / restLength) が変わったら sim state を invalidate。
+	// 次 tick は replayFromStartTo が起動し、 新構造に合わせて 0 から replay する。
+	// クリック保持 (= update_selection) は fingerprint 不変 → simTime 影響なし。
+	const fp = computeGraphFingerprint()
+	if (fp !== lastGraphFingerprint) {
+		lastGraphFingerprint = fp
+		simTime = -1
+	}
 }
 
 // 任意の animation 時刻に rig を当てる (= anim_ux Onion Skin / AJ updatePreview と同パターン)。
@@ -244,12 +292,16 @@ function getAnchorWorld(entry: BoneEntry, out: any): boolean {
 	return true
 }
 
+// getBoneAxisWorld で使い回す quaternion scratch。 per-sub-step の new Quaternion() を
+// 避けて GC 圧を減らす (= chain 化で bone × sub-step 数が効く段になったため)。
+// single-thread 前提で使い回し、 呼び出し間の値保持は前提しない。
+const _boneAxisScratchQuat = new THREE.Quaternion()
+
 function getBoneAxisWorld(entry: BoneEntry, out: any): boolean {
 	const parent = entry.group.mesh?.parent
 	if (!parent) return false
-	const parentQuat = new THREE.Quaternion()
-	parent.getWorldQuaternion(parentQuat)
-	out.copy(entry.restLocalDir).applyQuaternion(parentQuat)
+	parent.getWorldQuaternion(_boneAxisScratchQuat)
+	out.copy(entry.restLocalDir).applyQuaternion(_boneAxisScratchQuat)
 	return true
 }
 
@@ -313,8 +365,11 @@ function stepAndApplyOrdered(dt: number): void {
 }
 
 // 同時刻パス (= tick で sim 進めない、 state 不変で描画のみ更新する経路)。
-// applyPoseAt は既に一度走って全 bone が keyframe pose に、 matrixWorld も伝播済み前提。
-// あとは topo 順に「anchor 読み → rotation 書き → updateMatrixWorld(true)」 で
+// この経路では applyPoseAt はこの tick で走らない。 前提は「Blockbench 本体が
+// display_animation_frame 発火前に現在時刻 (= 非 snap) の pose を当てている」 こと。
+// 状態 (= state.pos) は snap 時刻、 anchor は非 snap 時刻の pose という 1 frame 未満の
+// ミスマッチが仕込みだが、 frame 単位では deterministic なので実害なし。
+// topo 順に「anchor 読み → rotation 書き → updateMatrixWorld(true)」 で
 // 各 entry の物理 state に対応した pose を描画に反映する。
 function applyOnlyOrdered(): void {
 	if (registry.size === 0) return
@@ -456,6 +511,7 @@ function installTickLoop(): () => void {
 		Blockbench.removeListener?.('select_mode', onModeChange)
 		registry.clear()
 		topoOrder = []
+		lastGraphFingerprint = ''
 		simTime = -1
 	}
 }
