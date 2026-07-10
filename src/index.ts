@@ -339,10 +339,13 @@ function registerContextMenuActions(): void {
 		// springify 側と対称の evaluateActionScope 経由判定 (Sol Round 3 MUST-2)。
 		// 「spring group が 1 個でも選択範囲にあれば表示」、 click 側 (multi_selected filter) と一致する
 		// 走査で、 混在選択時の表示発火食い違い排除。
+		// 名前がちょうど `spring_` (= prefix のみで本体空) の Group は除外 = click 側の長さ guard と揃える
+		// (Sol Round 4 IMO-1、 表示されるが click で発火しない見せかけを排除)。
 		condition: (context?: unknown) =>
-			evaluateActionScope(context, (g) =>
-				hasSpringPrefix((g as { name?: unknown } | null)?.name),
-			false),
+			evaluateActionScope(context, (g) => {
+				const n = (g as { name?: unknown } | null)?.name
+				return typeof n === 'string' && n.startsWith(BONE_NAME_PREFIX) && n.length > BONE_NAME_PREFIX.length
+			}, false),
 		click() {
 			// prefix 除去後に空文字にならない (= 「spring_」 だけの group を弾く、 N-3 guard) 条件込みで filter。
 			const groups = ((Group as { multi_selected?: unknown[] })?.multi_selected ?? []).filter(
@@ -1019,10 +1022,10 @@ function restoreAnimatorPose(snap: AnimatorPoseSnapshot): void {
 		// pre_rotation は BB group.js の rest Euler 相当 = stackAnimations 経由で書き換わるため、
 		// restore しないと複数 animation stack + 回転キー編集時に基準角ずれで keyframe が汚染される
 		// (Sol Round 2 MUST-2、 pose transaction の完全性)。
-		// hasPre=false ケース (= snapshot 時 pre_rotation なかった mesh) でも、 transaction 中に
-		// applyPoseAt が pre_rotation を生成した場合は identity (0,0,0) に reset して痕跡消去
-		// (Sol Round 3 MUST-1、 「存在しなかった状態」 の復元)。 delete まではしない (= BB 側
-		// property 参照経路が壊れるのを避ける)、 xyz=0 で pre_rotation 無し相当の効果。
+		// hasPre=false ケースは **delete で property そのものを消去** する (Sol Round 4 MUST-1)。
+		// xyz=0 埋めだと BB 本体の `mesh.pre_rotation ?? mesh.fix_rotation` fallback が阻害されて
+		// 「不存在」 と等価にならず、 非ゼロ rest rotation が無視されるため、 property そのものを
+		// delete して fallback を有効化する必要がある。
 		if (e.mesh.pre_rotation) {
 			if (e.hasPre) {
 				e.mesh.pre_rotation.x = e.prx
@@ -1032,9 +1035,7 @@ function restoreAnimatorPose(snap: AnimatorPoseSnapshot): void {
 					e.mesh.pre_rotation.order = e.pro
 				}
 			} else {
-				e.mesh.pre_rotation.x = 0
-				e.mesh.pre_rotation.y = 0
-				e.mesh.pre_rotation.z = 0
+				delete e.mesh.pre_rotation
 			}
 		}
 	}
