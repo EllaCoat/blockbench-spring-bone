@@ -826,17 +826,37 @@ function installTickLoop(): () => void {
 		// mode 切替で sim 状態を捨てる (= 次 animate モード復帰時に頭から replay)
 		simTime = -1
 	}
+	// 症状 1 (Undo できない) の primary fix : undo / redo で group.spring_* 値は元に戻るが、
+	// plugin 側の entry.config と Panel の form 表示は BB event 経由でしか同期されない。
+	// この listener が無いと「値は復元されたのに entry.config と UI は旧値のまま」 で
+	// 「Ctrl+Z が効いていないように見える」 症状となる。 rescanRegistry で config 再読込 +
+	// simTime = -1 で fingerprint 変化を経由して次 tick に 0 replay 起動、 updateSelection で
+	// element_panel / Panel の表示値を BB core 側の refresh 経路に載せる。
+	const onUndoRedo = (): void => {
+		try {
+			rescanRegistry()
+			simTime = -1
+			updateSelection()
+			if (Modes?.animate) Animator?.preview?.()
+		} catch (e) {
+			console.warn(`[${PLUGIN_ID}] undo/redo refresh failed`, e)
+		}
+	}
 
 	Blockbench.on('display_animation_frame', onAnimFrame)
 	Blockbench.on('select_project', onProjectSwitch)
 	Blockbench.on('update_selection', onUpdateSelection)
 	Blockbench.on('select_mode', onModeChange)
+	Blockbench.on('undo', onUndoRedo)
+	Blockbench.on('redo', onUndoRedo)
 
 	return (): void => {
 		Blockbench.removeListener?.('display_animation_frame', onAnimFrame)
 		Blockbench.removeListener?.('select_project', onProjectSwitch)
 		Blockbench.removeListener?.('update_selection', onUpdateSelection)
 		Blockbench.removeListener?.('select_mode', onModeChange)
+		Blockbench.removeListener?.('undo', onUndoRedo)
+		Blockbench.removeListener?.('redo', onUndoRedo)
 		registry.clear()
 		topoOrder = []
 		lastGraphFingerprint = ''

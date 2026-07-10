@@ -104,19 +104,47 @@ export function registerSpringPanel(onChange: () => void): () => void {
 		console.warn('[spring_bone] form.buildForm failed', e)
 	}
 
-	// form input event : 値変更を group Property に反映 + Undo wrap + registry sync。
-	// element_panel.ts:76-91 と同 pattern を単純化 (= 選択 group が spring_ prefix の 1 個のみ想定)。
+	// 症状 1 (Undo 粒度爆発) の primary fix : NumSlider の onBefore/onAfter に
+	// initEdit/finishEdit を寄せて per-gesture 1 Undo entry に集約する。 BB core の
+	// NumSlider (= actions.ts:1179/1210) は drag 開始 → onBefore、 drag 終了 → onAfter を
+	// per-gesture 1 回ずつ発火する。 arrow key (:1112/1119)、 text 確定 (:1445-1454) も同経路。
+	// これで form.on('input') が per-move-event で発火しても Undo entry は 1 gesture 1 個で済む。
+	// form.buildForm() 後に form.form_data[key].slider が生きているタイミングで差し替える。
+	for (const meta of PANEL_INPUTS) {
+		const element = (form as any).form_data?.[meta.key]
+		const slider = element?.slider
+		if (slider) {
+			slider.onBefore = () => {
+				if (!isSpringSelectionActive()) return
+				try {
+					Undo?.initEdit?.({ groups: [Group.first_selected] })
+				} catch (e) {
+					console.warn('[spring_bone] slider onBefore failed', e)
+				}
+			}
+			slider.onAfter = () => {
+				if (!isSpringSelectionActive()) return
+				try {
+					Undo?.finishEdit?.('Change spring config')
+				} catch (e) {
+					console.warn('[spring_bone] slider onAfter failed', e)
+				}
+			}
+		}
+	}
+
+	// form input event : 値変更を group Property に反映 + registry sync。
+	// Undo wrap は onBefore/onAfter に寄せた (= per-gesture 集約) ため、 ここでは書き込みと
+	// registry sync だけ担う (= per-move-event で発火するが Undo entry は積まれない)。
 	form.on('input', ({ result, changed_keys }: { result: Record<string, number>; changed_keys: string[] }) => {
 		if (!isSpringSelectionActive()) return
 		const g = Group.first_selected
 		try {
-			Undo?.initEdit?.({ groups: [g] })
 			// changed_keys は PANEL_INPUTS の key (= drag / stiffness / gravity) から来るので
 			// 追加の whitelist ガードは不要 (= 元の or チェーン常に true で冗長だった)。
 			for (const key of changed_keys) {
 				g[`spring_${key}`] = result[key]
 			}
-			Undo?.finishEdit?.('Change spring config')
 		} catch (e) {
 			console.warn('[spring_bone] panel input handler failed', e)
 		}
