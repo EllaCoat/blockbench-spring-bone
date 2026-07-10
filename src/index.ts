@@ -303,7 +303,7 @@ function registerContextMenuActions(): void {
 			// 物理姿勢が残る。 paused / 純物理 bone (= keyframe を持たない) の場合、
 			// showDefaultPose → stackAnimations の loop が「何も当てない」 状態で rest 固定となり
 			// 「アニメーションが完全停止」 に見える (= 症状 3 凍結の真因)。 Animator.preview を明示発火し
-			// 現在 Timeline.time の pose を improt して mesh.rotation を上書きすることで、
+			// 現在 Timeline.time の pose を apply して mesh.rotation を上書きすることで、
 			// 解除された bone の visual が最新 animation state に追従する。
 			if (Modes?.animate) {
 				try {
@@ -851,17 +851,21 @@ function installTickLoop(): () => void {
 		simTime = -1
 	}
 	// 症状 1 (Undo できない) の primary fix : undo / redo で group.spring_* 値は元に戻るが、
-	// plugin 側の entry.config と Panel の form 表示は BB event 経由でしか同期されない。
-	// この listener が無いと「値は復元されたのに entry.config と UI は旧値のまま」 で
-	// 「Ctrl+Z が効いていないように見える」 症状となる。 rescanRegistry で config 再読込 +
-	// simTime = -1 で fingerprint 変化を経由して次 tick に 0 replay 起動、 updateSelection で
-	// element_panel / Panel の表示値を BB core 側の refresh 経路に載せる。
+	// plugin 側の entry.config は BB event 経由でしか同期されない。 この listener が無いと
+	// 「値は復元されたのに entry.config は旧値のまま」 で「Ctrl+Z が効いていないように見える」
+	// 症状となる。 rescanRegistry で config 再読込 + simTime = -1 で fingerprint 変化経由の
+	// 次 tick 0 replay を起動する。 keyframe undo は fingerprint を触らないので simTime = -1
+	// は unconditional 必要 (= Fable Round 3 IMO-1 の指摘、 undo-path の厳格さ)。
+	//
+	// updateSelection() + Animator.preview() は敢えて呼ばない : BB core の loadUndoSave は
+	// 'undo'/'redo' event dispatch 直前 (= undo.js:823 / 830-832) に updateSelection と
+	// (animate 時) Animator.preview を既に発火済。 その updateSelection → 我々の
+	// onUpdateSelection listener 経路でも rescan は走る。 ここで再呼びすると undo 1 回で
+	// 最大 2 回 full replay となり性能を大きく食う (= Fable Round 3 WANT-1)。
 	const onUndoRedo = (): void => {
 		try {
 			rescanRegistry()
 			simTime = -1
-			updateSelection()
-			if (Modes?.animate) Animator?.preview?.()
 		} catch (e) {
 			console.warn(`[${PLUGIN_ID}] undo/redo refresh failed`, e)
 		}

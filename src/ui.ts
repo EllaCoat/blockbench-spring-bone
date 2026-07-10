@@ -110,6 +110,12 @@ export function registerSpringPanel(onChange: () => void): () => void {
 	// per-gesture 1 回ずつ発火する。 arrow key (:1112/1119)、 text 確定 (:1445-1454) も同経路。
 	// これで form.on('input') が per-move-event で発火しても Undo entry は 1 gesture 1 個で済む。
 	// form.buildForm() 後に form.form_data[key].slider が生きているタイミングで差し替える。
+	//
+	// edit_started フラグは onBefore で initEdit を実際に発火できたかを追跡する。
+	// drag 中に selection が非 spring group へ切り替わっても、 edit_started なら onAfter は
+	// 必ず finishEdit を呼んで Undo transaction を閉じる (= Codex Round 3 IMO-1 対策、
+	// 未対応だと initEdit が開きっぱなしになり後続の Undo 操作が壊れる)。
+	let edit_started = false
 	for (const meta of PANEL_INPUTS) {
 		const element = (form as any).form_data?.[meta.key]
 		const slider = element?.slider
@@ -118,16 +124,19 @@ export function registerSpringPanel(onChange: () => void): () => void {
 				if (!isSpringSelectionActive()) return
 				try {
 					Undo?.initEdit?.({ groups: [Group.first_selected] })
+					edit_started = true
 				} catch (e) {
 					console.warn('[spring_bone] slider onBefore failed', e)
 				}
 			}
 			slider.onAfter = () => {
-				if (!isSpringSelectionActive()) return
+				if (!edit_started) return
 				try {
 					Undo?.finishEdit?.('Change spring config')
 				} catch (e) {
 					console.warn('[spring_bone] slider onAfter failed', e)
+				} finally {
+					edit_started = false
 				}
 			}
 		}
