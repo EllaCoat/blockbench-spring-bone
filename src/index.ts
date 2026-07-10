@@ -415,10 +415,68 @@ function registerContextMenuActions(): void {
 		},
 	})
 
+	// 子孫再帰版の spring 解除 sub-action (= 選択 group + 全子孫の spring_ prefix を一括剥がし)。
+	// springify_recursive の対称版、 chain 途中で不用意に spring 化した range を一気に戻す用途。
+	const unspringify_recursive = new Action(`${PLUGIN_ID}_unspringify_recursive`, {
+		name: 'Spring 解除 (子孫含む)',
+		icon: 'link_off',
+		condition: (context?: unknown) => {
+			const target = isRealGroup(context) ? context : (Group as { first_selected?: unknown })?.first_selected
+			if (!target) return false
+			// 選択部分木のどれか 1 個でも spring group があれば表示 (= 空剥がしを避ける)
+			for (const g of collectGroupAndDescendants(target)) {
+				const n = (g as { name?: unknown } | null)?.name
+				if (typeof n === 'string' && n.startsWith(BONE_NAME_PREFIX) && n.length > BONE_NAME_PREFIX.length) return true
+			}
+			return false
+		},
+		click() {
+			const selected = ((Group as { multi_selected?: unknown[] })?.multi_selected ?? []) as unknown[]
+			const seenUuids = new Set<string>()
+			const targets: Array<{ name: string }> = []
+			for (const s of selected) {
+				for (const g of collectGroupAndDescendants(s)) {
+					const uuid = (g as { uuid?: unknown } | null)?.uuid
+					if (typeof uuid !== 'string' || seenUuids.has(uuid)) continue
+					seenUuids.add(uuid)
+					const n = (g as { name?: unknown } | null)?.name
+					if (typeof n === 'string' && n.startsWith(BONE_NAME_PREFIX) && n.length > BONE_NAME_PREFIX.length) {
+						targets.push(g as { name: string })
+					}
+				}
+			}
+			if (targets.length === 0) return
+			try {
+				Undo?.initEdit?.({ groups: targets })
+				for (const g of targets) g.name = g.name.slice(BONE_NAME_PREFIX.length)
+				Undo?.finishEdit?.('Spring 解除 (子孫含む)')
+			} catch (e) {
+				console.warn(`[${PLUGIN_ID}] unspringify_recursive failed`, e)
+			}
+			try {
+				rescanRegistry()
+			} catch (e) {
+				console.warn(`[${PLUGIN_ID}] rescanRegistry failed after unspringify_recursive`, e)
+			}
+			try {
+				updateSelection()
+			} catch (e) {
+				console.warn(`[${PLUGIN_ID}] updateSelection failed after unspringify_recursive`, e)
+			}
+			if (Modes?.animate) {
+				try {
+					Animator?.preview?.()
+				} catch (e) {
+					console.warn(`[${PLUGIN_ID}] preview refresh failed after unspringify_recursive`, e)
+				}
+			}
+		},
+	})
+
 	// Group.prototype.menu.structure に append (= 「rename」「delete」 の末尾に並ぶ)。
 	const sep = new MenuSeparator(`${PLUGIN_ID}_actions`)
-	menu.structure.push(sep, springify, springify_recursive, unspringify)
-	registeredMenuEntries.push(sep, springify, springify_recursive, unspringify)
+	menu.structure.push(sep, springify, springify_recursive, unspringify, unspringify_recursive)
+	registeredMenuEntries.push(sep, springify, springify_recursive, unspringify, unspringify_recursive)
 }
 
 function unregisterContextMenuActions(): void {
