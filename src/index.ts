@@ -1055,14 +1055,15 @@ function getAnchorWorld(entry: BoneEntry, out: any): boolean {
 //                「時刻 t の keyframe pose」、 同時刻パスでは BB core が当てた「現時刻 pose」)
 //   q_parentW  = mesh.parent の world quaternion
 //   d_simW     = normalize(state.pos - anchorWorld) (物理 tip 方向、 world 座標)
-//   d_animP    = normalize(q_base × r) (keyframe pose の bone 軸、 parent-local)
+//   d_animP    = normalize(r) (rest bone 軸、 parent-local、 own-rotation 独立化で qBase 除外)
 //   d_simP     = normalize(inverse(q_parentW) × d_simW) (物理シム目標、 parent-local)
 //   ΔP        = setFromUnitVectors(d_animP, d_simP) (keyframe → 物理 の parent-local swing)
 //   q_final   = ΔP × q_base (前乗算)
 // 静的 rest からの delta をそのまま代入していた旧経路は、 現行 keyframe rotation の上に
 // 「rest→物理」 を二重適用する形になり keyframe pose が消えていた (= 既存アニメパラ無視症状)。
 // 4 step 化で keyframe rotation を保存しつつ物理揺れ delta を parent-local で prepend する。
-// solver 目標 boneAxisWorld も q_parentW × q_base × r に切替、 static rest 目標との綱引きを排除。
+// own-rotation 独立化 (2026-07-10) 以降、 solver 目標 boneAxisWorld と d_animP は q_parentW × r 基準に
+// 統一 (= 自身の q_base を solver 目標 + Δ 合成基準から排除、 親 rotation は q_parentW 経由で反映)。
 function composeSpringPose(
 	entry: BoneEntry,
 	dt: number,
@@ -1109,8 +1110,8 @@ function composeSpringPose(
 	scratch.parentInv.copy(scratch.parentQuat).invert()
 	scratch.dSimP.copy(scratch.forward).applyQuaternion(scratch.parentInv).normalize()
 
-	// ΔP = setFromUnitVectors(d_animP, d_simP) : keyframe → 物理 の parent-local swing。
-	// setFromUnitVectors は twist を生成しない = keyframe twist を保存 (Sol 見落としバグ 9、
+	// ΔP = setFromUnitVectors(d_animP, d_simP) : rest → 物理 の parent-local swing (own-rotation 独立化後)。
+	// setFromUnitVectors は twist を生成しない = twist を保存 (Sol 見落としバグ 9、
 	// 180 度反転付近では回転軸が不連続になり得るが hemisphere 選択は今回未対応 = 次段課題)。
 	scratch.deltaP.setFromUnitVectors(scratch.dAnimP, scratch.dSimP)
 
