@@ -142,8 +142,14 @@ export function registerSpringPanel(onChange: () => void): () => void {
 		try {
 			// changed_keys は PANEL_INPUTS の key (= drag / stiffness / gravity) から来るので
 			// 追加の whitelist ガードは不要 (= 元の or チェーン常に true で冗長だった)。
+			// NumSlider text 入力の Molang 分岐 (= BB actions.ts:1421-1435) は NaN を返し得るため、
+			// 書き込み前に finite check (= 潜在バグ Fable #2)。 非 finite は silent drop、
+			// readSpringProp 側 fallback (= DEFAULT_CONFIG) と併せて sim が汚染されない。
 			for (const key of changed_keys) {
-				g[`spring_${key}`] = result[key]
+				const v = result[key]
+				if (typeof v === 'number' && Number.isFinite(v)) {
+					g[`spring_${key}`] = v
+				}
 			}
 		} catch (e) {
 			console.warn('[spring_bone] panel input handler failed', e)

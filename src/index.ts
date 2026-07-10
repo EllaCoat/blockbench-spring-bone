@@ -394,9 +394,26 @@ function originDelta(parent: { origin?: number[] }, child: { origin?: number[] }
 	if (!Array.isArray(parent.origin) || !Array.isArray(child.origin)) {
 		return { dir: null, length: 0 }
 	}
-	const dx = child.origin[0] - parent.origin[0]
-	const dy = child.origin[1] - parent.origin[1]
-	const dz = child.origin[2] - parent.origin[2]
+	// 6 座標 finite validate (= 潜在バグ Codex HIGH)。 手入力 .bbmodel や NumSlider Molang 経路
+	// (= BB actions.ts:1421-1435) で NaN / Infinity が origin に紛れ込むと、 dx / length が
+	// NaN 伝播し restLocalDir / restLength → step / setFromUnitVectors → mesh.rotation まで
+	// 汚染される (= NaN quaternion が rendering 全体を狂わす)。 6 座標いずれかが非 finite なら
+	// 「無効な rig」 扱いで invariance を返す。
+	const p0 = parent.origin[0]
+	const p1 = parent.origin[1]
+	const p2 = parent.origin[2]
+	const c0 = child.origin[0]
+	const c1 = child.origin[1]
+	const c2 = child.origin[2]
+	if (
+		!Number.isFinite(p0) || !Number.isFinite(p1) || !Number.isFinite(p2) ||
+		!Number.isFinite(c0) || !Number.isFinite(c1) || !Number.isFinite(c2)
+	) {
+		return { dir: null, length: 0 }
+	}
+	const dx = c0 - p0
+	const dy = c1 - p1
+	const dz = c2 - p2
 	const length = Math.sqrt(dx * dx + dy * dy + dz * dz)
 	if (length < 1e-4) return { dir: null, length: 0 }
 	return {
@@ -594,12 +611,16 @@ function rescanRegistry(): void {
 
 // 任意の animation 時刻に rig を当てる (= anim_ux Onion Skin / AJ updatePreview と同パターン)。
 // `inhibitTick` で applyPoseAt 起因の display_animation_frame 再発火を弾く。
+// tick 中は Timeline.time を snap 時刻に一時的に書き換えるため、 退避 → 復元で playhead
+// UI との乖離累積を防ぐ (= 潜在バグ Fable #4)。 tick は毎 frame 呼ばれる + snap 時刻は最大
+// 半 FIXED_DT 分ズレるため、 復元しないと ms 単位のズレが累積して UI が微振動する余地がある。
 function applyPoseAt(time: number): void {
 	if (typeof Animator?.showDefaultPose !== 'function') return
 	if (typeof Animator?.stackAnimations !== 'function') return
 	inhibitTick = true
+	const tl: any = Timeline
+	const savedTime = tl?.time
 	try {
-		const tl: any = Timeline
 		if (tl) tl.time = time
 		Animator.showDefaultPose(true)
 		const animSelected = (Animation as any)?.selected
@@ -609,6 +630,9 @@ function applyPoseAt(time: number): void {
 		Animator.stackAnimations(stack, false)
 		Canvas?.scene?.updateMatrixWorld?.(true)
 	} finally {
+		// 元の Timeline.time を復元 (= 呼び出し元の期待する playhead 状態を保つ)。
+		// tl.time が undefined だった場合 (= Timeline 未初期化) は復元不要。
+		if (tl && savedTime !== undefined) tl.time = savedTime
 		inhibitTick = false
 	}
 }
