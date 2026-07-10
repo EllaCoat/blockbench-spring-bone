@@ -371,7 +371,17 @@ function findChildGroup(group: { children?: unknown[] }): { origin?: number[] } 
 
 function registerGroup(group: any): void {
 	if (typeof group?.uuid !== 'string') return
-	if (registry.has(group.uuid)) return
+	// 既存 entry がある場合は group 参照を張り替えて return。 uuid 同一で instance 別のケース
+	// (= project 再オープン / delete → undo で新 Group instance 生成、 BB undo.js:509) が発生する。
+	// outliner_node の get mesh() は uuid 解決なので stale でも物理は動くが、 readSpringProp /
+	// element_panel / Panel からの書き込みは旧 instance を read/write するため、 UI 変更が
+	// entry.config に永遠に届かない (= 実機で観察された「値変更が preview に反映されない」
+	// 症状 primary root cause)。 参照だけ張り替えれば両者が繋がる、 state (= 慣性など) は保持。
+	const existing = registry.get(group.uuid)
+	if (existing) {
+		existing.group = group
+		return
+	}
 	// element_panel の setValues stale value 問題対策 (= Round 1 review W-2)。
 	// instance property が undefined だと form.setValues が「値 undefined = skip」 で
 	// 前の group の値を form に残してしまう。 spring 化した新規 group に対し
