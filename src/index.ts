@@ -955,134 +955,156 @@ function getAnchorWorld(entry: BoneEntry, out: any): boolean {
 	return true
 }
 
-// getBoneAxisWorld で使い回す quaternion scratch。 per-sub-step の new Quaternion() を
-// 避けて GC 圧を減らす (= chain 化で bone × sub-step 数が効く段になったため)。
-// single-thread 前提で使い回し、 呼び出し間の値保持は前提しない。
-const _boneAxisScratchQuat = new THREE.Quaternion()
+// Sol advice の Δ 加算合成 helper (= 「rest 直代入」 の keyframe 上書きを排除)。
+// 記号 :
+//   r          = entry.restLocalDir (parent-local frame の rest bone 軸単位ベクトル)
+//   q_base     = 現時点の mesh.quaternion (= keyframe pose、 sub-step では applyPoseAt が当てた
+//                「時刻 t の keyframe pose」、 同時刻パスでは BB core が当てた「現時刻 pose」)
+//   q_parentW  = mesh.parent の world quaternion
+//   d_simW     = normalize(state.pos - anchorWorld) (物理 tip 方向、 world 座標)
+//   d_animP    = normalize(q_base × r) (keyframe pose の bone 軸、 parent-local)
+//   d_simP     = normalize(inverse(q_parentW) × d_simW) (物理シム目標、 parent-local)
+//   ΔP        = setFromUnitVectors(d_animP, d_simP) (keyframe → 物理 の parent-local swing)
+//   q_final   = ΔP × q_base (前乗算)
+// 静的 rest からの delta をそのまま代入していた旧経路は、 現行 keyframe rotation の上に
+// 「rest→物理」 を二重適用する形になり keyframe pose が消えていた (= 既存アニメパラ無視症状)。
+// 4 step 化で keyframe rotation を保存しつつ物理揺れ delta を parent-local で prepend する。
+// solver 目標 boneAxisWorld も q_parentW × q_base × r に切替、 static rest 目標との綱引きを排除。
+function composeSpringPose(
+	entry: BoneEntry,
+	dt: number,
+	stepSim: boolean,
+	scratch: {
+		anchorWorld: any
+		boneAxisWorld: any
+		forward: any
+		parentQuat: any
+		parentInv: any
+		qBase: any
+		deltaP: any
+		dAnimP: any
+		dSimP: any
+	},
+): void {
+	const mesh = entry.group?.mesh
+	const meshParent = mesh?.parent
+	if (!mesh || !meshParent) return
 
-function getBoneAxisWorld(entry: BoneEntry, out: any): boolean {
-	const parent = entry.group.mesh?.parent
-	if (!parent) return false
-	parent.getWorldQuaternion(_boneAxisScratchQuat)
-	out.copy(entry.restLocalDir).applyQuaternion(_boneAxisScratchQuat)
-	return true
+	scratch.qBase.copy(mesh.quaternion)
+	meshParent.getWorldQuaternion(scratch.parentQuat)
+
+	if (!getAnchorWorld(entry, scratch.anchorWorld)) return
+
+	if (stepSim) {
+		// boneAxisWorld = q_parentW × q_base × r (Sol Δ 3.、 keyframe pose 反映版)。
+		// 現行 rest 直基準では solver が静的 rest を目指して keyframe と綱引き = 綱引き排除。
+		scratch.boneAxisWorld.copy(entry.restLocalDir).applyQuaternion(scratch.qBase).applyQuaternion(scratch.parentQuat)
+		step(entry.state, scratch.anchorWorld, scratch.boneAxisWorld, entry.config, dt)
+	}
+
+	if (!entry.state.initialized) return
+
+	// d_simW = state.pos - anchorWorld (world 方向)、 lengthSq guard で 0 除算防止
+	scratch.forward.subVectors(entry.state.pos, scratch.anchorWorld)
+	if (scratch.forward.lengthSq() < 1e-8) return
+	scratch.forward.normalize()
+
+	// d_animP = q_base × r (parent-local frame の keyframe pose bone 軸)
+	scratch.dAnimP.copy(entry.restLocalDir).applyQuaternion(scratch.qBase).normalize()
+
+	// d_simP = inv(q_parentW) × d_simW (world → parent-local)
+	scratch.parentInv.copy(scratch.parentQuat).invert()
+	scratch.dSimP.copy(scratch.forward).applyQuaternion(scratch.parentInv).normalize()
+
+	// ΔP = setFromUnitVectors(d_animP, d_simP) : keyframe → 物理 の parent-local swing。
+	// setFromUnitVectors は twist を生成しない = keyframe twist を保存 (Sol 見落としバグ 9、
+	// 180 度反転付近では回転軸が不連続になり得るが hemisphere 選択は今回未対応 = 次段課題)。
+	scratch.deltaP.setFromUnitVectors(scratch.dAnimP, scratch.dSimP)
+
+	// q_final = ΔP × q_base (parent-local 前乗算 = premultiply)。
+	// mesh.quaternion への直接書き込みで Three.js の Object3D は rotation を自動同期
+	// (= quaternion.onChange で euler も同期、 mesh.rotation.x/y/z は自然に最新値になる)。
+	mesh.quaternion.copy(scratch.qBase).premultiply(scratch.deltaP)
+
+	// matrixWorld 伝播 → 次 topo entry (= 子孫方向) が親 Δ 反映後の anchor / q_parentW を読める。
+	mesh.updateMatrixWorld(true)
+}
+
+function makeComposeScratch(): {
+	anchorWorld: any
+	boneAxisWorld: any
+	forward: any
+	parentQuat: any
+	parentInv: any
+	qBase: any
+	deltaP: any
+	dAnimP: any
+	dSimP: any
+} {
+	return {
+		anchorWorld: new THREE.Vector3(),
+		boneAxisWorld: new THREE.Vector3(),
+		forward: new THREE.Vector3(),
+		parentQuat: new THREE.Quaternion(),
+		parentInv: new THREE.Quaternion(),
+		qBase: new THREE.Quaternion(),
+		deltaP: new THREE.Quaternion(),
+		dAnimP: new THREE.Vector3(),
+		dSimP: new THREE.Vector3(),
+	}
 }
 
 // Phase 2 : chain 対応の逐次 topo 順 融合 pass。 stepAll + applyAll を 1 つに統合し、
 // sub-step 内で「applyPoseAt(t) で全 bone を keyframe pose にリセット」 → 各 entry を
-// topo 順に「anchor/boneAxis 読み → step → rotation 書き → updateMatrixWorld(true)」
-// で処理する。 これにより chain 子の anchor は「親 spring の物理変位反映後」 の world pos
-// を読める。 一斉 stepAll → 一斉 applyAll だと applyPoseAt が全 bone を keyframe pose に
-// 戻すため、 chain 子は親の spring 変位を「永遠に見ない」 (= 無限 lag) 問題があった。
+// topo 順に「anchor 読み → step → Δ 合成 (= composeSpringPose) → updateMatrixWorld(true)」
+// で処理する。 これにより chain 子の anchor は「親 spring の Δ 反映後」 の world pos を読める。
 // updateMatrixWorld(true) は自分 + 子孫の matrixWorld を伝播 (Blockbench 同梱 Three r129
 // の getWorldQuaternion は内部で ancestor 更新するが、 版依存吸収のため明示的に呼ぶ)。
 function stepAndApplyOrdered(dt: number): void {
 	if (registry.size === 0) return
-	const anchorWorld = new THREE.Vector3()
-	const boneAxisWorld = new THREE.Vector3()
-	const forward = new THREE.Vector3()
-	const parentQuat = new THREE.Quaternion()
-	const parentInv = new THREE.Quaternion()
-	const localForward = new THREE.Vector3()
-	const localQuat = new THREE.Quaternion()
-	const euler = new THREE.Euler()
-
+	const scratch = makeComposeScratch()
 	for (const uuid of topoOrder) {
 		const entry = registry.get(uuid)
 		if (!entry) continue
-		const mesh = entry.group?.mesh
-		const meshParent = mesh?.parent
-		if (!mesh || !meshParent) continue
-
-		if (!getAnchorWorld(entry, anchorWorld)) continue
-		if (!getBoneAxisWorld(entry, boneAxisWorld)) continue
-
-		step(entry.state, anchorWorld, boneAxisWorld, entry.config, dt)
-
-		if (!entry.state.initialized) continue
-
-		// world forward を parent local 化 → restLocalDir からこの方向に向ける最短回転を直接計算。
-		// 旧 basis 構築 (= forward / right / trueUp + lastRight parallel transport) は
-		// trueUp = forward × right が left-handed (= 反射) basis を生み、 setFromRotationMatrix
-		// が非単位 quat を返し、 Euler 抽出で角度が「正確に半分」 になっていた (= half-lock の真因)。
-		// setFromUnitVectors は restLocalDir → localForward の最短回転を直接計算するので、
-		// 反射トラップ + +Y 軸固定仮定 + lastRight hysteresis を一気に解消、 連続性も自然に担保。
-		forward.subVectors(entry.state.pos, anchorWorld)
-		if (forward.lengthSq() < 1e-8) continue
-		forward.normalize()
-
-		meshParent.getWorldQuaternion(parentQuat)
-		parentInv.copy(parentQuat).invert()
-		localForward.copy(forward).applyQuaternion(parentInv)
-		localQuat.setFromUnitVectors(entry.restLocalDir, localForward)
-
-		const order = mesh.rotation.order || 'ZYX'
-		euler.setFromQuaternion(localQuat, order)
-		mesh.rotation.x = euler.x
-		mesh.rotation.y = euler.y
-		mesh.rotation.z = euler.z
-
-		// mesh の matrixWorld を伝播 → 次 topo entry (= 子孫方向) が最新の world pos / quat を読める。
-		mesh.updateMatrixWorld(true)
+		composeSpringPose(entry, dt, true, scratch)
 	}
 }
 
 // 同時刻パス (= tick で sim 進めない、 state 不変で描画のみ更新する経路)。
-// この経路では applyPoseAt はこの tick で走らない。 前提は「Blockbench 本体が
-// display_animation_frame 発火前に現在時刻 (= 非 snap) の pose を当てている」 こと。
-// 状態 (= state.pos) は snap 時刻、 anchor は非 snap 時刻の pose という 1 frame 未満の
-// ミスマッチが仕込みだが、 frame 単位では deterministic なので実害なし。
-// topo 順に「anchor 読み → rotation 書き → updateMatrixWorld(true)」 で
-// 各 entry の物理 state に対応した pose を描画に反映する。
+// pose transaction 化以後は毎 tick 末尾で restore 直後に呼ばれる = mesh.quaternion に
+// BB core の「現時刻 keyframe pose」 が乗った状態から Δ を prepend し直す。
+// これで restore で消えた spring 揺れが再描画される + keyframe rotation は保存される。
 function applyOnlyOrdered(): void {
 	if (registry.size === 0) return
-	const anchorWorld = new THREE.Vector3()
-	const forward = new THREE.Vector3()
-	const parentQuat = new THREE.Quaternion()
-	const parentInv = new THREE.Quaternion()
-	const localForward = new THREE.Vector3()
-	const localQuat = new THREE.Quaternion()
-	const euler = new THREE.Euler()
-
+	const scratch = makeComposeScratch()
 	for (const uuid of topoOrder) {
 		const entry = registry.get(uuid)
 		if (!entry || !entry.state.initialized) continue
-		const mesh = entry.group?.mesh
-		const meshParent = mesh?.parent
-		if (!mesh || !meshParent) continue
-
-		if (!getAnchorWorld(entry, anchorWorld)) continue
-		forward.subVectors(entry.state.pos, anchorWorld)
-		if (forward.lengthSq() < 1e-8) continue
-		forward.normalize()
-
-		meshParent.getWorldQuaternion(parentQuat)
-		parentInv.copy(parentQuat).invert()
-		localForward.copy(forward).applyQuaternion(parentInv)
-		localQuat.setFromUnitVectors(entry.restLocalDir, localForward)
-
-		const order = mesh.rotation.order || 'ZYX'
-		euler.setFromQuaternion(localQuat, order)
-		mesh.rotation.x = euler.x
-		mesh.rotation.y = euler.y
-		mesh.rotation.z = euler.z
-
-		mesh.updateMatrixWorld(true)
+		composeSpringPose(entry, 0, false, scratch)
 	}
 }
 
 // 全 entry の state を「現時刻 frame の rest 位置」 にリセット (= scrub / 初回 invoke 時)。
-// topo 順で走らせて deterministic を確保する (= 単独 bone では順序が意味を持たないが、
-// chain の場合は将来的な拡張 (= gravity settle 事前計算等) で親の rest 反映が要る)。
+// pose transaction 化 + Δ 化以後、 rest 位置の計算基準も keyframe pose に合わせる :
+// boneAxisWorld = q_parentW × q_base × restLocalDir で「keyframe pose の bone 軸方向に
+// restLength 進めた点」 を restTip とする。 これで pose がキーで動いてる rig でも
+// state.pos が「keyframe pose の tip」 に確実に初期化される (= replay 開始時のジャンプ最小化)。
 function resetAllToRest(): void {
 	const anchorWorld = new THREE.Vector3()
 	const boneAxisWorld = new THREE.Vector3()
 	const restTip = new THREE.Vector3()
+	const parentQuat = new THREE.Quaternion()
+	const qBase = new THREE.Quaternion()
 	for (const uuid of topoOrder) {
 		const entry = registry.get(uuid)
 		if (!entry) continue
+		const mesh = entry.group?.mesh
+		const meshParent = mesh?.parent
+		if (!mesh || !meshParent) continue
 		if (!getAnchorWorld(entry, anchorWorld)) continue
-		if (!getBoneAxisWorld(entry, boneAxisWorld)) continue
+		qBase.copy(mesh.quaternion)
+		meshParent.getWorldQuaternion(parentQuat)
+		boneAxisWorld.copy(entry.restLocalDir).applyQuaternion(qBase).applyQuaternion(parentQuat)
 		restTip.copy(anchorWorld).addScaledVector(boneAxisWorld, entry.config.restLength)
 		resetState(entry.state, restTip)
 	}
