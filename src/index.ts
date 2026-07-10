@@ -211,6 +211,29 @@ function isRealGroup(context: unknown): boolean {
 	return all.includes(context)
 }
 
+// 指定 group + 全子孫 Group を DFS で列挙 (= 子孫再帰 spring 化用)。
+// - Group instance のみ収集 (= Cube / Element 等は除外)
+// - 循環回避 = visited Set (BB の Group tree では通常発生しないが malformed state 防御)
+// - 順序 = pre-order DFS (= 親 → 子)、 rename 側では順序に依存しないが consistency のため
+function collectGroupAndDescendants(root: unknown): unknown[] {
+	const result: unknown[] = []
+	const visited = new Set<object>()
+	const stack: unknown[] = [root]
+	while (stack.length > 0) {
+		const g = stack.pop()
+		if (!g || typeof g !== 'object' || visited.has(g)) continue
+		visited.add(g)
+		if (!(g instanceof Group)) continue
+		result.push(g)
+		const children = (g as { children?: unknown[] }).children
+		if (Array.isArray(children)) {
+			// stack に push する順は子孫方向、 順序保持したいので逆順 push
+			for (let i = children.length - 1; i >= 0; i--) stack.push(children[i])
+		}
+	}
+	return result
+}
+
 function registerContextMenuActions(): void {
 	if (typeof Action !== 'function' || typeof MenuSeparator !== 'function') {
 		console.warn(`[${PLUGIN_ID}] Action or MenuSeparator not available, skipping context menu registration`)
@@ -332,10 +355,70 @@ function registerContextMenuActions(): void {
 		},
 	})
 
+	// 子孫再帰版の spring 化 sub-action (= 選択 group + 全子孫を一括で spring 化)。
+	// 単独 spring 化 (= springify) は残す、 opt-in で子孫再帰版を選ぶ形。
+	// condition = 選択 group または子孫のいずれかが非 spring group であれば表示
+	// (= 選択部分木が既に全 spring 化済みなら意味ないので隠す)。
+	const springify_recursive = new Action(`${PLUGIN_ID}_springify_recursive`, {
+		name: 'Spring 化 (子孫含む)',
+		icon: 'account_tree',
+		condition: (context?: unknown) => {
+			const target = isRealGroup(context) ? context : (Group as { first_selected?: unknown })?.first_selected
+			if (!target) return false
+			for (const g of collectGroupAndDescendants(target)) {
+				if (!hasSpringPrefix((g as { name?: unknown } | null)?.name)) return true
+			}
+			return false
+		},
+		click() {
+			// multi-select 対応 = 選択中の全 root group と、 各々の子孫全部を集める
+			// (= uuid dedup で「兄弟同士で親子関係にある」 malformed 選択も安全)
+			const selected = ((Group as { multi_selected?: unknown[] })?.multi_selected ?? []) as unknown[]
+			const seenUuids = new Set<string>()
+			const targets: Array<{ name: string }> = []
+			for (const s of selected) {
+				for (const g of collectGroupAndDescendants(s)) {
+					const uuid = (g as { uuid?: unknown } | null)?.uuid
+					if (typeof uuid !== 'string' || seenUuids.has(uuid)) continue
+					seenUuids.add(uuid)
+					if (!hasSpringPrefix((g as { name?: unknown } | null)?.name)) {
+						targets.push(g as { name: string })
+					}
+				}
+			}
+			if (targets.length === 0) return
+			try {
+				Undo?.initEdit?.({ groups: targets })
+				for (const g of targets) g.name = `${BONE_NAME_PREFIX}${g.name}`
+				Undo?.finishEdit?.('Spring 化 (子孫含む)')
+			} catch (e) {
+				console.warn(`[${PLUGIN_ID}] springify_recursive failed`, e)
+			}
+			// springify と同一の後処理 (= registry sync + UI 状態更新 + preview refresh)
+			try {
+				rescanRegistry()
+			} catch (e) {
+				console.warn(`[${PLUGIN_ID}] rescanRegistry failed after springify_recursive`, e)
+			}
+			try {
+				updateSelection()
+			} catch (e) {
+				console.warn(`[${PLUGIN_ID}] updateSelection failed after springify_recursive`, e)
+			}
+			if (Modes?.animate) {
+				try {
+					Animator?.preview?.()
+				} catch (e) {
+					console.warn(`[${PLUGIN_ID}] preview refresh failed after springify_recursive`, e)
+				}
+			}
+		},
+	})
+
 	// Group.prototype.menu.structure に append (= 「rename」「delete」 の末尾に並ぶ)。
 	const sep = new MenuSeparator(`${PLUGIN_ID}_actions`)
-	menu.structure.push(sep, springify, unspringify)
-	registeredMenuEntries.push(sep, springify, unspringify)
+	menu.structure.push(sep, springify, springify_recursive, unspringify)
+	registeredMenuEntries.push(sep, springify, springify_recursive, unspringify)
 }
 
 function unregisterContextMenuActions(): void {
