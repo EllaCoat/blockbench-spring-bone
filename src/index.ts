@@ -45,6 +45,10 @@ declare const Property: any
 declare const Action: any
 declare const MenuSeparator: any
 declare const Undo: any
+// BB global : selection 変化を UI 全体に伝播する (= element_panel の input 可視性、
+// Panel の display_condition、 outliner ハイライト等が再評価される)。 spring 化 / 解除の
+// name 変更後や undo/redo 後に手動で叩いて UI 状態と rig state のズレを解消する。
+declare function updateSelection(): void
 
 const PLUGIN_ID = 'spring_bone'
 const PLUGIN_VERSION = '0.0.10'
@@ -211,9 +215,12 @@ function registerContextMenuActions(): void {
 	const springify = new Action(`${PLUGIN_ID}_springify`, {
 		name: 'Spring 化',
 		icon: 'gesture',
-		condition: () => {
-			// first_selected が非 spring group のときのみ表示 (= 「化」 が意味を持つ場面)。
-			return !hasSpringPrefix((Group as { first_selected?: { name?: unknown } })?.first_selected?.name)
+		// BB menu.js:346 で右クリ対象 group が context として渡る、 無ければ first_selected fallback。
+		// multi_selected の index 0 でない group を右クリしたケースで first_selected が別 group を
+		// 指す実バグ (= 症状 3 toggle 逆挙動の secondary) を防ぐ。
+		condition: (context?: unknown) => {
+			const target = context ?? (Group as { first_selected?: unknown })?.first_selected
+			return !hasSpringPrefix((target as { name?: unknown } | null)?.name)
 		},
 		click() {
 			const groups = ((Group as { multi_selected?: unknown[] })?.multi_selected ?? []).filter(
@@ -235,15 +242,33 @@ function registerContextMenuActions(): void {
 			} catch (e) {
 				console.warn(`[${PLUGIN_ID}] rescanRegistry failed after springify`, e)
 			}
+			// BB core の updateSelection を叩いて element_panel input の可視性 + Panel display_condition を
+			// 再評価させる。 これが無いと直後の UI 状態が古いままで「toggle が逆に動いたように見える」
+			// 感覚を生む (= 症状 3 toggle 逆挙動の primary)。
+			try {
+				updateSelection()
+			} catch (e) {
+				console.warn(`[${PLUGIN_ID}] updateSelection failed after springify`, e)
+			}
+			// animate モード時は preview 明示 refresh、 mesh.rotation を最新 rig state に追従させる。
+			if (Modes?.animate) {
+				try {
+					Animator?.preview?.()
+				} catch (e) {
+					console.warn(`[${PLUGIN_ID}] preview refresh failed after springify`, e)
+				}
+			}
 		},
 	})
 
 	const unspringify = new Action(`${PLUGIN_ID}_unspringify`, {
 		name: 'Spring 解除',
 		icon: 'link_off',
-		condition: () => {
-			// first_selected が spring group のときのみ表示 (= 「解除」 が意味を持つ場面)。
-			return hasSpringPrefix((Group as { first_selected?: { name?: unknown } })?.first_selected?.name)
+		// context 引数 (= 右クリ対象 group) 優先、 fallback は first_selected。 詳細は springify 側の
+		// condition 参照 (= symmetric、 spring group のときだけ visible)。
+		condition: (context?: unknown) => {
+			const target = context ?? (Group as { first_selected?: unknown })?.first_selected
+			return hasSpringPrefix((target as { name?: unknown } | null)?.name)
 		},
 		click() {
 			// prefix 除去後に空文字にならない (= 「spring_」 だけの group を弾く、 N-3 guard) 条件込みで filter。
@@ -267,6 +292,25 @@ function registerContextMenuActions(): void {
 				rescanRegistry()
 			} catch (e) {
 				console.warn(`[${PLUGIN_ID}] rescanRegistry failed after unspringify`, e)
+			}
+			// updateSelection = UI 状態 (= element_panel input 可視性、 Panel display_condition) を最新化。
+			try {
+				updateSelection()
+			} catch (e) {
+				console.warn(`[${PLUGIN_ID}] updateSelection failed after unspringify`, e)
+			}
+			// 凍結解決の primary fix : 登録解除後、 mesh.rotation には plugin が最後に書いた
+			// 物理姿勢が残る。 paused / 純物理 bone (= keyframe を持たない) の場合、
+			// showDefaultPose → stackAnimations の loop が「何も当てない」 状態で rest 固定となり
+			// 「アニメーションが完全停止」 に見える (= 症状 3 凍結の真因)。 Animator.preview を明示発火し
+			// 現在 Timeline.time の pose を improt して mesh.rotation を上書きすることで、
+			// 解除された bone の visual が最新 animation state に追従する。
+			if (Modes?.animate) {
+				try {
+					Animator?.preview?.()
+				} catch (e) {
+					console.warn(`[${PLUGIN_ID}] preview refresh failed after unspringify`, e)
+				}
 			}
 		},
 	})
