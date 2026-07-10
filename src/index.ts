@@ -211,6 +211,35 @@ function isRealGroup(context: unknown): boolean {
 	return all.includes(context)
 }
 
+// recursive action の condition 判定範囲を click 側 (= multi_selected 経由の走査) と一致させる helper。
+// 問題 (Sol Round 2 MUST-3) : condition が「context = clicked Group / first_selected 1 個」 の子孫で
+// 判定していたため、 Action.trigger 経路 (= keybind 等、 context = Action instance の fallback で
+// first_selected を使う) と click の multi_selected 走査で範囲がズレ、 「状態が異なる複数 Group
+// 選択時に表示は出るが click で発火しない」 症状。
+// fix = menu 表示経路 (context = Group instance) は context 単発、 それ以外は multi_selected 全体
+// (= click と一致する走査、 空なら first_selected fallback) を対象に predicate を評価する。
+function evaluateRecursiveActionScope(
+	context: unknown,
+	predicate: (group: unknown) => boolean,
+): boolean {
+	if (isRealGroup(context)) {
+		for (const g of collectGroupAndDescendants(context)) {
+			if (predicate(g)) return true
+		}
+		return false
+	}
+	const multi = ((Group as { multi_selected?: unknown[] })?.multi_selected ?? []) as unknown[]
+	const sources: unknown[] = multi.length > 0
+		? multi
+		: [(Group as { first_selected?: unknown })?.first_selected].filter(Boolean)
+	for (const s of sources) {
+		for (const g of collectGroupAndDescendants(s)) {
+			if (predicate(g)) return true
+		}
+	}
+	return false
+}
+
 // 指定 group + 全子孫 Group を DFS で列挙 (= 子孫再帰 spring 化用)。
 // - Group instance のみ収集 (= Cube / Element 等は除外)
 // - 循環回避 = visited Set (BB の Group tree では通常発生しないが malformed state 防御)
@@ -362,14 +391,10 @@ function registerContextMenuActions(): void {
 	const springify_recursive = new Action(`${PLUGIN_ID}_springify_recursive`, {
 		name: 'Spring 化 (子孫含む)',
 		icon: 'account_tree',
-		condition: (context?: unknown) => {
-			const target = isRealGroup(context) ? context : (Group as { first_selected?: unknown })?.first_selected
-			if (!target) return false
-			for (const g of collectGroupAndDescendants(target)) {
-				if (!hasSpringPrefix((g as { name?: unknown } | null)?.name)) return true
-			}
-			return false
-		},
+		condition: (context?: unknown) =>
+			evaluateRecursiveActionScope(context, (g) =>
+				!hasSpringPrefix((g as { name?: unknown } | null)?.name),
+			),
 		click() {
 			// multi-select 対応 = 選択中の全 root group と、 各々の子孫全部を集める
 			// (= uuid dedup で「兄弟同士で親子関係にある」 malformed 選択も安全)
@@ -420,16 +445,13 @@ function registerContextMenuActions(): void {
 	const unspringify_recursive = new Action(`${PLUGIN_ID}_unspringify_recursive`, {
 		name: 'Spring 解除 (子孫含む)',
 		icon: 'link_off',
-		condition: (context?: unknown) => {
-			const target = isRealGroup(context) ? context : (Group as { first_selected?: unknown })?.first_selected
-			if (!target) return false
-			// 選択部分木のどれか 1 個でも spring group があれば表示 (= 空剥がしを避ける)
-			for (const g of collectGroupAndDescendants(target)) {
+		// 選択部分木 (context or multi_selected) に対象があれば表示、 evaluateRecursiveActionScope で
+		// click 側 (= multi_selected 走査) と一致する範囲判定 = Action.trigger 経路の食い違い解消
+		condition: (context?: unknown) =>
+			evaluateRecursiveActionScope(context, (g) => {
 				const n = (g as { name?: unknown } | null)?.name
-				if (typeof n === 'string' && n.startsWith(BONE_NAME_PREFIX) && n.length > BONE_NAME_PREFIX.length) return true
-			}
-			return false
-		},
+				return typeof n === 'string' && n.startsWith(BONE_NAME_PREFIX) && n.length > BONE_NAME_PREFIX.length
+			}),
 		click() {
 			const selected = ((Group as { multi_selected?: unknown[] })?.multi_selected ?? []) as unknown[]
 			const seenUuids = new Set<string>()
@@ -529,13 +551,20 @@ function registerOutlinerMarker(): () => void {
 	const styleEl = document.createElement('style')
 	styleEl.id = OUTLINER_MARKER_STYLE_ID
 	styleEl.textContent = `
-		.outliner_object.${OUTLINER_MARKER_CLASS} {
+		/* :not(.selected) で BB 標準の選択色 (= .outliner_object.selected の background) と
+		   共存させる (Sol Round 2 WANT-3、 同 specificity かつ後勝ちで選択色が消える問題)。
+		   選択時は左端 box-shadow だけ残して spring group であることを示す。 */
+		.outliner_object.${OUTLINER_MARKER_CLASS}:not(.selected) {
 			background: linear-gradient(90deg, rgba(64, 192, 176, 0.16), rgba(64, 192, 176, 0.04) 60%, transparent);
+		}
+		.outliner_object.${OUTLINER_MARKER_CLASS} {
 			box-shadow: inset 3px 0 0 rgba(64, 192, 176, 0.7);
 		}
-		/* BB の dynamic-icon 実 class は `.material-icons.notranslate.icon` (= js/api.ts:132-134)、
-		   前 revision の `.icon-material` セレクタは空振りだった (Opus IMO-1) */
-		.outliner_object.${OUTLINER_MARKER_CLASS} i.material-icons.icon {
+		/* BB dynamic-icon 実 class = .material-icons.notranslate.icon (js/api.ts:132-134)、
+		   前 revision の .icon-material セレクタは空振りだった (Opus IMO-1)。
+		   :not(.outliner_toggle) で visibility / lock 等の Material Icon toggle を除外
+		   (outliner.js:1211-1219、 Sol Round 2 NITS)、 primary folder icon だけ teal に染める。 */
+		.outliner_object.${OUTLINER_MARKER_CLASS} > i.material-icons.icon:not(.outliner_toggle) {
 			color: rgba(64, 192, 176, 0.95) !important;
 		}
 	`
@@ -911,6 +940,11 @@ function applyPoseAt(time: number): void {
 // 取り残される別ノード種別版 root-bone bug が残る (Opus MUST-1)。
 // mesh 参照は seen Set で dedup、 Cube のように「keyframe channel を持たず親追従だけ」 の要素も
 // 含まれるが restore で書き戻すのは no-op で実害なし、 判定コスト回避を優先。
+// pre_rotation は BB Group の Object3D 拡張 property (= `js/outliner/types/group.js` で追加)。
+// stackAnimations が sub-step ごとに書き換えるが、 従来の snapshot は position/quaternion/scale のみで
+// pre_rotation を復元してなかった。 複数 animation stack 中に scrub → 回転キー編集すると、
+// pre_rotation が最後の sub-step 時刻の値のまま残り「基準角ずれで keyframe が汚染される」
+// (Sol Round 2 MUST-2)。 存在有無 + xyz + order を snapshot し、 存在する mesh だけ復元する。
 interface AnimatorPoseSnapshot {
 	entries: Array<{
 		mesh: any
@@ -924,6 +958,11 @@ interface AnimatorPoseSnapshot {
 		sx: number
 		sy: number
 		sz: number
+		hasPre: boolean
+		prx: number
+		pry: number
+		prz: number
+		pro: string
 	}>
 }
 
@@ -933,11 +972,18 @@ function captureAnimatorPose(): AnimatorPoseSnapshot {
 	const pushMesh = (mesh: any): void => {
 		if (!mesh || typeof mesh !== 'object' || seen.has(mesh)) return
 		seen.add(mesh)
+		const pre = mesh.pre_rotation
+		const hasPre = !!(pre && typeof pre === 'object' && typeof pre.x === 'number')
 		entries.push({
 			mesh,
 			px: mesh.position.x, py: mesh.position.y, pz: mesh.position.z,
 			qx: mesh.quaternion.x, qy: mesh.quaternion.y, qz: mesh.quaternion.z, qw: mesh.quaternion.w,
 			sx: mesh.scale.x, sy: mesh.scale.y, sz: mesh.scale.z,
+			hasPre,
+			prx: hasPre ? pre.x : 0,
+			pry: hasPre ? pre.y : 0,
+			prz: hasPre ? pre.z : 0,
+			pro: hasPre && typeof pre.order === 'string' ? pre.order : 'XYZ',
 		})
 	}
 	const groups = (Project as { groups?: unknown[] } | null)?.groups
@@ -966,6 +1012,18 @@ function restoreAnimatorPose(snap: AnimatorPoseSnapshot): void {
 		e.mesh.position.set(e.px, e.py, e.pz)
 		e.mesh.quaternion.set(e.qx, e.qy, e.qz, e.qw)
 		e.mesh.scale.set(e.sx, e.sy, e.sz)
+		// pre_rotation は snapshot 時に存在した mesh だけ復元 (= 存在しない Cube 等では skip)。
+		// mesh.pre_rotation は BB group.js の rest Euler 相当 = stackAnimations 経由で書き換わる
+		// ため、 restore しないと複数 animation stack + 回転キー編集時に基準角ずれで keyframe が
+		// 汚染される (Sol Round 2 MUST-2、 pose transaction の完全性)。
+		if (e.hasPre && e.mesh.pre_rotation) {
+			e.mesh.pre_rotation.x = e.prx
+			e.mesh.pre_rotation.y = e.pry
+			e.mesh.pre_rotation.z = e.prz
+			if (typeof e.mesh.pre_rotation.order === 'string') {
+				e.mesh.pre_rotation.order = e.pro
+			}
+		}
 	}
 }
 
