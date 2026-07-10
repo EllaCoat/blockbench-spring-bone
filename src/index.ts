@@ -903,8 +903,14 @@ function applyPoseAt(time: number): void {
 // 非対称 (= 解除済み bone / 非 spring bone が「applyPoseAt が最後に残した pose」 のまま取り残される)
 // を排除、 root bone 解除 → keyframe animation 完全停止 bug の根本 fix となる (Sol 推し fix、
 // 見落としバグ 1-6 も同経路で連鎖解消)。
-// snapshot 対象 = Project.groups 内の全 Group instance の mesh、 local position / quaternion / scale
-// を Float32 で保持。 Group 以外 (= Cube / Element) は BB 側の rig 変換で automatic なので触らない。
+// snapshot 対象 = Project.groups (= Group instance) **と** Project.elements (= Cube / Mesh /
+// NullObject / ArmatureBone / Locator 等) の両方。 BB の stackAnimations は Group.all.concat(
+// Outliner.elements) を対象に animator を回すため (= animation_mode.js:321)、 NullObject や
+// ArmatureBone も独立 keyframe channel を持ち applyPoseAt で書き換わる。 Group だけ snapshot
+// では NullObject/ArmatureBone の keyframe animation が「最後の sub-step の snap 時刻 pose」 に
+// 取り残される別ノード種別版 root-bone bug が残る (Opus MUST-1)。
+// mesh 参照は seen Set で dedup、 Cube のように「keyframe channel を持たず親追従だけ」 の要素も
+// 含まれるが restore で書き戻すのは no-op で実害なし、 判定コスト回避を優先。
 interface AnimatorPoseSnapshot {
 	entries: Array<{
 		mesh: any
@@ -923,18 +929,33 @@ interface AnimatorPoseSnapshot {
 
 function captureAnimatorPose(): AnimatorPoseSnapshot {
 	const entries: AnimatorPoseSnapshot['entries'] = []
-	const groups = (Project as { groups?: unknown[] } | null)?.groups
-	if (!Array.isArray(groups)) return { entries }
-	for (const g of groups) {
-		if (!(g instanceof Group)) continue
-		const mesh = (g as { mesh?: any }).mesh
-		if (!mesh) continue
+	const seen = new Set<object>()
+	const pushMesh = (mesh: any): void => {
+		if (!mesh || typeof mesh !== 'object' || seen.has(mesh)) return
+		seen.add(mesh)
 		entries.push({
 			mesh,
 			px: mesh.position.x, py: mesh.position.y, pz: mesh.position.z,
 			qx: mesh.quaternion.x, qy: mesh.quaternion.y, qz: mesh.quaternion.z, qw: mesh.quaternion.w,
 			sx: mesh.scale.x, sy: mesh.scale.y, sz: mesh.scale.z,
 		})
+	}
+	const groups = (Project as { groups?: unknown[] } | null)?.groups
+	if (Array.isArray(groups)) {
+		for (const g of groups) {
+			if (!(g instanceof Group)) continue
+			pushMesh((g as { mesh?: any }).mesh)
+		}
+	}
+	// Project.elements (= Outliner.elements 相当、 outliner.js:14) の中の pose 保持ノードを追加
+	// snapshot。 NullObject / ArmatureBone は独立 animator を持つので必ず対象、 Cube 等も含めて
+	// 一律 snapshot する (= 判定コスト回避、 write-back は BB の Object3D property set のみ)。
+	const elements = (Project as { elements?: unknown[] } | null)?.elements
+	if (Array.isArray(elements)) {
+		for (const e of elements) {
+			if (!e || typeof e !== 'object') continue
+			pushMesh((e as { mesh?: any }).mesh)
+		}
 	}
 	return { entries }
 }
