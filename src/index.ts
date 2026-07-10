@@ -1089,9 +1089,9 @@ function composeSpringPose(
 	if (!getAnchorWorld(entry, scratch.anchorWorld)) return
 
 	if (stepSim) {
-		// boneAxisWorld = q_parentW × q_base × r (Sol Δ 3.、 keyframe pose 反映版)。
-		// 現行 rest 直基準では solver が静的 rest を目指して keyframe と綱引き = 綱引き排除。
-		scratch.boneAxisWorld.copy(entry.restLocalDir).applyQuaternion(scratch.qBase).applyQuaternion(scratch.parentQuat)
+		// boneAxisWorld = q_parentW × restLocalDir (own-rotation 独立化、 自身の keyframe rotation を
+		// solver 目標から排除。 親の rotation は q_parentW 経由で反映される)。
+		scratch.boneAxisWorld.copy(entry.restLocalDir).applyQuaternion(scratch.parentQuat)
 		step(entry.state, scratch.anchorWorld, scratch.boneAxisWorld, entry.config, dt)
 	}
 
@@ -1102,8 +1102,8 @@ function composeSpringPose(
 	if (scratch.forward.lengthSq() < 1e-8) return
 	scratch.forward.normalize()
 
-	// d_animP = q_base × r (parent-local frame の keyframe pose bone 軸)
-	scratch.dAnimP.copy(entry.restLocalDir).applyQuaternion(scratch.qBase).normalize()
+	// d_animP = restLocalDir (parent-local frame の rest bone 軸、 own-rotation 独立化で qBase 削除)
+	scratch.dAnimP.copy(entry.restLocalDir).normalize()
 
 	// d_simP = inv(q_parentW) × d_simW (world → parent-local)
 	scratch.parentInv.copy(scratch.parentQuat).invert()
@@ -1178,16 +1178,13 @@ function applyOnlyOrdered(): void {
 }
 
 // 全 entry の state を「現時刻 frame の rest 位置」 にリセット (= scrub / 初回 invoke 時)。
-// pose transaction 化 + Δ 化以後、 rest 位置の計算基準も keyframe pose に合わせる :
-// boneAxisWorld = q_parentW × q_base × restLocalDir で「keyframe pose の bone 軸方向に
-// restLength 進めた点」 を restTip とする。 これで pose がキーで動いてる rig でも
-// state.pos が「keyframe pose の tip」 に確実に初期化される (= replay 開始時のジャンプ最小化)。
+// rest 姿勢基準 = q_parentW × restLocalDir で restTip を計算。 own-rotation 独立化により
+// qBase は初期化から排除 (= scrub / replay 開始時の qBase 混入回避)。
 function resetAllToRest(): void {
 	const anchorWorld = new THREE.Vector3()
 	const boneAxisWorld = new THREE.Vector3()
 	const restTip = new THREE.Vector3()
 	const parentQuat = new THREE.Quaternion()
-	const qBase = new THREE.Quaternion()
 	for (const uuid of topoOrder) {
 		const entry = registry.get(uuid)
 		if (!entry) continue
@@ -1195,9 +1192,8 @@ function resetAllToRest(): void {
 		const meshParent = mesh?.parent
 		if (!mesh || !meshParent) continue
 		if (!getAnchorWorld(entry, anchorWorld)) continue
-		qBase.copy(mesh.quaternion)
 		meshParent.getWorldQuaternion(parentQuat)
-		boneAxisWorld.copy(entry.restLocalDir).applyQuaternion(qBase).applyQuaternion(parentQuat)
+		boneAxisWorld.copy(entry.restLocalDir).applyQuaternion(parentQuat)
 		restTip.copy(anchorWorld).addScaledVector(boneAxisWorld, entry.config.restLength)
 		resetState(entry.state, restTip)
 	}
