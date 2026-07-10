@@ -1298,6 +1298,12 @@ function installTickLoop(): () => void {
 	// 状態遷移で invalidate すれば cancelEdit / finishEdit どちらの経路でも拾えるため、 event に依存せず
 	// 「transaction 終了時点で必ず cache 破棄」 が担保される。 finished_edit listener と重複しても
 	// invalidateAnimationCache の副作用は「次 tick で 0 replay」 のみで無害。
+	// **重要な再入対策 (Sol Round 2 MUST-1)** : `invalidateAnimationCache()` は `Animator.preview()` を
+	// 呼び、 BB core (= animation_mode.js:454) は preview 内で `display_animation_frame` を **同期発火** する。
+	// つまり onAnimFrame が再入 → 再入時に wasKeyframeEditActive がまだ true のままだと同じ分岐に
+	// 再度入って invalidateAnimationCache 再帰 → スタック上限。 shouldInvalidate をローカル決定 +
+	// wasKeyframeEditActive を invalidate 呼び出しより **前** に更新することで、 再入時は
+	// wasKeyframeEditActive=false = 遷移条件不成立で invalidate が起きない = 再帰を切断する。
 	let wasKeyframeEditActive = false
 	const onAnimFrame = (): void => {
 		try {
@@ -1306,9 +1312,12 @@ function installTickLoop(): () => void {
 			// transaction の正しさを優先 (Opus Round 1 WANT-2、 意図的トレードオフ)。
 			// transaction 外は wasKeyframeEditActive 遷移で 1 回 invalidate → 以降 cache 経路へ自動復帰。
 			const active = isKeyframeEditActive()
-			if (active) simTime = -1
-			else if (wasKeyframeEditActive) invalidateAnimationCache()
+			const shouldInvalidate = !active && wasKeyframeEditActive
+			// 再入対策 : invalidate 呼び出しより前に flag を更新して、 preview 同期発火経由の
+			// 再入時に「wasKeyframeEditActive=false」 で遷移条件不成立にし、 再帰を切断する。
 			wasKeyframeEditActive = active
+			if (active) simTime = -1
+			else if (shouldInvalidate) invalidateAnimationCache()
 			tick()
 		} catch (e) {
 			console.warn(`[${PLUGIN_ID}] tick failed`, e)
