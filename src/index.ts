@@ -1057,7 +1057,7 @@ function getAnchorWorld(entry: BoneEntry, out: any): boolean {
 //   d_simW     = normalize(state.pos - anchorWorld) (物理 tip 方向、 world 座標)
 //   d_animP    = normalize(r) (rest bone 軸、 parent-local、 own-rotation 独立化で qBase 除外)
 //   d_simP     = normalize(inverse(q_parentW) × d_simW) (物理シム目標、 parent-local)
-//   ΔP        = setFromUnitVectors(d_animP, d_simP) (keyframe → 物理 の parent-local swing)
+//   ΔP        = setFromUnitVectors(d_animP, d_simP) (rest → 物理 の parent-local swing)
 //   q_final   = ΔP × q_base (前乗算)
 // 静的 rest からの delta をそのまま代入していた旧経路は、 現行 keyframe rotation の上に
 // 「rest→物理」 を二重適用する形になり keyframe pose が消えていた (= 既存アニメパラ無視症状)。
