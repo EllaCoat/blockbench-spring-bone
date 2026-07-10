@@ -897,6 +897,57 @@ function applyPoseAt(time: number): void {
 	}
 }
 
+// pose transaction : BB core が display_animation_frame 直前に当てた「正しい current pose」
+// (= 全 animation / blend / controller 適用済の状態) を snapshot、 sub-step の applyPoseAt が
+// 全 bone の pose を書き換えても finally で確実に復元する。 これで registry 限定 write-back の
+// 非対称 (= 解除済み bone / 非 spring bone が「applyPoseAt が最後に残した pose」 のまま取り残される)
+// を排除、 root bone 解除 → keyframe animation 完全停止 bug の根本 fix となる (Sol 推し fix、
+// 見落としバグ 1-6 も同経路で連鎖解消)。
+// snapshot 対象 = Project.groups 内の全 Group instance の mesh、 local position / quaternion / scale
+// を Float32 で保持。 Group 以外 (= Cube / Element) は BB 側の rig 変換で automatic なので触らない。
+interface AnimatorPoseSnapshot {
+	entries: Array<{
+		mesh: any
+		px: number
+		py: number
+		pz: number
+		qx: number
+		qy: number
+		qz: number
+		qw: number
+		sx: number
+		sy: number
+		sz: number
+	}>
+}
+
+function captureAnimatorPose(): AnimatorPoseSnapshot {
+	const entries: AnimatorPoseSnapshot['entries'] = []
+	const groups = (Project as { groups?: unknown[] } | null)?.groups
+	if (!Array.isArray(groups)) return { entries }
+	for (const g of groups) {
+		if (!(g instanceof Group)) continue
+		const mesh = (g as { mesh?: any }).mesh
+		if (!mesh) continue
+		entries.push({
+			mesh,
+			px: mesh.position.x, py: mesh.position.y, pz: mesh.position.z,
+			qx: mesh.quaternion.x, qy: mesh.quaternion.y, qz: mesh.quaternion.z, qw: mesh.quaternion.w,
+			sx: mesh.scale.x, sy: mesh.scale.y, sz: mesh.scale.z,
+		})
+	}
+	return { entries }
+}
+
+function restoreAnimatorPose(snap: AnimatorPoseSnapshot): void {
+	for (let i = 0; i < snap.entries.length; i++) {
+		const e = snap.entries[i]
+		e.mesh.position.set(e.px, e.py, e.pz)
+		e.mesh.quaternion.set(e.qx, e.qy, e.qz, e.qw)
+		e.mesh.scale.set(e.sx, e.sy, e.sz)
+	}
+}
+
 function getAnchorWorld(entry: BoneEntry, out: any): boolean {
 	const mesh = entry.group.mesh
 	if (!mesh) return false
@@ -1072,15 +1123,27 @@ function tick(): void {
 	// currentTime を FIXED_DT 単位に snap (= frame ごとの値固定、 deterministic 確保)
 	const targetSimTime = Math.max(0, Math.floor(currentTime / FIXED_DT) * FIXED_DT)
 
-	if (simTime < 0 || targetSimTime < simTime - 1e-6 || targetSimTime - simTime > FAST_FORWARD_THRESHOLD) {
-		// 初回 / 逆行 / 大ジャンプ = 0 から replay (= deterministic 完全保証)
-		replayFromStartTo(targetSimTime)
-	} else if (targetSimTime > simTime + 1e-6) {
-		// 通常前進 = cache (= 前 simTime) から進める (= 軽量化、 1 tick で 1-3 step)
-		advanceSimTo(targetSimTime)
+	// pose transaction : sub-step の applyPoseAt / stepAndApplyOrdered が全 bone を書き換えても
+	// finally で displayedBase (= BB core が当てた正しい current pose) に戻す。 これで registry 外の
+	// bone (= 解除済み / 非 spring / muted 等) が rest に取り残される root bone 凍結を排除。
+	// 例外時も rollback される (Sol 見落としバグ 5、 反復例外による恒久 rest 凍結の防止)。
+	const displayedBase = captureAnimatorPose()
+	try {
+		if (simTime < 0 || targetSimTime < simTime - 1e-6 || targetSimTime - simTime > FAST_FORWARD_THRESHOLD) {
+			// 初回 / 逆行 / 大ジャンプ = 0 から replay (= deterministic 完全保証)
+			replayFromStartTo(targetSimTime)
+		} else if (targetSimTime > simTime + 1e-6) {
+			// 通常前進 = cache (= 前 simTime) から進める (= 軽量化、 1 tick で 1-3 step)
+			advanceSimTo(targetSimTime)
+		}
+		// 同時刻 (= |targetSimTime - simTime| < 1e-6) = sim 進めない (= state 不変、 描画のみ)
+	} finally {
+		restoreAnimatorPose(displayedBase)
+		Canvas?.scene?.updateMatrixWorld?.(true)
 	}
-	// 同時刻 (= |targetSimTime - simTime| < 1e-6) = sim 進めない (= state 不変、 描画のみ)
 
+	// spring bone だけ最終 pose を再適用 (= restore で消えた spring 揺れを書き戻す)。
+	// applyOnlyOrdered は registry 限定書き込み + updateMatrixWorld(true) で chain を伝播。
 	applyOnlyOrdered()
 }
 
