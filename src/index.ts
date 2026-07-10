@@ -1290,11 +1290,25 @@ function installTickLoop(): () => void {
 		}
 	}
 
+	// wasKeyframeEditActive = 前 tick 時点で編集 transaction 中だったかの状態 (= 遷移検知用)。
+	// `Undo.cancelEdit()` (= viewport gizmo drag 中の Esc、 undo.js:143-151) は event を dispatch せず、
+	// keyframe 値を revert するだけで finished_edit / select_animation どちらも fire しない。 その結果
+	// drag 中に累積した「編集途中の値ベースの state.pos」 が cancel 後に残り、 revert 済の pose に対して
+	// spring だけ stale 表示になる (Opus Round 1 WANT-1)。 前 tick で true → 今 tick で false の
+	// 状態遷移で invalidate すれば cancelEdit / finishEdit どちらの経路でも拾えるため、 event に依存せず
+	// 「transaction 終了時点で必ず cache 破棄」 が担保される。 finished_edit listener と重複しても
+	// invalidateAnimationCache の副作用は「次 tick で 0 replay」 のみで無害。
+	let wasKeyframeEditActive = false
 	const onAnimFrame = (): void => {
 		try {
 			// keyframe edit transaction 中は値が preview ごとに変わり得るため、各 frame を 0 replay。
-			// transaction 終了後は false となり、通常の advanceSimTo cache 経路へ自動復帰する。
-			if (isKeyframeEditActive()) simTime = -1
+			// 個人スコープでは長 timeline + 多 chain rig で drag スタッター可能性あるが、
+			// transaction の正しさを優先 (Opus Round 1 WANT-2、 意図的トレードオフ)。
+			// transaction 外は wasKeyframeEditActive 遷移で 1 回 invalidate → 以降 cache 経路へ自動復帰。
+			const active = isKeyframeEditActive()
+			if (active) simTime = -1
+			else if (wasKeyframeEditActive) invalidateAnimationCache()
+			wasKeyframeEditActive = active
 			tick()
 		} catch (e) {
 			console.warn(`[${PLUGIN_ID}] tick failed`, e)
