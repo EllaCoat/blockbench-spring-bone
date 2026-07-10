@@ -436,6 +436,102 @@ function unregisterContextMenuActions(): void {
 	registeredMenuEntries = []
 }
 
+// 別軸 B : Outliner 上の spring_ prefix group を視覚的に区別する軽量マーカー。
+// - <style> で `.outliner_object.spring-bone-marker` に淡い teal 色を付与
+// - BB Outliner (= outliner.js:1183+) は Vue で描画、 group name は `input.cube_name` の value
+//   にバインドされる (= v-model)。 value 変化は DOM attribute には反映されないため、
+//   MutationObserver + BB event の 2 経路で scan トリガを取る。
+// - scanOutlinerMarkers = document 内 全 `.outliner_object.group` を走査、
+//   input.cube_name.value が spring_ 始まりなら class 付与、 それ以外なら剥がす。
+// - 副作用ゼロ (= class 追加のみ、 group 内部データは触らない)、 unload で完全クリーンアップ。
+const OUTLINER_MARKER_CLASS = 'spring-bone-marker'
+const OUTLINER_MARKER_STYLE_ID = 'spring-bone-outliner-marker-style'
+
+function scanOutlinerMarkers(): void {
+	const objects = document.querySelectorAll('.outliner_object.group')
+	for (let i = 0; i < objects.length; i++) {
+		const obj = objects[i] as HTMLElement
+		const input = obj.querySelector('input.cube_name') as HTMLInputElement | null
+		const name = input?.value
+		const should = typeof name === 'string' && name.startsWith(BONE_NAME_PREFIX)
+		if (should) {
+			obj.classList.add(OUTLINER_MARKER_CLASS)
+		} else {
+			obj.classList.remove(OUTLINER_MARKER_CLASS)
+		}
+	}
+}
+
+function registerOutlinerMarker(): () => void {
+	// <style> を head に注入 (= reload 時の重複対策で既存 id は除去してから append)。
+	// 色 = 落ち着いた teal (= spring / hair 系連想)、 淡い accent で他の outliner mark
+	// (= selected 反転、 color scope) と衝突しない。 icon 色は !important で BB 側の
+	// dynamic-icon color prop に優先させる (= outliner.js:1207)。
+	document.getElementById(OUTLINER_MARKER_STYLE_ID)?.remove()
+	const styleEl = document.createElement('style')
+	styleEl.id = OUTLINER_MARKER_STYLE_ID
+	styleEl.textContent = `
+		.outliner_object.${OUTLINER_MARKER_CLASS} {
+			background: linear-gradient(90deg, rgba(64, 192, 176, 0.16), rgba(64, 192, 176, 0.04) 60%, transparent);
+			box-shadow: inset 3px 0 0 rgba(64, 192, 176, 0.7);
+		}
+		.outliner_object.${OUTLINER_MARKER_CLASS} .icon-material,
+		.outliner_object.${OUTLINER_MARKER_CLASS} > i:first-child {
+			color: rgba(64, 192, 176, 0.95) !important;
+		}
+	`
+	document.head.appendChild(styleEl)
+
+	// MutationObserver : outliner root (= #cubes_list) 配下の childList / subtree 変化で
+	// 再 scan。 group 追加 / 削除 / expand / undo redo による DOM 差し替えを拾う。
+	// attributeFilter は使わない (= Vue の v-model は attribute 経由でなく property 経由で
+	// 書くため、 attribute 監視では拾えず、 childList / subtree だけで十分)。
+	const outlinerRoot = document.getElementById('cubes_list') ?? document.body
+	let scanScheduled = false
+	const scheduleScan = (): void => {
+		if (scanScheduled) return
+		scanScheduled = true
+		requestAnimationFrame(() => {
+			scanScheduled = false
+			try {
+				scanOutlinerMarkers()
+			} catch (e) {
+				console.warn(`[${PLUGIN_ID}] scanOutlinerMarkers failed`, e)
+			}
+		})
+	}
+	const mo = new MutationObserver(scheduleScan)
+	mo.observe(outlinerRoot, { childList: true, subtree: true })
+
+	// BB event 経路 : 選択 / rename / undo redo の直後にも scan を走らせる
+	// (= v-model 経由の value 変更は MutationObserver では拾えないため二重化)。
+	Blockbench.on('update_selection', scheduleScan)
+	Blockbench.on('undo', scheduleScan)
+	Blockbench.on('redo', scheduleScan)
+	Blockbench.on('select_project', scheduleScan)
+
+	// 初回 scan (= plugin load 時に既存 spring group を pick up)
+	scheduleScan()
+
+	return (): void => {
+		mo.disconnect()
+		Blockbench.removeListener?.('update_selection', scheduleScan)
+		Blockbench.removeListener?.('undo', scheduleScan)
+		Blockbench.removeListener?.('redo', scheduleScan)
+		Blockbench.removeListener?.('select_project', scheduleScan)
+		document.getElementById(OUTLINER_MARKER_STYLE_ID)?.remove()
+		// 残っているマーカー class を全部剥がす (= reload 時の視覚残留を防ぐ)
+		try {
+			const marked = document.querySelectorAll(`.outliner_object.${OUTLINER_MARKER_CLASS}`)
+			for (let i = 0; i < marked.length; i++) {
+				marked[i].classList.remove(OUTLINER_MARKER_CLASS)
+			}
+		} catch (e) {
+			console.warn(`[${PLUGIN_ID}] outliner marker cleanup failed`, e)
+		}
+	}
+}
+
 interface BoneEntry {
 	group: any
 	config: SpringConfig
@@ -1020,6 +1116,8 @@ Plugin.register(PLUGIN_ID, {
 		// Group 右クリ context menu に「Spring 化 / 解除」 の rename sugar action を追加。
 		// gesture (= 唯一の truth) は依然 name prefix 「spring_」 の付け外し。
 		registerContextMenuActions()
+		// Outliner 上で spring_ prefix group を視覚的に区別する軽量マーカーを install。
+		cleanups.push(registerOutlinerMarker())
 	},
 	onunload() {
 		for (const fn of cleanups) {
