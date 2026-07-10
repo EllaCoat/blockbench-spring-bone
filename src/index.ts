@@ -1278,9 +1278,20 @@ function installTickLoop(): () => void {
 	const isKeyframeEditActive = (): boolean =>
 		Array.isArray(Undo?.current_save?.aspects?.keyframes)
 
+	// wasKeyframeEditActive の宣言は invalidateAnimationCache より先 (= 内部で reset するため)。
+	// 詳細な役割は下記 onAnimFrame ブロックのコメント参照。
+	let wasKeyframeEditActive = false
+
 	// finished_edit / select_animation は BB core の最後の preview より後に発火する経路があるため、
 	// invalidate だけでなく preview を再発火し、paused 中も新 pose をその場で replay する。
+	// **重複 invalidate 抑止 (Sol Round 3 MUST-1)** : `Animator.preview()` は BB core (= animation_mode.js:454)
+	// で `display_animation_frame` を **同期発火** するため、 onAnimFrame が再入する。 このタイミングで
+	// wasKeyframeEditActive がまだ true のままだと、 状態遷移検知 (= !active && wasKeyframeEditActive) が
+	// 満たされ再度 invalidateAnimationCache が呼ばれ「1 回の finishEdit で 2 回 invalidate」 になる。
+	// invalidate の入口で wasKeyframeEditActive=false に落として全経路 (= onFinishedEdit / onSelectAnimation /
+	// onAnimFrame の状態遷移検知) 共通で 1 回発火のみを保証する。
 	const invalidateAnimationCache = (): void => {
+		wasKeyframeEditActive = false
 		simTime = -1
 		if (!Modes?.animate) return
 		try {
@@ -1304,7 +1315,9 @@ function installTickLoop(): () => void {
 	// 再度入って invalidateAnimationCache 再帰 → スタック上限。 shouldInvalidate をローカル決定 +
 	// wasKeyframeEditActive を invalidate 呼び出しより **前** に更新することで、 再入時は
 	// wasKeyframeEditActive=false = 遷移条件不成立で invalidate が起きない = 再帰を切断する。
-	let wasKeyframeEditActive = false
+	// **重複発火抑止 (Sol Round 3 MUST-1)** : wasKeyframeEditActive の宣言は invalidateAnimationCache
+	// より先に移動済 (= 内部で flag reset するため)、 これで onFinishedEdit / onSelectAnimation の
+	// 経路と onAnimFrame の状態遷移検知が共通で「1 回だけ発火」 を保証する。
 	const onAnimFrame = (): void => {
 		try {
 			// keyframe edit transaction 中は値が preview ごとに変わり得るため、各 frame を 0 replay。
