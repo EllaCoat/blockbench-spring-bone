@@ -1269,12 +1269,43 @@ function installTickLoop(): () => void {
 	simTime = -1
 	inhibitTick = false
 
+	// animation pose 由来の cache invalidation は BB event / Undo transaction を境界にする案 A を採用。
+	// 案 B (= keyframe 全値を fingerprint 化) は display frame ごとの走査と BB 内部構造への依存が増え、
+	// 案 C (= 常時 0 replay) は通常再生の cache を失う。 BB 5.1.4 では数値変更 / 追加 / 削除が
+	// `Undo.current_save.aspects.keyframes` を持つ transaction 内で preview され、 commit 後に
+	// `finished_edit`、 animation 切替後に `select_animation` が発火するため、この境界だけで十分。
+	// 編集中は slider drag 等の連続 preview も毎回 replay し、 transaction 外では従来の cache を保つ。
+	const isKeyframeEditActive = (): boolean =>
+		Array.isArray(Undo?.current_save?.aspects?.keyframes)
+
+	// finished_edit / select_animation は BB core の最後の preview より後に発火する経路があるため、
+	// invalidate だけでなく preview を再発火し、paused 中も新 pose をその場で replay する。
+	const invalidateAnimationCache = (): void => {
+		simTime = -1
+		if (!Modes?.animate) return
+		try {
+			Animator?.preview?.()
+		} catch (e) {
+			console.warn(`[${PLUGIN_ID}] animation cache refresh failed`, e)
+		}
+	}
+
 	const onAnimFrame = (): void => {
 		try {
+			// keyframe edit transaction 中は値が preview ごとに変わり得るため、各 frame を 0 replay。
+			// transaction 終了後は false となり、通常の advanceSimTo cache 経路へ自動復帰する。
+			if (isKeyframeEditActive()) simTime = -1
 			tick()
 		} catch (e) {
 			console.warn(`[${PLUGIN_ID}] tick failed`, e)
 		}
+	}
+	const onFinishedEdit = (event: unknown): void => {
+		const keyframes = (event as { aspects?: { keyframes?: unknown } } | null)?.aspects?.keyframes
+		if (Array.isArray(keyframes)) invalidateAnimationCache()
+	}
+	const onSelectAnimation = (): void => {
+		invalidateAnimationCache()
 	}
 	const onProjectSwitch = (): void => {
 		rescanRegistry()
@@ -1322,6 +1353,8 @@ function installTickLoop(): () => void {
 	Blockbench.on('select_mode', onModeChange)
 	Blockbench.on('undo', onUndoRedo)
 	Blockbench.on('redo', onUndoRedo)
+	Blockbench.on('finished_edit', onFinishedEdit)
+	Blockbench.on('select_animation', onSelectAnimation)
 
 	return (): void => {
 		Blockbench.removeListener?.('display_animation_frame', onAnimFrame)
@@ -1330,6 +1363,8 @@ function installTickLoop(): () => void {
 		Blockbench.removeListener?.('select_mode', onModeChange)
 		Blockbench.removeListener?.('undo', onUndoRedo)
 		Blockbench.removeListener?.('redo', onUndoRedo)
+		Blockbench.removeListener?.('finished_edit', onFinishedEdit)
+		Blockbench.removeListener?.('select_animation', onSelectAnimation)
 		registry.clear()
 		topoOrder = []
 		lastGraphFingerprint = ''
