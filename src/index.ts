@@ -211,30 +211,39 @@ function isRealGroup(context: unknown): boolean {
 	return all.includes(context)
 }
 
-// recursive action の condition 判定範囲を click 側 (= multi_selected 経由の走査) と一致させる helper。
-// 問題 (Sol Round 2 MUST-3) : condition が「context = clicked Group / first_selected 1 個」 の子孫で
-// 判定していたため、 Action.trigger 経路 (= keybind 等、 context = Action instance の fallback で
-// first_selected を使う) と click の multi_selected 走査で範囲がズレ、 「状態が異なる複数 Group
-// 選択時に表示は出るが click で発火しない」 症状。
-// fix = menu 表示経路 (context = Group instance) は context 単発、 それ以外は multi_selected 全体
-// (= click と一致する走査、 空なら first_selected fallback) を対象に predicate を評価する。
-function evaluateRecursiveActionScope(
+// action の condition 判定範囲を click 側 (= multi_selected 経由の走査) と一致させる helper。
+// 問題 (Sol Round 2 MUST-3 = recursive / Sol Round 3 MUST-2 = 単独) : condition が「context =
+// clicked Group / first_selected 1 個」 で判定していたため、 Action.trigger 経路 (= keybind 等、
+// context = Action instance の fallback で first_selected を使う) と click の multi_selected 走査で
+// 範囲がズレ、 「状態が異なる複数 Group 選択時に表示は出るが click で発火しない」 症状。
+// fix = menu 表示経路 (context = Group instance) は context を対象、 それ以外は multi_selected
+// 全体 (= click と一致する走査、 空なら first_selected fallback) を対象に predicate を評価する。
+// recursive=true の時は各 group の子孫まで再帰、 recursive=false の時は group 単発で判定。
+function evaluateActionScope(
 	context: unknown,
 	predicate: (group: unknown) => boolean,
+	recursive: boolean,
 ): boolean {
 	if (isRealGroup(context)) {
-		for (const g of collectGroupAndDescendants(context)) {
-			if (predicate(g)) return true
+		if (recursive) {
+			for (const g of collectGroupAndDescendants(context)) {
+				if (predicate(g)) return true
+			}
+			return false
 		}
-		return false
+		return predicate(context)
 	}
 	const multi = ((Group as { multi_selected?: unknown[] })?.multi_selected ?? []) as unknown[]
 	const sources: unknown[] = multi.length > 0
 		? multi
 		: [(Group as { first_selected?: unknown })?.first_selected].filter(Boolean)
 	for (const s of sources) {
-		for (const g of collectGroupAndDescendants(s)) {
-			if (predicate(g)) return true
+		if (recursive) {
+			for (const g of collectGroupAndDescendants(s)) {
+				if (predicate(g)) return true
+			}
+		} else {
+			if (predicate(s)) return true
 		}
 	}
 	return false
@@ -277,19 +286,14 @@ function registerContextMenuActions(): void {
 	const springify = new Action(`${PLUGIN_ID}_springify`, {
 		name: 'Spring 化',
 		icon: 'gesture',
-		// 2 経路の context を扱う (= Sol Round 3 MUST-1、 前 commit の regression fix) :
-		//   (A) 右クリメニュー表示時 = BB menu.js が context として clicked Group を渡す
-		//   (B) Action.trigger() 経由 (= menu クリック / keybind / Action Control) = BB actions.ts:496
-		//       が Action 自身を context として condition を再評価する。 その context.name は
-		//       "Spring 化" / "Spring 解除" で spring_ prefix 判定に使うと常に false になり、 表示は
-		//       出るが click が絶対発火しない挙動になる (= 前 fix commit 7302596 で潜り込んだ regression)
-		// Group.all に含まれるかで Group instance かを判定、 それ以外 (= Action instance / undefined) は
-		// first_selected fallback。 これで menu 表示は clicked group で判定、 click 実行時は選択中 group
-		// で判定 = 両経路とも意図通り動く。
-		condition: (context?: unknown) => {
-			const target = isRealGroup(context) ? context : (Group as { first_selected?: unknown })?.first_selected
-			return !hasSpringPrefix((target as { name?: unknown } | null)?.name)
-		},
+		// menu 表示は clicked Group 単独、 Action.trigger 経由 (= keybind 等) は multi_selected 全体
+		// (空なら first_selected fallback) を対象に「非 spring group が 1 個でもあるか」 で判定。
+		// 判定範囲を click 側 (= multi_selected filter) と一致させ、 状態が異なる複数選択で
+		// 「表示されるが発火しない」 症状を排除する (Sol Round 3 MUST-2 = 単独 action 側の同型 bug)。
+		condition: (context?: unknown) =>
+			evaluateActionScope(context, (g) =>
+				!hasSpringPrefix((g as { name?: unknown } | null)?.name),
+			false),
 		click() {
 			const groups = ((Group as { multi_selected?: unknown[] })?.multi_selected ?? []).filter(
 				(g) => !hasSpringPrefix((g as { name?: unknown } | null)?.name),
@@ -332,13 +336,13 @@ function registerContextMenuActions(): void {
 	const unspringify = new Action(`${PLUGIN_ID}_unspringify`, {
 		name: 'Spring 解除',
 		icon: 'link_off',
-		// 2 経路 (menu 表示 = Group context / Action.trigger 再評価 = Action context) の分岐は
-		// springify 側 condition 参照 (= symmetric)。 Group instance のみ context 採用、 それ以外は
-		// first_selected fallback で「Spring 解除」 が絶対発火しない regression を防ぐ。
-		condition: (context?: unknown) => {
-			const target = isRealGroup(context) ? context : (Group as { first_selected?: unknown })?.first_selected
-			return hasSpringPrefix((target as { name?: unknown } | null)?.name)
-		},
+		// springify 側と対称の evaluateActionScope 経由判定 (Sol Round 3 MUST-2)。
+		// 「spring group が 1 個でも選択範囲にあれば表示」、 click 側 (multi_selected filter) と一致する
+		// 走査で、 混在選択時の表示発火食い違い排除。
+		condition: (context?: unknown) =>
+			evaluateActionScope(context, (g) =>
+				hasSpringPrefix((g as { name?: unknown } | null)?.name),
+			false),
 		click() {
 			// prefix 除去後に空文字にならない (= 「spring_」 だけの group を弾く、 N-3 guard) 条件込みで filter。
 			const groups = ((Group as { multi_selected?: unknown[] })?.multi_selected ?? []).filter(
@@ -392,9 +396,9 @@ function registerContextMenuActions(): void {
 		name: 'Spring 化 (子孫含む)',
 		icon: 'account_tree',
 		condition: (context?: unknown) =>
-			evaluateRecursiveActionScope(context, (g) =>
+			evaluateActionScope(context, (g) =>
 				!hasSpringPrefix((g as { name?: unknown } | null)?.name),
-			),
+			true),
 		click() {
 			// multi-select 対応 = 選択中の全 root group と、 各々の子孫全部を集める
 			// (= uuid dedup で「兄弟同士で親子関係にある」 malformed 選択も安全)
@@ -445,13 +449,13 @@ function registerContextMenuActions(): void {
 	const unspringify_recursive = new Action(`${PLUGIN_ID}_unspringify_recursive`, {
 		name: 'Spring 解除 (子孫含む)',
 		icon: 'link_off',
-		// 選択部分木 (context or multi_selected) に対象があれば表示、 evaluateRecursiveActionScope で
+		// 選択部分木 (context or multi_selected) に対象があれば表示、 evaluateActionScope で
 		// click 側 (= multi_selected 走査) と一致する範囲判定 = Action.trigger 経路の食い違い解消
 		condition: (context?: unknown) =>
-			evaluateRecursiveActionScope(context, (g) => {
+			evaluateActionScope(context, (g) => {
 				const n = (g as { name?: unknown } | null)?.name
 				return typeof n === 'string' && n.startsWith(BONE_NAME_PREFIX) && n.length > BONE_NAME_PREFIX.length
-			}),
+			}, true),
 		click() {
 			const selected = ((Group as { multi_selected?: unknown[] })?.multi_selected ?? []) as unknown[]
 			const seenUuids = new Set<string>()
@@ -1012,16 +1016,25 @@ function restoreAnimatorPose(snap: AnimatorPoseSnapshot): void {
 		e.mesh.position.set(e.px, e.py, e.pz)
 		e.mesh.quaternion.set(e.qx, e.qy, e.qz, e.qw)
 		e.mesh.scale.set(e.sx, e.sy, e.sz)
-		// pre_rotation は snapshot 時に存在した mesh だけ復元 (= 存在しない Cube 等では skip)。
-		// mesh.pre_rotation は BB group.js の rest Euler 相当 = stackAnimations 経由で書き換わる
-		// ため、 restore しないと複数 animation stack + 回転キー編集時に基準角ずれで keyframe が
-		// 汚染される (Sol Round 2 MUST-2、 pose transaction の完全性)。
-		if (e.hasPre && e.mesh.pre_rotation) {
-			e.mesh.pre_rotation.x = e.prx
-			e.mesh.pre_rotation.y = e.pry
-			e.mesh.pre_rotation.z = e.prz
-			if (typeof e.mesh.pre_rotation.order === 'string') {
-				e.mesh.pre_rotation.order = e.pro
+		// pre_rotation は BB group.js の rest Euler 相当 = stackAnimations 経由で書き換わるため、
+		// restore しないと複数 animation stack + 回転キー編集時に基準角ずれで keyframe が汚染される
+		// (Sol Round 2 MUST-2、 pose transaction の完全性)。
+		// hasPre=false ケース (= snapshot 時 pre_rotation なかった mesh) でも、 transaction 中に
+		// applyPoseAt が pre_rotation を生成した場合は identity (0,0,0) に reset して痕跡消去
+		// (Sol Round 3 MUST-1、 「存在しなかった状態」 の復元)。 delete まではしない (= BB 側
+		// property 参照経路が壊れるのを避ける)、 xyz=0 で pre_rotation 無し相当の効果。
+		if (e.mesh.pre_rotation) {
+			if (e.hasPre) {
+				e.mesh.pre_rotation.x = e.prx
+				e.mesh.pre_rotation.y = e.pry
+				e.mesh.pre_rotation.z = e.prz
+				if (typeof e.mesh.pre_rotation.order === 'string') {
+					e.mesh.pre_rotation.order = e.pro
+				}
+			} else {
+				e.mesh.pre_rotation.x = 0
+				e.mesh.pre_rotation.y = 0
+				e.mesh.pre_rotation.z = 0
 			}
 		}
 	}
