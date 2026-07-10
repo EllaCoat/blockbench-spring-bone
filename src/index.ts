@@ -855,17 +855,24 @@ function installTickLoop(): () => void {
 	// 「値は復元されたのに entry.config は旧値のまま」 で「Ctrl+Z が効いていないように見える」
 	// 症状となる。 rescanRegistry で config 再読込 + simTime = -1 で fingerprint 変化経由の
 	// 次 tick 0 replay を起動する。 keyframe undo は fingerprint を触らないので simTime = -1
-	// は unconditional 必要 (= Fable Round 3 IMO-1 の指摘、 undo-path の厳格さ)。
+	// は unconditional 必要 (= Fable IMO-1、 undo-path の厳格さ)。
 	//
-	// updateSelection() + Animator.preview() は敢えて呼ばない : BB core の loadUndoSave は
-	// 'undo'/'redo' event dispatch 直前 (= undo.js:823 / 830-832) に updateSelection と
-	// (animate 時) Animator.preview を既に発火済。 その updateSelection → 我々の
-	// onUpdateSelection listener 経路でも rescan は走る。 ここで再呼びすると undo 1 回で
-	// 最大 2 回 full replay となり性能を大きく食う (= Fable Round 3 WANT-1)。
+	// updateSelection() は敢えて呼ばない : BB core の loadUndoSave が 'undo'/'redo' event
+	// dispatch 直前 (= undo.js:823) に既発火、 我々の onUpdateSelection listener 経路で rescan
+	// も走るため冗長 (= Round 2 review WANT-1、 undo 1 回で 2 rescan の性能ロス回避)。
+	//
+	// 一方 Animator.preview() は残す : keyframe undo (= fingerprint 変化なし) の場合、 core の
+	// preview (= undo.js:830-832) は旧 simTime のまま走り「復元済み keyframe に古い物理姿勢を
+	// 適用」 する。 我々の simTime = -1 は次 display_animation_frame event を待つが、 paused
+	// 中は自然発火しないため paused 中の keyframe undo で spring bones が視覚 stale のまま残る
+	// (= Codex Round 2 MUST-1 / Fable Round 2 WANT-1)。 unconditional preview 呼びで最新
+	// state を強制反映、 config undo 時の 2 replay 代償は個人スコープで許容 (dirty-flag による
+	// conditional skip は overkill 判定)。
 	const onUndoRedo = (): void => {
 		try {
 			rescanRegistry()
 			simTime = -1
+			if (Modes?.animate) Animator?.preview?.()
 		} catch (e) {
 			console.warn(`[${PLUGIN_ID}] undo/redo refresh failed`, e)
 		}
