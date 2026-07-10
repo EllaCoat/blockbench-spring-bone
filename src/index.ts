@@ -533,8 +533,9 @@ function registerOutlinerMarker(): () => void {
 			background: linear-gradient(90deg, rgba(64, 192, 176, 0.16), rgba(64, 192, 176, 0.04) 60%, transparent);
 			box-shadow: inset 3px 0 0 rgba(64, 192, 176, 0.7);
 		}
-		.outliner_object.${OUTLINER_MARKER_CLASS} .icon-material,
-		.outliner_object.${OUTLINER_MARKER_CLASS} > i:first-child {
+		/* BB の dynamic-icon 実 class は `.material-icons.notranslate.icon` (= js/api.ts:132-134)、
+		   前 revision の `.icon-material` セレクタは空振りだった (Opus IMO-1) */
+		.outliner_object.${OUTLINER_MARKER_CLASS} i.material-icons.icon {
 			color: rgba(64, 192, 176, 0.95) !important;
 		}
 	`
@@ -563,10 +564,14 @@ function registerOutlinerMarker(): () => void {
 
 	// BB event 経路 : 選択 / rename / undo redo の直後にも scan を走らせる
 	// (= v-model 経由の value 変更は MutationObserver では拾えないため二重化)。
+	// `finished_edit` は BB core が Undo commit 完了直後に fire (= js/undo.js:95)、
+	// これで outliner 上の dblclick → 直接 rename 確定経路 (= outliner_node.ts saveName)
+	// も他イベント待ちにならず即時ハイライト追従する (Opus WANT-1)。
 	Blockbench.on('update_selection', scheduleScan)
 	Blockbench.on('undo', scheduleScan)
 	Blockbench.on('redo', scheduleScan)
 	Blockbench.on('select_project', scheduleScan)
+	Blockbench.on('finished_edit', scheduleScan)
 
 	// 初回 scan (= plugin load 時に既存 spring group を pick up)
 	scheduleScan()
@@ -577,6 +582,7 @@ function registerOutlinerMarker(): () => void {
 		Blockbench.removeListener?.('undo', scheduleScan)
 		Blockbench.removeListener?.('redo', scheduleScan)
 		Blockbench.removeListener?.('select_project', scheduleScan)
+		Blockbench.removeListener?.('finished_edit', scheduleScan)
 		document.getElementById(OUTLINER_MARKER_STYLE_ID)?.remove()
 		// 残っているマーカー class を全部剥がす (= reload 時の視覚残留を防ぐ)
 		try {
