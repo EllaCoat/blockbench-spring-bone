@@ -201,6 +201,16 @@ function hasSpringPrefix(name: unknown): boolean {
 	return typeof name === 'string' && name.startsWith(BONE_NAME_PREFIX)
 }
 
+// context が Group instance かの判定。 Group.all は BB core が全 Group を保持する list。
+// Action.trigger() 内での condition 再評価時に渡される context (= Action instance) を弾き、
+// menu 表示時の clicked Group context のみ採用するために使う (= Sol Round 3 MUST-1 の fix)。
+function isRealGroup(context: unknown): boolean {
+	if (!context) return false
+	const all = (Group as { all?: unknown[] })?.all
+	if (!Array.isArray(all)) return false
+	return all.includes(context)
+}
+
 function registerContextMenuActions(): void {
 	if (typeof Action !== 'function' || typeof MenuSeparator !== 'function') {
 		console.warn(`[${PLUGIN_ID}] Action or MenuSeparator not available, skipping context menu registration`)
@@ -215,11 +225,17 @@ function registerContextMenuActions(): void {
 	const springify = new Action(`${PLUGIN_ID}_springify`, {
 		name: 'Spring 化',
 		icon: 'gesture',
-		// BB menu.js:346 で右クリ対象 group が context として渡る、 無ければ first_selected fallback。
-		// multi_selected の index 0 でない group を右クリしたケースで first_selected が別 group を
-		// 指す実バグ (= 症状 3 toggle 逆挙動の secondary) を防ぐ。
+		// 2 経路の context を扱う (= Sol Round 3 MUST-1、 前 commit の regression fix) :
+		//   (A) 右クリメニュー表示時 = BB menu.js が context として clicked Group を渡す
+		//   (B) Action.trigger() 経由 (= menu クリック / keybind / Action Control) = BB actions.ts:496
+		//       が Action 自身を context として condition を再評価する。 その context.name は
+		//       "Spring 化" / "Spring 解除" で spring_ prefix 判定に使うと常に false になり、 表示は
+		//       出るが click が絶対発火しない挙動になる (= 前 fix commit 7302596 で潜り込んだ regression)
+		// Group.all に含まれるかで Group instance かを判定、 それ以外 (= Action instance / undefined) は
+		// first_selected fallback。 これで menu 表示は clicked group で判定、 click 実行時は選択中 group
+		// で判定 = 両経路とも意図通り動く。
 		condition: (context?: unknown) => {
-			const target = context ?? (Group as { first_selected?: unknown })?.first_selected
+			const target = isRealGroup(context) ? context : (Group as { first_selected?: unknown })?.first_selected
 			return !hasSpringPrefix((target as { name?: unknown } | null)?.name)
 		},
 		click() {
@@ -264,10 +280,11 @@ function registerContextMenuActions(): void {
 	const unspringify = new Action(`${PLUGIN_ID}_unspringify`, {
 		name: 'Spring 解除',
 		icon: 'link_off',
-		// context 引数 (= 右クリ対象 group) 優先、 fallback は first_selected。 詳細は springify 側の
-		// condition 参照 (= symmetric、 spring group のときだけ visible)。
+		// 2 経路 (menu 表示 = Group context / Action.trigger 再評価 = Action context) の分岐は
+		// springify 側 condition 参照 (= symmetric)。 Group instance のみ context 採用、 それ以外は
+		// first_selected fallback で「Spring 解除」 が絶対発火しない regression を防ぐ。
 		condition: (context?: unknown) => {
-			const target = context ?? (Group as { first_selected?: unknown })?.first_selected
+			const target = isRealGroup(context) ? context : (Group as { first_selected?: unknown })?.first_selected
 			return hasSpringPrefix((target as { name?: unknown } | null)?.name)
 		},
 		click() {
