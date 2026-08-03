@@ -70,7 +70,8 @@ export interface EvaluationResult {
 //   各 sub-step で basePose + stepAndApplyOrdered → restorePose → updateMatrixWorld →
 //   applyOnlyOrdered の順を保証する。 例外時は restorePose / updateMatrixWorld を通した後
 //   step cache を null にして再 throw (= 次回が必ず 0 replay になる)。 例外時は
-//   applyOnlyOrdered を呼ばない
+//   applyOnlyOrdered を呼ばない。 sub-step と restorePose が両方 throw した場合は
+//   sub-step 由来の例外を伝播させる (= 原因に近い方。 restore 失敗は警告に落とす)
 // - applyWithoutAdvance = state を進めずに描画だけ更新する (= ops.applyOnlyOrdered)。
 //   session 未開始 / 初回評価前の呼び出しは契約違反として Error を throw する
 // - endAnimation = context / evaluator / step cache を破棄。 scene pose は変更しない
@@ -125,6 +126,10 @@ export class SpringRuntime<C extends AnimationContext, P> {
 		this.evaluating = true
 		try {
 			const snapshot = this.ops.capturePose()
+			// 例外を変数で持ち回る (= finally 内の throw で元例外が上書きされるのを防ぐ)。
+			// 伝播は sub-step 由来の例外を優先 (= 原因に近い方)。
+			let pendingError: unknown = null
+			let hasPendingError = false
 			try {
 				if (mode === 'replay') {
 					evaluateBasePose(0, context)
@@ -138,9 +143,30 @@ export class SpringRuntime<C extends AnimationContext, P> {
 					this.stepIndex = next
 					substepCount++
 				}
+			} catch (e) {
+				pendingError = e
+				hasPendingError = true
 			} finally {
-				this.ops.restorePose(snapshot)
-				this.ops.updateMatrixWorld()
+				try {
+					this.ops.restorePose(snapshot)
+				} catch (restoreError) {
+					// 元の例外がある場合はそちらを優先する (= 原因に近い方を伝播させる)。
+					// restore 失敗は握り潰さず警告に落とす。
+					if (!hasPendingError) {
+						pendingError = restoreError
+						hasPendingError = true
+					} else {
+						console.warn('[spring_bone] restorePose failed while another error was pending', restoreError)
+					}
+				} finally {
+					// restore が失敗しても matrix 更新は必ず通す
+					this.ops.updateMatrixWorld()
+				}
+			}
+			if (hasPendingError) {
+				// 次回の評価が必ず 0 replay になるよう step cache を破棄してから再 throw
+				this.stepIndex = null
+				throw pendingError
 			}
 			this.ops.applyOnlyOrdered(context)
 			const stepIndex = this.stepIndex as number

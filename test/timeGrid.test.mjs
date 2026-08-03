@@ -54,33 +54,43 @@ test('stepIndexToTime: round-trip', () => {
 // --- SpringRuntime lifecycle ---
 
 // stub ops : 呼ばれた順に {fn, args} を calls へ push するだけ (= BB 無しで検証するための口)。
-// throwOnStep = n を指定すると n 回目の stepAndApplyOrdered が 1 度だけ throw する。
-function makeRuntime(calls, { throwOnStep = -1 } = {}) {
+// throwOnStep = n で n 回目の stepAndApplyOrdered が 1 度だけ throw (= stepError で例外
+// object を指定可能)、 restoreError を渡すと restorePose が常にそれを throw する。
+// evaluatingLog には各 call 発生時点の runtime.isEvaluating が記録される。
+function makeRuntime(calls, { throwOnStep = -1, stepError = null, restoreError = null } = {}) {
 	let stepCount = 0
 	let throwArmed = true
+	const evaluatingLog = []
+	let runtime = null
+	const record = (fn, impl) => (...args) => {
+		calls.push({ fn, args })
+		if (runtime) evaluatingLog.push(runtime.isEvaluating)
+		return impl(...args)
+	}
 	const ops = {
-		resolveConfigs: (context) => calls.push({ fn: 'resolveConfigs', args: [context] }),
-		capturePose: () => {
-			calls.push({ fn: 'capturePose', args: [] })
-			return { snapshot: true }
-		},
-		restorePose: (snapshot) => calls.push({ fn: 'restorePose', args: [snapshot] }),
-		updateMatrixWorld: () => calls.push({ fn: 'updateMatrixWorld', args: [] }),
-		resetAllToRest: (context) => calls.push({ fn: 'resetAllToRest', args: [context] }),
-		stepAndApplyOrdered: (dtSeconds, context) => {
+		resolveConfigs: record('resolveConfigs', () => {}),
+		capturePose: record('capturePose', () => ({ snapshot: true })),
+		restorePose: record('restorePose', () => {
+			if (restoreError) throw restoreError
+		}),
+		updateMatrixWorld: record('updateMatrixWorld', () => {}),
+		resetAllToRest: record('resetAllToRest', () => {}),
+		stepAndApplyOrdered: record('stepAndApplyOrdered', () => {
 			stepCount++
-			calls.push({ fn: 'stepAndApplyOrdered', args: [dtSeconds, context] })
 			if (throwArmed && stepCount === throwOnStep) {
 				throwArmed = false
-				throw new Error('step failed')
+				throw stepError ?? new Error('step failed')
 			}
-		},
-		applyOnlyOrdered: (context) => calls.push({ fn: 'applyOnlyOrdered', args: [context] }),
+		}),
+		applyOnlyOrdered: record('applyOnlyOrdered', () => {}),
 	}
-	const runtime = new SpringRuntime(ops)
+	runtime = new SpringRuntime(ops)
 	const context = { animation: null }
-	const basePose = (timeSeconds, ctx) => calls.push({ fn: 'basePose', args: [timeSeconds, ctx] })
-	return { runtime, ops, context, basePose }
+	const basePose = (timeSeconds, ctx) => {
+		calls.push({ fn: 'basePose', args: [timeSeconds, ctx] })
+		evaluatingLog.push(runtime.isEvaluating)
+	}
+	return { runtime, ops, context, basePose, evaluatingLog }
 }
 
 const fnNames = (calls) => calls.map((c) => c.fn)
@@ -232,4 +242,73 @@ test('SpringRuntime: endAnimation 後の evaluateSample は ops を呼ばない'
 	assert.deepEqual(calls, [])
 	// endAnimation の二重呼び出し (= 未開始状態への呼び出し) は no-op
 	assert.doesNotThrow(() => runtime.endAnimation())
+})
+
+test('SpringRuntime: restorePose が throw しても updateMatrixWorld は実行される', () => {
+	const restoreErr = new Error('restore failed')
+	const calls = []
+	const { runtime, context, basePose } = makeRuntime(calls, { restoreError: restoreErr })
+	runtime.beginAnimation(context, basePose)
+	calls.length = 0
+
+	// 正常系で restorePose だけが throw → その例外がそのまま伝播する
+	assert.throws(() => runtime.evaluateSample(0.05), (e) => e === restoreErr)
+	const names = fnNames(calls)
+	assert.ok(names.includes('restorePose'))
+	assert.ok(names.includes('updateMatrixWorld'))
+	assert.ok(!names.includes('applyOnlyOrdered'))
+	assert.equal(runtime.currentStepIndex, null)
+})
+
+test('SpringRuntime: sub-step と restorePose が両方 throw → sub-step 由来の例外が伝播', () => {
+	const stepErr = new Error('step failed')
+	const restoreErr = new Error('restore failed')
+	const calls = []
+	const { runtime, context, basePose } = makeRuntime(calls, {
+		throwOnStep: 1,
+		stepError: stepErr,
+		restoreError: restoreErr,
+	})
+	runtime.beginAnimation(context, basePose)
+	calls.length = 0
+
+	// 伝播するのは原因に近い方 (= sub-step 由来)。 identity で判定する
+	assert.throws(() => runtime.evaluateSample(0.05), (e) => e === stepErr)
+	const names = fnNames(calls)
+	assert.ok(names.includes('restorePose'))
+	assert.ok(names.includes('updateMatrixWorld'))
+	assert.ok(!names.includes('applyOnlyOrdered'))
+	assert.equal(runtime.currentStepIndex, null)
+})
+
+test('SpringRuntime: 例外時も restorePose → updateMatrixWorld の順序が保たれる', () => {
+	const calls = []
+	const { runtime, context, basePose } = makeRuntime(calls, { throwOnStep: 1 })
+	runtime.beginAnimation(context, basePose)
+	calls.length = 0
+
+	assert.throws(() => runtime.evaluateSample(0.05))
+	const names = fnNames(calls)
+	assert.ok(names.indexOf('restorePose') !== -1)
+	assert.ok(names.indexOf('restorePose') < names.indexOf('updateMatrixWorld'))
+})
+
+test('SpringRuntime: isEvaluating は評価中のみ true (= 例外終了後も false)', () => {
+	const calls = []
+	const { runtime, context, basePose, evaluatingLog } = makeRuntime(calls)
+	runtime.beginAnimation(context, basePose)
+	evaluatingLog.length = 0
+
+	// 評価中は全 call 地点で true、 正常終了後は false
+	runtime.evaluateSample(0.05)
+	assert.ok(evaluatingLog.length > 0)
+	assert.ok(evaluatingLog.every((v) => v === true))
+	assert.equal(runtime.isEvaluating, false)
+
+	// 例外終了後も false
+	const calls2 = []
+	const failing = makeRuntime(calls2, { throwOnStep: 1 })
+	failing.runtime.beginAnimation(failing.context, failing.basePose)
+	assert.throws(() => failing.runtime.evaluateSample(0.05))
+	assert.equal(failing.runtime.isEvaluating, false)
 })
