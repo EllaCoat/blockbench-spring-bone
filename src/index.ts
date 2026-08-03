@@ -10,12 +10,12 @@
 //   - applyAll は v0.0.8 の setFromUnitVectors 経路 (= 反射 basis half-lock 真因 fix) を維持
 //   - 物理は v0.0.7 の VRM SpringBone 風 force injection (= boneAxis * stiffness * dt 注入) を維持
 // Loop 連続性 = keyframe 側責任。 deterministic replay の構造上 loop wrap (= time 2.0 → 0) で
-//   spring 慣性 state は rest に戻る (= replayFromStartTo(0) で resetAllToRest)。 周期境界での
+//   spring 慣性 state は rest に戻る (= runtime の replay 経路で resetAllToRest)。 周期境界での
 //   ガクつきを避けるには「アニメ末端で物理が rest に収まる長さ」 で設計する必要あり。
 //   残った場合は Phase 5 のベイク機能で微調整する方針 (= 過剰な loop seamless 機構は入れない)。
 
 import { createState, resetState, step, type SpringConfig, type SpringState } from './springSim'
-import { FIXED_DT_SECONDS, FAST_FORWARD_STEP_THRESHOLD, timeToStepIndex, stepIndexToTime, type AnimationContext } from './springRuntime'
+import { SpringRuntime, type SpringRuntimeOps, type AnimationContext } from './springRuntime'
 import { registerSpringPanel } from './ui'
 
 declare const Plugin: { register(id: string, opts: Record<string, unknown>): void }
@@ -110,7 +110,7 @@ function onSpringPropertyChange(): void {
 	// fingerprint を空文字にすることで rescanRegistry 経由の invalidate を必ずトリガする
 	// (= 次 tick の rescanRegistry で fp !== lastGraphFingerprint 判定が真になる)。
 	lastGraphFingerprint = ''
-	currentStepIndex = null
+	invalidatePreviewSession()
 	// **animate モード限定で** Animator.preview を呼ぶ (= Round 2 review MUST-1 regression fix)。
 	// element_panel の onChange 経路は modes: ['edit'] で edit 専用、 その場合 Animator.preview は
 	// (a) tick() が !Modes?.animate で early-return するため意味がない、 加えて
@@ -665,10 +665,9 @@ const registry = new Map<string, BoneEntry>()
 let topoOrder: string[] = []
 // chain 構造の指紋 (= uuid:parentUuid:restLength の連結)。 rescan で fingerprint が
 // 変わった = topology が変化 (= reparent / rename / restLength / add / remove) と判定、
-// 変化時に currentStepIndex = null で次 tick の 0 replay をトリガする。 update_selection の
-// クリック保持は「構造不変 = fingerprint 不変」 のため step 状態に影響なし。
+// 変化時に invalidatePreviewSession() で次 tick の 0 replay をトリガする。 update_selection の
+// クリック保持は「構造不変 = fingerprint 不変」 のため session に影響なし。
 let lastGraphFingerprint = ''
-let currentStepIndex: number | null = null   // 現在 sim 状態が表現してる step 番号、 null = 未初期化
 let inhibitTick = false   // applyPoseAt 由来の再描画で tick が再入するのを防ぐ
 
 function isSpringGroup(group: unknown): boolean {
@@ -913,12 +912,12 @@ function rescanRegistry(): void {
 	rebuildTopoOrder(groups)
 
 	// topology (= chain 構造 / restLength) が変わったら sim state を invalidate。
-	// 次 tick は replayFromStartTo が起動し、 新構造に合わせて 0 から replay する。
-	// クリック保持 (= update_selection) は fingerprint 不変 → step 状態に影響なし。
+	// 次 tick は runtime の replay 経路が起動し、 新構造に合わせて 0 から replay する。
+	// クリック保持 (= update_selection) は fingerprint 不変 → session に影響なし。
 	const fp = computeGraphFingerprint()
 	if (fp !== lastGraphFingerprint) {
 		lastGraphFingerprint = fp
-		currentStepIndex = null
+		invalidatePreviewSession()
 	}
 }
 
@@ -927,7 +926,9 @@ function rescanRegistry(): void {
 // tick 中は Timeline.time を snap 時刻に一時的に書き換えるため、 退避 → 復元で playhead
 // UI との乖離累積を防ぐ (= 潜在バグ Fable #4)。 tick は毎 frame 呼ばれる + snap 時刻は最大
 // 半 step 分ズレるため、 復元しないと ms 単位のズレが累積して UI が微振動する余地がある。
-function applyPoseAt(time: number): void {
+// animation stack は呼び出し側 (= makePreviewAnimationContext) が確定させたものを context 経由で
+// 受け取る。 関数内部で Animation.selected を再参照しない (= 選択中 animation への暗黙依存の排除)。
+function applyPoseAt(time: number, context: PreviewAnimationContext): void {
 	if (typeof Animator?.showDefaultPose !== 'function') return
 	if (typeof Animator?.stackAnimations !== 'function') return
 	inhibitTick = true
@@ -936,11 +937,7 @@ function applyPoseAt(time: number): void {
 	try {
 		if (tl) tl.time = time
 		Animator.showDefaultPose(true)
-		const animSelected = (Animation as any)?.selected
-		const stack: any[] = animSelected
-			? [animSelected]
-			: ((Animation as any)?.all ?? []).filter((a: any) => a?.playing)
-		Animator.stackAnimations(stack, false)
+		Animator.stackAnimations(context.animationStack as any[], false)
 		Canvas?.scene?.updateMatrixWorld?.(true)
 	} finally {
 		// 元の Timeline.time を復元 (= 呼び出し元の期待する playhead 状態を保つ)。
@@ -1217,71 +1214,93 @@ function resetAllToRest(): void {
 	}
 }
 
-// 0 → target step まで fixed-dt sub-step 完走 (= deterministic replay の起点)
-function replayFromStartTo(targetStepIndex: number): void {
-	applyPoseAt(0)
-	resetAllToRest()
-	currentStepIndex = 0
-	advanceSimTo(targetStepIndex)
+// --- SpringRuntime 接続 (= preview 用の薄い BB adapter) ---
+// 時刻管理と replay / advance / same-step の判断は SpringRuntime (= springRuntime.ts) が持つ。
+// ここには「BB 由来の値を context に詰める」 「ops を BB API へ繋ぐ」 「session の張り直し
+// 判断」 だけを置く。 capturePose / restorePose / updateMatrixWorld / applyOnlyOrdered は
+// runtime.evaluateSample 内で順序保証されているため、 tick から直接呼ばない。
+
+// preview 用の context。 animationStack = base pose 適用対象の animation 列。
+// makePreviewAnimationContext で 1 回だけ確定させ、 applyPoseAt からは
+// Animation.selected を再参照させない (= 選択中 animation への暗黙依存の排除)。
+interface PreviewAnimationContext extends AnimationContext<any> {
+	animationStack: readonly any[]
 }
 
-// 現 step から target step まで fixed-dt sub-step (= cache 経路 + replay の共通実装)。
-// Phase 2 以降 : stepAll + applyAll を融合した stepAndApplyOrdered を呼ぶ。
-// sub-step ごとに applyPoseAt が keyframe pose を反映してから、 topo 順に物理を進めて
-// mesh.rotation を書き込む。 これで chain 子は親の物理変位反映後の world pos を anchor に読める。
-function advanceSimTo(targetStepIndex: number): void {
-	if (currentStepIndex === null) return
-	for (let next = currentStepIndex + 1; next <= targetStepIndex; next++) {
-		applyPoseAt(stepIndexToTime(next))
-		stepAndApplyOrdered(FIXED_DT_SECONDS)
-		currentStepIndex = next
-	}
+// 選択中 animation (= selected があればそれだけ、 無ければ playing 群) を解決して
+// animationStack に確定させる。 stack の解決はこの関数 1 箇所だけ。
+function makePreviewAnimationContext(): PreviewAnimationContext {
+	const animSelected = (Animation as any)?.selected
+	const animationStack: any[] = animSelected
+		? [animSelected]
+		: ((Animation as any)?.all ?? []).filter((a: any) => a?.playing)
+	return { animation: animSelected ?? null, animationStack }
+}
+
+// timeToStepIndex は非 finite で RangeError を throw するため、 preview 側で 0 へ正規化する
+// (= Timeline 未初期化や NaN の frame で tick 全体が死なないようにする)。
+function normalizeTimelineTime(t: unknown): number {
+	return typeof t === 'number' && Number.isFinite(t) ? t : 0
+}
+
+const previewOps: SpringRuntimeOps<PreviewAnimationContext, AnimatorPoseSnapshot> = {
+	resolveConfigs: (context) => {
+		for (const entry of registry.values()) {
+			Object.assign(entry.config, resolveConfig(entry, context))
+		}
+	},
+	capturePose: () => captureAnimatorPose(),
+	restorePose: (snapshot) => restoreAnimatorPose(snapshot),
+	updateMatrixWorld: () => { Canvas?.scene?.updateMatrixWorld?.(true) },
+	resetAllToRest: () => resetAllToRest(),
+	stepAndApplyOrdered: (dt) => stepAndApplyOrdered(dt),
+	applyOnlyOrdered: () => applyOnlyOrdered(),
+}
+const runtime = new SpringRuntime<PreviewAnimationContext, AnimatorPoseSnapshot>(previewOps)
+
+// 現在の session が張られた時の animationStack。 ensurePreviewSession が identity 列比較で
+// 張り直し要否を判定する。 null = session 未開始 or invalidate 済み (= 次 tick で begin し直す)。
+let previewSessionStack: readonly any[] | null = null
+
+// 現 session の animationStack と新 context の animationStack を要素の identity 列 (===) で
+// 比較し、 違う場合 (= animation 切替 / selected 変化) だけ session を張り直す。
+// 同じなら何もしない (= step cache を維持して cache advance 経路を生かす)。
+function ensurePreviewSession(context: PreviewAnimationContext): void {
+	const current = previewSessionStack
+	const next = context.animationStack
+	const same = current !== null && current.length === next.length &&
+		current.every((a, i) => a === next[i])
+	if (same) return
+	runtime.endAnimation()
+	runtime.beginAnimation(context, applyPoseAt)
+	previewSessionStack = next
+}
+
+// preview session の invalidate 唯一の口。 全 invalidate 経路 (= Property 変更 / topology 変化 /
+// keyframe edit / undo / mode 切替 / cleanup) はここに集約する。
+// previewSessionStack を null にすることで、 ensurePreviewSession が次回必ず begin し直す
+// (= runtime の step cache も endAnimation で破棄される = 次回は必ず 0 replay)。
+function invalidatePreviewSession(): void {
+	previewSessionStack = null
+	runtime.endAnimation()
 }
 
 function tick(): void {
-	if (inhibitTick) return
-	if (registry.size === 0) {
-		currentStepIndex = null
+	if (inhibitTick || runtime.isEvaluating) return
+	if (registry.size === 0 || !Modes?.animate) {
+		invalidatePreviewSession()
 		return
 	}
-	if (!Modes?.animate) {
-		currentStepIndex = null
-		return
-	}
-
-	// currentTime を step 番号に snap (= frame ごとの値固定、 deterministic 確保)
-	const targetStepIndex = timeToStepIndex((Timeline?.time as number) ?? 0)
-
-	// pose transaction : sub-step の applyPoseAt / stepAndApplyOrdered が全 bone を書き換えても
-	// finally で displayedBase (= BB core が当てた正しい current pose) に戻す。 これで registry 外の
-	// bone (= 解除済み / 非 spring / muted 等) が rest に取り残される root bone 凍結を排除。
-	// 例外時も rollback される (Sol 見落としバグ 5、 反復例外による恒久 rest 凍結の防止)。
-	const displayedBase = captureAnimatorPose()
-	try {
-		if (currentStepIndex === null || targetStepIndex < currentStepIndex ||
-			targetStepIndex - currentStepIndex > FAST_FORWARD_STEP_THRESHOLD) {
-			// 初回 / 逆行 / 大ジャンプ (= 31 step 以上の前進) = 0 から replay (= deterministic 完全保証)
-			replayFromStartTo(targetStepIndex)
-		} else if (targetStepIndex > currentStepIndex) {
-			// 通常前進 (= 30 step ちょうどまで) = cache (= 前 step) から進める (= 軽量化、 1 tick で 1-3 step)
-			advanceSimTo(targetStepIndex)
-		}
-		// 同一 step = sim 進めない (= state 不変、 描画のみ)
-	} finally {
-		restoreAnimatorPose(displayedBase)
-		Canvas?.scene?.updateMatrixWorld?.(true)
-	}
-
-	// spring bone だけ最終 pose を再適用 (= restore で消えた spring 揺れを書き戻す)。
-	// applyOnlyOrdered は registry 限定書き込み + updateMatrixWorld(true) で chain を伝播。
-	applyOnlyOrdered()
+	const context = makePreviewAnimationContext()
+	ensurePreviewSession(context)
+	runtime.evaluateSample(normalizeTimelineTime(Timeline?.time))
 }
 
 let cleanups: Array<() => void> = []
 
 function installTickLoop(): () => void {
 	rescanRegistry()
-	currentStepIndex = null
+	invalidatePreviewSession()
 	inhibitTick = false
 
 	// animation pose 由来の cache invalidation は BB event / Undo transaction を境界にする案 A を採用。
@@ -1307,7 +1326,7 @@ function installTickLoop(): () => void {
 	// onAnimFrame の状態遷移検知) 共通で 1 回発火のみを保証する。
 	const invalidateAnimationCache = (): void => {
 		wasKeyframeEditActive = false
-		currentStepIndex = null
+		invalidatePreviewSession()
 		if (!Modes?.animate) return
 		try {
 			Animator?.preview?.()
@@ -1344,7 +1363,7 @@ function installTickLoop(): () => void {
 			// 再入対策 : invalidate 呼び出しより前に flag を更新して、 preview 同期発火経由の
 			// 再入時に「wasKeyframeEditActive=false」 で遷移条件不成立にし、 再帰を切断する。
 			wasKeyframeEditActive = active
-			if (active) currentStepIndex = null
+			if (active) invalidatePreviewSession()
 			else if (shouldInvalidate) invalidateAnimationCache()
 			tick()
 		} catch (e) {
@@ -1360,22 +1379,22 @@ function installTickLoop(): () => void {
 	}
 	const onProjectSwitch = (): void => {
 		rescanRegistry()
-		currentStepIndex = null
+		invalidatePreviewSession()
 	}
 	const onUpdateSelection = (): void => {
-		// idempotent rescan で既存 entry の state は保持、 step 状態もそのまま (= 物理継続)。
+		// idempotent rescan で既存 entry の state は保持、 session もそのまま (= 物理継続)。
 		rescanRegistry()
 	}
 	const onModeChange = (): void => {
 		// mode 切替で sim 状態を捨てる (= 次 animate モード復帰時に頭から replay)
-		currentStepIndex = null
+		invalidatePreviewSession()
 	}
 	// 症状 1 (Undo できない) の primary fix : undo / redo で group.spring_* 値は元に戻るが、
 	// plugin 側の entry.config は BB event 経由でしか同期されない。 この listener が無いと
 	// 「値は復元されたのに entry.config は旧値のまま」 で「Ctrl+Z が効いていないように見える」
-	// 症状となる。 rescanRegistry で config 再読込 + currentStepIndex = null で fingerprint 変化経由の
-	// 次 tick 0 replay を起動する。 keyframe undo は fingerprint を触らないので currentStepIndex = null
-	// は unconditional 必要 (= Fable IMO-1、 undo-path の厳格さ)。
+	// 症状となる。 rescanRegistry で config 再読込 + invalidatePreviewSession() で fingerprint 変化経由の
+	// 次 tick 0 replay を起動する。 keyframe undo は fingerprint を触らないので invalidate は
+	// unconditional 必要 (= Fable IMO-1、 undo-path の厳格さ)。
 	//
 	// updateSelection() は敢えて呼ばない : BB core の loadUndoSave が 'undo'/'redo' event
 	// dispatch 直前 (= undo.js:823) に既発火、 我々の onUpdateSelection listener 経路で rescan
@@ -1383,7 +1402,7 @@ function installTickLoop(): () => void {
 	//
 	// 一方 Animator.preview() は残す : keyframe undo (= fingerprint 変化なし) の場合、 core の
 	// preview (= undo.js:830-832) は旧 step のまま走り「復元済み keyframe に古い物理姿勢を
-	// 適用」 する。 我々の currentStepIndex = null は次 display_animation_frame event を待つが、 paused
+	// 適用」 する。 我々の invalidatePreviewSession() は次 display_animation_frame event を待つが、 paused
 	// 中は自然発火しないため paused 中の keyframe undo で spring bones が視覚 stale のまま残る
 	// (= Codex Round 2 MUST-1 / Fable Round 2 WANT-1)。 unconditional preview 呼びで最新
 	// state を強制反映、 config undo 時の 2 replay 代償は個人スコープで許容 (dirty-flag による
@@ -1391,7 +1410,7 @@ function installTickLoop(): () => void {
 	const onUndoRedo = (): void => {
 		try {
 			rescanRegistry()
-			currentStepIndex = null
+			invalidatePreviewSession()
 			if (Modes?.animate) Animator?.preview?.()
 		} catch (e) {
 			console.warn(`[${PLUGIN_ID}] undo/redo refresh failed`, e)
@@ -1419,7 +1438,7 @@ function installTickLoop(): () => void {
 		registry.clear()
 		topoOrder = []
 		lastGraphFingerprint = ''
-		currentStepIndex = null
+		invalidatePreviewSession()
 	}
 }
 
