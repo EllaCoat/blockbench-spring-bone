@@ -15,7 +15,12 @@ Personal-use plugin. Not distributed publicly. Issues / PRs may not be triaged.
 
 - **Verlet integration** + spring + damper, fixed dt with sub-stepping for stability
 - Chain solving: root → leaf order, supports parent → child → grandchild bone trees
-- Per-bone parameters: mass / stiffness / damping / gravity / drag
+- Per-bone parameters:
+  - `drag` — inertia decay factor between sub-steps
+  - `stiffness` — force coefficient toward the rest direction (= parent bone orientation)
+  - `gravity` — force coefficient in world -Y
+  - `restLength` — distance from anchor to virtual tip. Auto-computed from the first
+    child group's origin; not directly editable at the moment
 - AnimatedJava integration: bake simulated transforms into the export pipeline so the
   motion is reproducible in-game
 
