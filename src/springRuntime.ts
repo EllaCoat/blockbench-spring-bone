@@ -46,13 +46,20 @@ export function stepIndexToTime(stepIndex: number): number {
 }
 
 // export frame 番号 → step 番号。 浮動小数の秒を経由しないため、 累積誤差が原理的に
-// 発生しない。 export driver (= Phase γ) はこちらを使い、 timeToStepIndex は通さない。
+// 発生しない。 戻り値は evaluateStepIndex にそのまま渡せる (= 秒への逆変換も
+// timeToStepIndex の再通過も不要)。 export driver (= Phase γ) はこちらを使い、
+// timeToStepIndex は通さない。
 export function stepIndexFromFrame(frameIndex: number): number {
-	if (!Number.isInteger(frameIndex)) {
-		throw new RangeError(`stepIndexFromFrame: frameIndex must be an integer, got ${frameIndex}`)
+	if (!Number.isSafeInteger(frameIndex)) {
+		throw new RangeError(`stepIndexFromFrame: frameIndex must be a safe integer, got ${frameIndex}`)
 	}
 	if (frameIndex <= 0) return 0
-	return frameIndex * SUBSTEPS_PER_EXPORT_FRAME
+	const result = frameIndex * SUBSTEPS_PER_EXPORT_FRAME
+	// 積が safe integer を外れる巨大 frame も弾く (= evaluateStepIndex のループ上限を守る)
+	if (!Number.isSafeInteger(result)) {
+		throw new RangeError(`stepIndexFromFrame: frame ${frameIndex} is out of safe integer step range`)
+	}
+	return result
 }
 
 // per-animation 解決の口。 今は animation 参照のみ (= 値の解決は呼び出し側の
@@ -88,20 +95,24 @@ export interface EvaluationResult {
 // 1 回だけ格子化)。 BB / AnimatedJava / THREE の API は一切参照せず、 scene への作用は
 // すべて constructor で受け取る ops に委譲する (= node:test で BB 無しに検証可能)。
 //
-// session の流れ : beginAnimation → evaluateSample × N → endAnimation。
-// - beginAnimation = 前 session を破棄して step cache を null に戻し、 resolveConfigs を
-//   1 回だけ呼ぶ。 pose / 物理 state は触らない (= 最初の evaluateSample が 0 から初期化)
-// - evaluateSample = capturePose → (replay 時のみ basePose(0) + resetAllToRest) →
-//   各 sub-step で basePose + stepAndApplyOrdered → restorePose → updateMatrixWorld →
-//   applyOnlyOrdered の順を保証する。 例外時は restorePose / updateMatrixWorld を通した後
-//   step cache を null にして再 throw (= 次回が必ず 0 replay になる)。 例外時は
-//   applyOnlyOrdered を呼ばない。 例外が複数段で発生した場合は最も原因に近いものを
-//   伝播させる (= 優先順位 sub-step > restorePose > updateMatrixWorld、 後段の失敗は
-//   警告に落とす)
+// session の流れ : beginAnimation → evaluateStepIndex (or evaluateSample) × N → endAnimation。
+// - beginAnimation = 前 session を破棄してから resolveConfigs を 1 回呼び、 成功した時点で
+//   session を確定する (= resolveConfigs が throw した場合は session 未開始のまま残る)。
+//   pose / 物理 state は触らない (= 最初の評価が 0 から初期化)
+// - evaluateStepIndex = 整数 step を直接受ける評価の本体。 capturePose →
+//   (replay 時のみ basePose(0) + resetAllToRest) → 各 sub-step で basePose +
+//   stepAndApplyOrdered → restorePose → updateMatrixWorld → applyOnlyOrdered の順を保証する。
+//   例外時は restorePose / updateMatrixWorld を通した後 step cache を null にして再 throw
+//   (= 次回が必ず 0 replay になる)。 例外時は applyOnlyOrdered を呼ばない。 例外が複数段で
+//   発生した場合は最も原因に近いものを伝播させる (= 優先順位 sub-step > restorePose >
+//   updateMatrixWorld、 後段の失敗は警告に落とす)
+// - evaluateSample = 秒を受ける preview 用の薄いラッパー (= timeToStepIndex で格子化して
+//   evaluateStepIndex に渡すだけ)
 // - applyWithoutAdvance = state を進めずに描画だけ更新する (= ops.applyOnlyOrdered)。
 //   session 未開始 / 初回評価前の呼び出しは契約違反として Error を throw する
 // - endAnimation = context / evaluator / step cache を破棄。 scene pose は変更しない
-// - isEvaluating = evaluateSample 実行中のみ true。 export hook からの再入を弾く口
+// - isEvaluating = 評価 (= evaluateStepIndex / evaluateSample) 実行中のみ true。
+//   export hook からの再入を弾く口
 export class SpringRuntime<C extends AnimationContext, P> {
 	private readonly ops: SpringRuntimeOps<C, P>
 	private context: C | null = null
@@ -122,20 +133,36 @@ export class SpringRuntime<C extends AnimationContext, P> {
 	}
 
 	beginAnimation(context: C, evaluateBasePose: BasePoseEvaluator<C>): void {
+		// 先に旧 session を破棄する (= 失敗時に古い session が残らない)
+		this.context = null
+		this.evaluateBasePose = null
+		this.stepIndex = null
+		// resolveConfigs が成功してから session を確定させる (= 失敗時に半端な
+		// context / evaluator が「開始済み」 として残らないようにする)
+		this.ops.resolveConfigs(context)
 		this.context = context
 		this.evaluateBasePose = evaluateBasePose
-		this.stepIndex = null
-		this.ops.resolveConfigs(context)
 	}
 
+	// 秒を受ける評価 API (= preview 用の薄いラッパー)。
+	// Blockbench の Timeline.time は可変デルタの累積で任意の float になるため、
+	// preview はこちらで格子化する。 export driver は使わず evaluateStepIndex を直接呼ぶ。
 	evaluateSample(sampleTimeSeconds: number): EvaluationResult {
+		return this.evaluateStepIndex(timeToStepIndex(sampleTimeSeconds))
+	}
+
+	// 整数 step 番号を直接受ける評価 API (= 本体)。 export driver はこちらを使う。
+	// stepIndexFromFrame(frameIndex) の戻り値をそのまま渡せば、 浮動小数の秒を一切経由しない。
+	evaluateStepIndex(targetStepIndex: number): EvaluationResult {
 		const context = this.context
 		const evaluateBasePose = this.evaluateBasePose
 		if (context === null || evaluateBasePose === null) {
-			throw new Error('SpringRuntime.evaluateSample: session not started')
+			throw new Error('SpringRuntime.evaluateStepIndex: session not started')
 		}
-		// 秒 → step の変換は timeToStepIndex で 1 回だけ (= 以降の分岐はすべて整数比較)
-		const target = timeToStepIndex(sampleTimeSeconds)
+		if (!Number.isSafeInteger(targetStepIndex) || targetStepIndex < 0) {
+			throw new RangeError(`SpringRuntime.evaluateStepIndex: target step must be a non-negative safe integer, got ${targetStepIndex}`)
+		}
+		const target = targetStepIndex
 		let mode: EvaluationMode
 		if (this.stepIndex === null || target < this.stepIndex ||
 			target - this.stepIndex > FAST_FORWARD_STEP_THRESHOLD) {

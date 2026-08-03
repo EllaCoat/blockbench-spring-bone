@@ -72,6 +72,12 @@ test('stepIndexFromFrame: 非整数 / 非有限値は RangeError', () => {
 	assert.throws(() => stepIndexFromFrame(1.5), RangeError)
 	assert.throws(() => stepIndexFromFrame(Number.NaN), RangeError)
 	assert.throws(() => stepIndexFromFrame(Number.POSITIVE_INFINITY), RangeError)
+	// Number.MAX_SAFE_INTEGER は isInteger を通過するが、 3 倍した積が safe integer を
+	// 外れるため入力側 / 積側の両方の検証で弾く
+	assert.throws(() => stepIndexFromFrame(Number.MAX_SAFE_INTEGER), RangeError)
+	assert.throws(() => stepIndexFromFrame(Number.MAX_SAFE_INTEGER + 1), RangeError)
+	// 積が safe integer に収まる境界は通る
+	assert.equal(stepIndexFromFrame(Math.floor(Number.MAX_SAFE_INTEGER / 3)), Math.floor(Number.MAX_SAFE_INTEGER / 3) * 3)
 })
 
 test('累積加算した秒は格子に乗らないため export では frame 番号経由を使う', () => {
@@ -90,9 +96,10 @@ test('累積加算した秒は格子に乗らないため export では frame �
 
 // stub ops : 呼ばれた順に {fn, args} を calls へ push するだけ (= BB 無しで検証するための口)。
 // throwOnStep = n で n 回目の stepAndApplyOrdered が 1 度だけ throw (= stepError で例外
-// object を指定可能)、 restoreError / updateError を渡すと restorePose / updateMatrixWorld
-// が常にそれを throw する。 evaluatingLog には各 call 発生時点の runtime.isEvaluating が記録される。
-function makeRuntime(calls, { throwOnStep = -1, stepError = null, restoreError = null, updateError = null } = {}) {
+// object を指定可能)、 restoreError / updateError / configError を渡すと
+// restorePose / updateMatrixWorld / resolveConfigs が常にそれを throw する。
+// evaluatingLog には各 call 発生時点の runtime.isEvaluating が記録される。
+function makeRuntime(calls, { throwOnStep = -1, stepError = null, restoreError = null, updateError = null, configError = null } = {}) {
 	let stepCount = 0
 	let throwArmed = true
 	const evaluatingLog = []
@@ -103,7 +110,9 @@ function makeRuntime(calls, { throwOnStep = -1, stepError = null, restoreError =
 		return impl(...args)
 	}
 	const ops = {
-		resolveConfigs: record('resolveConfigs', () => {}),
+		resolveConfigs: record('resolveConfigs', () => {
+			if (configError) throw configError
+		}),
 		capturePose: record('capturePose', () => ({ snapshot: true })),
 		restorePose: record('restorePose', () => {
 			if (restoreError) throw restoreError
@@ -427,4 +436,95 @@ test('SpringRuntime: applyWithoutAdvance は applyOnlyOrdered を 1 回だけ呼
 	assert.deepEqual(fnNames(calls), ['applyOnlyOrdered'])
 	// step / base pose は呼ばれず、 step cache も変化しない
 	assert.equal(runtime.currentStepIndex, 3)
+})
+
+test('SpringRuntime: evaluateStepIndex(stepIndexFromFrame(k)) は各 frame で 3 sub-step', () => {
+	// 1 export frame = 3 sub-step の直接検証。 秒を一切経由しない export driver の
+	// 呼び方そのまま (= stepIndexFromFrame の戻り値を evaluateStepIndex に渡す)。
+	const calls = []
+	const { runtime, context, basePose } = makeRuntime(calls)
+	runtime.beginAnimation(context, basePose)
+
+	// k = 0 は初回 replay で step 0 に初期化されるだけ (= sub-step 無し)
+	const first = runtime.evaluateStepIndex(stepIndexFromFrame(0))
+	assert.equal(first.mode, 'replay')
+	assert.equal(first.substepCount, 0)
+	assert.equal(first.stepIndex, 0)
+
+	// k = 1..10 は各回ちょうど 3 sub-step (= 浮動小数の累積誤差で変動しない)
+	for (let k = 1; k <= 10; k++) {
+		const result = runtime.evaluateStepIndex(stepIndexFromFrame(k))
+		assert.equal(result.substepCount, 3, `k=${k}`)
+		assert.equal(result.stepIndex, k * 3, `k=${k}`)
+		assert.equal(result.mode, 'advance', `k=${k}`)
+	}
+})
+
+test('SpringRuntime: evaluateStepIndex は負値 / 非整数 / 非 safe-integer で RangeError', () => {
+	const calls = []
+	const { runtime, context, basePose } = makeRuntime(calls)
+	runtime.beginAnimation(context, basePose)
+	assert.throws(() => runtime.evaluateStepIndex(-1), RangeError)
+	assert.throws(() => runtime.evaluateStepIndex(1.5), RangeError)
+	assert.throws(() => runtime.evaluateStepIndex(Number.NaN), RangeError)
+	assert.throws(() => runtime.evaluateStepIndex(Number.MAX_SAFE_INTEGER + 1), RangeError)
+	// いずれも ops は呼ばれない
+	assert.deepEqual(fnNames(calls), ['resolveConfigs'])
+})
+
+test('SpringRuntime: evaluateSample と evaluateStepIndex は同じ結果を返す', () => {
+	const callsA = []
+	const callsB = []
+	const a = makeRuntime(callsA)
+	const b = makeRuntime(callsB)
+	a.runtime.beginAnimation(a.context, a.basePose)
+	b.runtime.beginAnimation(b.context, b.basePose)
+
+	for (const seconds of [0.05, 0.10, 0.15, 0.10, 0.50]) {
+		const viaSample = a.runtime.evaluateSample(seconds)
+		const viaStep = b.runtime.evaluateStepIndex(timeToStepIndex(seconds))
+		assert.deepEqual(viaStep, viaSample, `seconds=${seconds}`)
+	}
+	// 呼び出し列も一致する (= 薄いラッパーであることの検証)
+	assert.deepEqual(fnNames(callsA), fnNames(callsB))
+})
+
+test('SpringRuntime: resolveConfigs が throw したら session は確定しない', () => {
+	const configErr = new Error('config resolve failed')
+	const calls = []
+	const { runtime, context, basePose } = makeRuntime(calls, { configError: configErr })
+
+	assert.throws(() => runtime.beginAnimation(context, basePose), (e) => e === configErr)
+	// 半端な session が残っていない (= 後続の evaluateSample は「session 未開始」 で弾く)
+	assert.equal(runtime.currentStepIndex, null)
+	assert.throws(() => runtime.evaluateSample(0.05), /session not started/)
+
+	// 正常な ops で begin し直せば復帰できる
+	const calls2 = []
+	const ok = makeRuntime(calls2)
+	ok.runtime.beginAnimation(ok.context, ok.basePose)
+	assert.equal(ok.runtime.evaluateSample(0.05).mode, 'replay')
+})
+
+test('SpringRuntime: restorePose と updateMatrixWorld が両方 throw → restorePose 由来が伝播', () => {
+	// sub-step は成功し、 後段 2 つが連続で失敗する分岐。 優先順位
+	// sub-step > restorePose > updateMatrixWorld の restore > update 部分を検証する。
+	const restoreErr = new Error('restore failed')
+	const updateErr = new Error('update failed')
+	const calls = []
+	const { runtime, context, basePose } = makeRuntime(calls, {
+		restoreError: restoreErr,
+		updateError: updateErr,
+	})
+	runtime.beginAnimation(context, basePose)
+	calls.length = 0
+
+	assert.throws(() => runtime.evaluateSample(0.05), (e) => e === restoreErr)
+	const names = fnNames(calls)
+	// sub-step は完走している (= 全 3 sub-step 成功) が、 後段失敗で applyOnlyOrdered は呼ばれない
+	assert.equal(names.filter((n) => n === 'stepAndApplyOrdered').length, 3)
+	assert.ok(names.includes('restorePose'))
+	assert.ok(names.includes('updateMatrixWorld'))
+	assert.ok(!names.includes('applyOnlyOrdered'))
+	assert.equal(runtime.currentStepIndex, null)
 })
