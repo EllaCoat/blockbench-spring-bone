@@ -15,7 +15,7 @@
 //   残った場合は Phase 5 のベイク機能で微調整する方針 (= 過剰な loop seamless 機構は入れない)。
 
 import { createState, resetState, step, type SpringConfig, type SpringState } from './springSim'
-import { FIXED_DT_SECONDS, FAST_FORWARD_STEP_THRESHOLD, timeToStepIndex, stepIndexToTime } from './springRuntime'
+import { FIXED_DT_SECONDS, FAST_FORWARD_STEP_THRESHOLD, timeToStepIndex, stepIndexToTime, type AnimationContext } from './springRuntime'
 import { registerSpringPanel } from './ui'
 
 declare const Plugin: { register(id: string, opts: Record<string, unknown>): void }
@@ -79,6 +79,24 @@ function readSpringProp(group: unknown, key: SpringPropertyKey, fallback: number
 	return typeof raw === 'number' && Number.isFinite(raw) ? raw : fallback
 }
 
+// Group Property から物理パラ (= drag / stiffness / gravity) を解決する唯一の口。
+// registerGroup (= 初期 config) / rescanRegistry (= refresh) / onSpringPropertyChange
+// (= Property 変更 hook) の 3 経路で共通。 戻り値に restLength / restLocalDir は
+// **含めない** : これらは子 group の origin から算出される rig geometry 由来の値で
+// Property 解決の対象外であり、 含めると geometry 算出値を DEFAULT へ戻す事故になる。
+// 呼び出し側は `Object.assign(entry.config, resolveConfig(entry, null))` で適用する。
+// _animationContext は将来の per-animation 解決用の口 (= 今は読まない)。
+function resolveConfig(
+	entry: BoneEntry,
+	_animationContext: AnimationContext | null,
+): { drag: number; stiffness: number; gravity: number } {
+	return {
+		drag: readSpringProp(entry.group, 'spring_drag', DEFAULT_CONFIG.drag),
+		stiffness: readSpringProp(entry.group, 'spring_stiffness', DEFAULT_CONFIG.stiffness),
+		gravity: readSpringProp(entry.group, 'spring_gravity', DEFAULT_CONFIG.gravity),
+	}
+}
+
 // Property 変更時の同期 hook。 element_panel input の onChange から呼ばれる。
 // - 全 registered spring group の Property 値を entry.config に反映
 // - fingerprint invalidate (= 次 tick で 0 replay 経路が走り、 preview 即反映)
@@ -87,9 +105,7 @@ function readSpringProp(group: unknown, key: SpringPropertyKey, fallback: number
 //   `Animator.preview()` を明示的に呼ぶことで停止中の即時反映を確保する (= 受け入れ条件 (c))。
 function onSpringPropertyChange(): void {
 	for (const entry of registry.values()) {
-		entry.config.drag = readSpringProp(entry.group, 'spring_drag', DEFAULT_CONFIG.drag)
-		entry.config.stiffness = readSpringProp(entry.group, 'spring_stiffness', DEFAULT_CONFIG.stiffness)
-		entry.config.gravity = readSpringProp(entry.group, 'spring_gravity', DEFAULT_CONFIG.gravity)
+		Object.assign(entry.config, resolveConfig(entry, null))
 	}
 	// fingerprint を空文字にすることで rescanRegistry 経由の invalidate を必ずトリガする
 	// (= 次 tick の rescanRegistry で fp !== lastGraphFingerprint 判定が真になる)。
@@ -756,21 +772,25 @@ function registerGroup(group: any): void {
 			restLocalDir = d.dir
 		}
 	}
-	registry.set(group.uuid, {
+	// entry を先に組み立ててから Property 由来の物理パラ (= drag / stiffness / gravity) を
+	// resolveConfig で適用する。 残りの restLength は子 group の origin から算出した
+	// rig geometry 由来の値で、 resolveConfig の対象外 (= DEFAULT へ戻さない)。
+	// registerGroup は idempotent スキップで state を保持するため、 このパスは新規 register 時のみ通る。
+	const entry: BoneEntry = {
 		group,
-		// Property 値を初期 config に反映 (= Property 未 register / 未設定なら DEFAULT_CONFIG fallback)。
-		// registerGroup は idempotent スキップで state を保持するため、 このパスは新規 register 時のみ通る。
 		config: {
-			drag: readSpringProp(group, 'spring_drag', DEFAULT_CONFIG.drag),
-			stiffness: readSpringProp(group, 'spring_stiffness', DEFAULT_CONFIG.stiffness),
-			gravity: readSpringProp(group, 'spring_gravity', DEFAULT_CONFIG.gravity),
+			drag: DEFAULT_CONFIG.drag,
+			stiffness: DEFAULT_CONFIG.stiffness,
+			gravity: DEFAULT_CONFIG.gravity,
 			restLength,
 		},
 		state: createState(),
 		restLocalDir,
 		parentUuid: getSpringParentUuid(group),
 		depth: 0, // rebuildTopoOrder で再計算される
-	})
+	}
+	Object.assign(entry.config, resolveConfig(entry, null))
+	registry.set(group.uuid, entry)
 }
 
 // registry の各 entry に depth を割り付けつつ topoOrder を再構築する。
@@ -880,9 +900,7 @@ function rescanRegistry(): void {
 	// tick 経路で自然に取り込まれる。
 	for (const entry of registry.values()) {
 		entry.parentUuid = getSpringParentUuid(entry.group)
-		entry.config.drag = readSpringProp(entry.group, 'spring_drag', DEFAULT_CONFIG.drag)
-		entry.config.stiffness = readSpringProp(entry.group, 'spring_stiffness', DEFAULT_CONFIG.stiffness)
-		entry.config.gravity = readSpringProp(entry.group, 'spring_gravity', DEFAULT_CONFIG.gravity)
+		Object.assign(entry.config, resolveConfig(entry, null))
 		const child = findChildGroup(entry.group)
 		if (child) {
 			const d = originDelta(entry.group, child)
