@@ -55,7 +55,7 @@ function pushValuesFromSelectedGroup(form: any): void {
 }
 
 // Panel + form + selection listener を register して cleanup 関数を返す。
-// onChange = index.ts の onSpringPropertyChange (= registry sync + simTime = -1 invalidate)。
+// onChange = index.ts の onSpringPropertyChange (= registry sync + invalidatePreviewSession() による session 破棄)。
 export function registerSpringPanel(onChange: () => void): () => void {
 	if (typeof Panel !== 'function' || typeof InputForm !== 'function') {
 		console.warn('[spring_bone] Panel or InputForm not available, skipping panel registration')
