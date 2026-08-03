@@ -1,9 +1,9 @@
 // blockbench-spring-bone — Blockbench plugin
 // Spring bone physics simulation for hair / cloth / accessory bones.
 // v0.0.9 で deterministic replay 方式に切替 :
-//   - 物理 sim 進行を simTime (= 0 基準の sim 内部時刻) ベースに変更
-//   - 毎 tick で currentTime を FIXED_DT 単位に snap、 0 → targetSimTime まで FIXED_DT で完走
-//   - 通常前進は cache (= 前 simTime) から進める軽量化、 逆行 / 大ジャンプは 0 から replay
+//   - 物理 sim 進行を整数 step 番号 (= 1/60 秒格子、 springRuntime.ts) ベースで管理
+//   - 毎 tick で currentTime を step 番号に snap、 0 → target step まで fixed-dt で完走
+//   - 通常前進は cache (= 前 step) から進める軽量化、 逆行 / 大ジャンプは 0 から replay
 //   - 結果 = frame ごとに値固定、 scrub 速度 / 履歴に依存しない、 巨大 dt 爆発なし
 //   - 旧 accumulator (leftoverTime) + scrub_reset 機構は全廃 (= 履歴依存で deterministic でなかった)
 //   - rescanRegistry を idempotent 化 (= 既存 entry の state を保持、 ボーンクリック時のリセット解消)
@@ -15,6 +15,7 @@
 //   残った場合は Phase 5 のベイク機能で微調整する方針 (= 過剰な loop seamless 機構は入れない)。
 
 import { createState, resetState, step, type SpringConfig, type SpringState } from './springSim'
+import { FIXED_DT_SECONDS, FAST_FORWARD_STEP_THRESHOLD, timeToStepIndex, stepIndexToTime } from './springRuntime'
 import { registerSpringPanel } from './ui'
 
 declare const Plugin: { register(id: string, opts: Record<string, unknown>): void }
@@ -58,10 +59,8 @@ const PLUGIN_VERSION = '0.0.10'
 // この prefix を前提に register される。
 const BONE_NAME_PREFIX = 'spring_'
 
-// 物理パラ (= VRM SpringBone デフォルト相当)
-const FIXED_DT = 1 / 60
-// 0.5s 超の前進は cache 経路が重くなる + scrub の大ジャンプ判定なので 0 から replay に流す
-const FAST_FORWARD_THRESHOLD = 0.5
+// 物理パラ (= VRM SpringBone デフォルト相当)。 時刻刻み関連の定数 (= FIXED_DT_SECONDS /
+// FAST_FORWARD_STEP_THRESHOLD) は springRuntime.ts 側に集約。
 const DEFAULT_CONFIG: Omit<SpringConfig, 'restLength'> = {
 	drag: 0.05,        // 速度減衰 = 5% / step (= ふんわり残響、 VRM デフォルト相当)
 	stiffness: 1.0,    // 親方向への per-step force coefficient
@@ -95,7 +94,7 @@ function onSpringPropertyChange(): void {
 	// fingerprint を空文字にすることで rescanRegistry 経由の invalidate を必ずトリガする
 	// (= 次 tick の rescanRegistry で fp !== lastGraphFingerprint 判定が真になる)。
 	lastGraphFingerprint = ''
-	simTime = -1
+	currentStepIndex = null
 	// **animate モード限定で** Animator.preview を呼ぶ (= Round 2 review MUST-1 regression fix)。
 	// element_panel の onChange 経路は modes: ['edit'] で edit 専用、 その場合 Animator.preview は
 	// (a) tick() が !Modes?.animate で early-return するため意味がない、 加えて
@@ -650,10 +649,10 @@ const registry = new Map<string, BoneEntry>()
 let topoOrder: string[] = []
 // chain 構造の指紋 (= uuid:parentUuid:restLength の連結)。 rescan で fingerprint が
 // 変わった = topology が変化 (= reparent / rename / restLength / add / remove) と判定、
-// 変化時に simTime = -1 で次 tick の 0 replay をトリガする。 update_selection の
-// クリック保持は「構造不変 = fingerprint 不変」 のため simTime 影響なし。
+// 変化時に currentStepIndex = null で次 tick の 0 replay をトリガする。 update_selection の
+// クリック保持は「構造不変 = fingerprint 不変」 のため step 状態に影響なし。
 let lastGraphFingerprint = ''
-let simTime = -1          // 現在 sim 状態が表現してる時刻 (= 秒)、 -1 = 未初期化
+let currentStepIndex: number | null = null   // 現在 sim 状態が表現してる step 番号、 null = 未初期化
 let inhibitTick = false   // applyPoseAt 由来の再描画で tick が再入するのを防ぐ
 
 function isSpringGroup(group: unknown): boolean {
@@ -897,11 +896,11 @@ function rescanRegistry(): void {
 
 	// topology (= chain 構造 / restLength) が変わったら sim state を invalidate。
 	// 次 tick は replayFromStartTo が起動し、 新構造に合わせて 0 から replay する。
-	// クリック保持 (= update_selection) は fingerprint 不変 → simTime 影響なし。
+	// クリック保持 (= update_selection) は fingerprint 不変 → step 状態に影響なし。
 	const fp = computeGraphFingerprint()
 	if (fp !== lastGraphFingerprint) {
 		lastGraphFingerprint = fp
-		simTime = -1
+		currentStepIndex = null
 	}
 }
 
@@ -909,7 +908,7 @@ function rescanRegistry(): void {
 // `inhibitTick` で applyPoseAt 起因の display_animation_frame 再発火を弾く。
 // tick 中は Timeline.time を snap 時刻に一時的に書き換えるため、 退避 → 復元で playhead
 // UI との乖離累積を防ぐ (= 潜在バグ Fable #4)。 tick は毎 frame 呼ばれる + snap 時刻は最大
-// 半 FIXED_DT 分ズレるため、 復元しないと ms 単位のズレが累積して UI が微振動する余地がある。
+// 半 step 分ズレるため、 復元しないと ms 単位のズレが累積して UI が微振動する余地がある。
 function applyPoseAt(time: number): void {
 	if (typeof Animator?.showDefaultPose !== 'function') return
 	if (typeof Animator?.stackAnimations !== 'function') return
@@ -1200,40 +1199,40 @@ function resetAllToRest(): void {
 	}
 }
 
-// 0 → targetTime まで FIXED_DT 単位で fixed-dt sub-step 完走 (= deterministic replay の起点)
-function replayFromStartTo(targetTime: number): void {
+// 0 → target step まで fixed-dt sub-step 完走 (= deterministic replay の起点)
+function replayFromStartTo(targetStepIndex: number): void {
 	applyPoseAt(0)
 	resetAllToRest()
-	simTime = 0
-	advanceSimTo(targetTime)
+	currentStepIndex = 0
+	advanceSimTo(targetStepIndex)
 }
 
-// 現 simTime から targetTime まで FIXED_DT 単位で sub-step (= cache 経路 + replay の共通実装)。
+// 現 step から target step まで fixed-dt sub-step (= cache 経路 + replay の共通実装)。
 // Phase 2 以降 : stepAll + applyAll を融合した stepAndApplyOrdered を呼ぶ。
 // sub-step ごとに applyPoseAt が keyframe pose を反映してから、 topo 順に物理を進めて
 // mesh.rotation を書き込む。 これで chain 子は親の物理変位反映後の world pos を anchor に読める。
-function advanceSimTo(targetTime: number): void {
-	while (simTime + FIXED_DT <= targetTime + 1e-6) {
-		applyPoseAt(simTime + FIXED_DT)
-		stepAndApplyOrdered(FIXED_DT)
-		simTime += FIXED_DT
+function advanceSimTo(targetStepIndex: number): void {
+	if (currentStepIndex === null) return
+	for (let next = currentStepIndex + 1; next <= targetStepIndex; next++) {
+		applyPoseAt(stepIndexToTime(next))
+		stepAndApplyOrdered(FIXED_DT_SECONDS)
+		currentStepIndex = next
 	}
 }
 
 function tick(): void {
 	if (inhibitTick) return
 	if (registry.size === 0) {
-		simTime = -1
+		currentStepIndex = null
 		return
 	}
 	if (!Modes?.animate) {
-		simTime = -1
+		currentStepIndex = null
 		return
 	}
-	const currentTime = (Timeline?.time as number) ?? 0
 
-	// currentTime を FIXED_DT 単位に snap (= frame ごとの値固定、 deterministic 確保)
-	const targetSimTime = Math.max(0, Math.floor(currentTime / FIXED_DT) * FIXED_DT)
+	// currentTime を step 番号に snap (= frame ごとの値固定、 deterministic 確保)
+	const targetStepIndex = timeToStepIndex((Timeline?.time as number) ?? 0)
 
 	// pose transaction : sub-step の applyPoseAt / stepAndApplyOrdered が全 bone を書き換えても
 	// finally で displayedBase (= BB core が当てた正しい current pose) に戻す。 これで registry 外の
@@ -1241,14 +1240,15 @@ function tick(): void {
 	// 例外時も rollback される (Sol 見落としバグ 5、 反復例外による恒久 rest 凍結の防止)。
 	const displayedBase = captureAnimatorPose()
 	try {
-		if (simTime < 0 || targetSimTime < simTime - 1e-6 || targetSimTime - simTime > FAST_FORWARD_THRESHOLD) {
-			// 初回 / 逆行 / 大ジャンプ = 0 から replay (= deterministic 完全保証)
-			replayFromStartTo(targetSimTime)
-		} else if (targetSimTime > simTime + 1e-6) {
-			// 通常前進 = cache (= 前 simTime) から進める (= 軽量化、 1 tick で 1-3 step)
-			advanceSimTo(targetSimTime)
+		if (currentStepIndex === null || targetStepIndex < currentStepIndex ||
+			targetStepIndex - currentStepIndex > FAST_FORWARD_STEP_THRESHOLD) {
+			// 初回 / 逆行 / 大ジャンプ (= 31 step 以上の前進) = 0 から replay (= deterministic 完全保証)
+			replayFromStartTo(targetStepIndex)
+		} else if (targetStepIndex > currentStepIndex) {
+			// 通常前進 (= 30 step ちょうどまで) = cache (= 前 step) から進める (= 軽量化、 1 tick で 1-3 step)
+			advanceSimTo(targetStepIndex)
 		}
-		// 同時刻 (= |targetSimTime - simTime| < 1e-6) = sim 進めない (= state 不変、 描画のみ)
+		// 同一 step = sim 進めない (= state 不変、 描画のみ)
 	} finally {
 		restoreAnimatorPose(displayedBase)
 		Canvas?.scene?.updateMatrixWorld?.(true)
@@ -1263,7 +1263,7 @@ let cleanups: Array<() => void> = []
 
 function installTickLoop(): () => void {
 	rescanRegistry()
-	simTime = -1
+	currentStepIndex = null
 	inhibitTick = false
 
 	// animation pose 由来の cache invalidation は BB event / Undo transaction を境界にする案 A を採用。
@@ -1289,7 +1289,7 @@ function installTickLoop(): () => void {
 	// onAnimFrame の状態遷移検知) 共通で 1 回発火のみを保証する。
 	const invalidateAnimationCache = (): void => {
 		wasKeyframeEditActive = false
-		simTime = -1
+		currentStepIndex = null
 		if (!Modes?.animate) return
 		try {
 			Animator?.preview?.()
@@ -1326,7 +1326,7 @@ function installTickLoop(): () => void {
 			// 再入対策 : invalidate 呼び出しより前に flag を更新して、 preview 同期発火経由の
 			// 再入時に「wasKeyframeEditActive=false」 で遷移条件不成立にし、 再帰を切断する。
 			wasKeyframeEditActive = active
-			if (active) simTime = -1
+			if (active) currentStepIndex = null
 			else if (shouldInvalidate) invalidateAnimationCache()
 			tick()
 		} catch (e) {
@@ -1342,21 +1342,21 @@ function installTickLoop(): () => void {
 	}
 	const onProjectSwitch = (): void => {
 		rescanRegistry()
-		simTime = -1
+		currentStepIndex = null
 	}
 	const onUpdateSelection = (): void => {
-		// idempotent rescan で既存 entry の state は保持、 simTime もそのまま (= 物理継続)。
+		// idempotent rescan で既存 entry の state は保持、 step 状態もそのまま (= 物理継続)。
 		rescanRegistry()
 	}
 	const onModeChange = (): void => {
 		// mode 切替で sim 状態を捨てる (= 次 animate モード復帰時に頭から replay)
-		simTime = -1
+		currentStepIndex = null
 	}
 	// 症状 1 (Undo できない) の primary fix : undo / redo で group.spring_* 値は元に戻るが、
 	// plugin 側の entry.config は BB event 経由でしか同期されない。 この listener が無いと
 	// 「値は復元されたのに entry.config は旧値のまま」 で「Ctrl+Z が効いていないように見える」
-	// 症状となる。 rescanRegistry で config 再読込 + simTime = -1 で fingerprint 変化経由の
-	// 次 tick 0 replay を起動する。 keyframe undo は fingerprint を触らないので simTime = -1
+	// 症状となる。 rescanRegistry で config 再読込 + currentStepIndex = null で fingerprint 変化経由の
+	// 次 tick 0 replay を起動する。 keyframe undo は fingerprint を触らないので currentStepIndex = null
 	// は unconditional 必要 (= Fable IMO-1、 undo-path の厳格さ)。
 	//
 	// updateSelection() は敢えて呼ばない : BB core の loadUndoSave が 'undo'/'redo' event
@@ -1364,8 +1364,8 @@ function installTickLoop(): () => void {
 	// も走るため冗長 (= Round 2 review WANT-1、 undo 1 回で 2 rescan の性能ロス回避)。
 	//
 	// 一方 Animator.preview() は残す : keyframe undo (= fingerprint 変化なし) の場合、 core の
-	// preview (= undo.js:830-832) は旧 simTime のまま走り「復元済み keyframe に古い物理姿勢を
-	// 適用」 する。 我々の simTime = -1 は次 display_animation_frame event を待つが、 paused
+	// preview (= undo.js:830-832) は旧 step のまま走り「復元済み keyframe に古い物理姿勢を
+	// 適用」 する。 我々の currentStepIndex = null は次 display_animation_frame event を待つが、 paused
 	// 中は自然発火しないため paused 中の keyframe undo で spring bones が視覚 stale のまま残る
 	// (= Codex Round 2 MUST-1 / Fable Round 2 WANT-1)。 unconditional preview 呼びで最新
 	// state を強制反映、 config undo 時の 2 replay 代償は個人スコープで許容 (dirty-flag による
@@ -1373,7 +1373,7 @@ function installTickLoop(): () => void {
 	const onUndoRedo = (): void => {
 		try {
 			rescanRegistry()
-			simTime = -1
+			currentStepIndex = null
 			if (Modes?.animate) Animator?.preview?.()
 		} catch (e) {
 			console.warn(`[${PLUGIN_ID}] undo/redo refresh failed`, e)
@@ -1401,7 +1401,7 @@ function installTickLoop(): () => void {
 		registry.clear()
 		topoOrder = []
 		lastGraphFingerprint = ''
-		simTime = -1
+		currentStepIndex = null
 	}
 }
 
