@@ -1258,22 +1258,30 @@ const previewOps: SpringRuntimeOps<PreviewAnimationContext, AnimatorPoseSnapshot
 }
 const runtime = new SpringRuntime<PreviewAnimationContext, AnimatorPoseSnapshot>(previewOps)
 
-// 現在の session が張られた時の animationStack。 ensurePreviewSession が identity 列比較で
-// 張り直し要否を判定する。 null = session 未開始 or invalidate 済み (= 次 tick で begin し直す)。
+// 現在の session が張られた時の animationStack / animation。 ensurePreviewSession が
+// identity 比較で張り直し要否を判定する。 previewSessionStack === null = session 未開始
+// or invalidate 済み (= 次 tick で begin し直す)。
 let previewSessionStack: readonly any[] | null = null
+let previewSessionAnimation: any = null
 
-// 現 session の animationStack と新 context の animationStack を要素の identity 列 (===) で
-// 比較し、 違う場合 (= animation 切替 / selected 変化) だけ session を張り直す。
+// 現 session と新 context を比較し、 違う場合だけ session を張り直す。
+// 同一判定は **両方** の一致を要求する :
+// - animationStack の要素 identity 列 (===)
+// - animation の === (= stack 中身が同じ [A] でも animation: null → A 遷移を検出する。
+//   Phase β の per-animation パラメータ解決で context.animation が resolver の入力になるため)
 // 同じなら何もしない (= step cache を維持して cache advance 経路を生かす)。
 function ensurePreviewSession(context: PreviewAnimationContext): void {
 	const current = previewSessionStack
 	const next = context.animationStack
-	const same = current !== null && current.length === next.length &&
+	const same = current !== null &&
+		previewSessionAnimation === context.animation &&
+		current.length === next.length &&
 		current.every((a, i) => a === next[i])
 	if (same) return
 	runtime.endAnimation()
 	runtime.beginAnimation(context, applyPoseAt)
 	previewSessionStack = next
+	previewSessionAnimation = context.animation
 }
 
 // preview session の invalidate 唯一の口。 全 invalidate 経路 (= Property 変更 / topology 変化 /
@@ -1282,6 +1290,7 @@ function ensurePreviewSession(context: PreviewAnimationContext): void {
 // (= runtime の step cache も endAnimation で破棄される = 次回は必ず 0 replay)。
 function invalidatePreviewSession(): void {
 	previewSessionStack = null
+	previewSessionAnimation = null
 	runtime.endAnimation()
 }
 
