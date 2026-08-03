@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-const { timeToStepIndex, stepIndexToTime, SpringRuntime } = await import('../dist-test/springRuntime.mjs')
+const { timeToStepIndex, stepIndexToTime, stepIndexFromFrame, SpringRuntime } = await import('../dist-test/springRuntime.mjs')
 
 test('timeToStepIndex: バグ再現ケース (2.05 → 123)', () => {
 	// 旧実装 Math.floor(2.05 / (1/60)) は 122.99999999999999 を floor して 122 を返していた
@@ -51,13 +51,48 @@ test('stepIndexToTime: round-trip', () => {
 	assert.equal(stepIndexToTime(3), 0.05)
 })
 
+test('timeToStepIndex: safe integer を外れる巨大時刻は RangeError', () => {
+	// timeSeconds * 60 が Infinity に overflow する領域。 そのまま返すと
+	// evaluateSample の sub-step ループが終了しなくなるため throw で弾く
+	assert.throws(() => timeToStepIndex(Number.MAX_VALUE), RangeError)
+	assert.throws(() => timeToStepIndex(1e308), RangeError)
+})
+
+test('stepIndexFromFrame: frame 番号から step を直接引く (k = 0..100000)', () => {
+	for (let k = 0; k <= 100000; k++) {
+		assert.equal(stepIndexFromFrame(k), k * 3, `k=${k}`)
+		if (k > 0) {
+			// 連続する frame の差は常に 3 (= 浮動小数の秒を経由しないため変動しない)
+			assert.equal(stepIndexFromFrame(k) - stepIndexFromFrame(k - 1), 3, `k=${k}`)
+		}
+	}
+})
+
+test('stepIndexFromFrame: 非整数 / 非有限値は RangeError', () => {
+	assert.throws(() => stepIndexFromFrame(1.5), RangeError)
+	assert.throws(() => stepIndexFromFrame(Number.NaN), RangeError)
+	assert.throws(() => stepIndexFromFrame(Number.POSITIVE_INFINITY), RangeError)
+})
+
+test('累積加算した秒は格子に乗らないため export では frame 番号経由を使う', () => {
+	// 実測固定 : t += 0.05 を 60 回繰り返すと 2.9999999999999973 となり、
+	// timeToStepIndex では 180 ではなく 179 と評価される (= 累積加算された値は
+	// 1/60 格子上の点ではないため、 tolerance を広げても根治しない)。
+	// これを保証対象外の仕様として固定する。 同じ frame を stepIndexFromFrame で
+	// 引けば厳密に 180 になる (= export 経路はこちらを使う)。
+	let t = 0
+	for (let i = 0; i < 60; i++) t += 0.05
+	assert.equal(timeToStepIndex(t), 179)
+	assert.equal(stepIndexFromFrame(60), 180)
+})
+
 // --- SpringRuntime lifecycle ---
 
 // stub ops : 呼ばれた順に {fn, args} を calls へ push するだけ (= BB 無しで検証するための口)。
 // throwOnStep = n で n 回目の stepAndApplyOrdered が 1 度だけ throw (= stepError で例外
-// object を指定可能)、 restoreError を渡すと restorePose が常にそれを throw する。
-// evaluatingLog には各 call 発生時点の runtime.isEvaluating が記録される。
-function makeRuntime(calls, { throwOnStep = -1, stepError = null, restoreError = null } = {}) {
+// object を指定可能)、 restoreError / updateError を渡すと restorePose / updateMatrixWorld
+// が常にそれを throw する。 evaluatingLog には各 call 発生時点の runtime.isEvaluating が記録される。
+function makeRuntime(calls, { throwOnStep = -1, stepError = null, restoreError = null, updateError = null } = {}) {
 	let stepCount = 0
 	let throwArmed = true
 	const evaluatingLog = []
@@ -73,7 +108,9 @@ function makeRuntime(calls, { throwOnStep = -1, stepError = null, restoreError =
 		restorePose: record('restorePose', () => {
 			if (restoreError) throw restoreError
 		}),
-		updateMatrixWorld: record('updateMatrixWorld', () => {}),
+		updateMatrixWorld: record('updateMatrixWorld', () => {
+			if (updateError) throw updateError
+		}),
 		resetAllToRest: record('resetAllToRest', () => {}),
 		stepAndApplyOrdered: record('stepAndApplyOrdered', () => {
 			stepCount++
@@ -311,4 +348,83 @@ test('SpringRuntime: isEvaluating は評価中のみ true (= 例外終了後も 
 	failing.runtime.beginAnimation(failing.context, failing.basePose)
 	assert.throws(() => failing.runtime.evaluateSample(0.05))
 	assert.equal(failing.runtime.isEvaluating, false)
+})
+
+test('SpringRuntime: updateMatrixWorld が throw しても例外経路が完走する', () => {
+	const updateErr = new Error('update failed')
+	const calls = []
+	const { runtime, context, basePose } = makeRuntime(calls, { updateError: updateErr })
+	runtime.beginAnimation(context, basePose)
+	calls.length = 0
+
+	// 正常系で updateMatrixWorld だけが throw → その例外がそのまま伝播する
+	assert.throws(() => runtime.evaluateSample(0.05), (e) => e === updateErr)
+	const names = fnNames(calls)
+	assert.ok(names.includes('restorePose'))
+	assert.ok(names.includes('updateMatrixWorld'))
+	assert.ok(!names.includes('applyOnlyOrdered'))
+	assert.equal(runtime.currentStepIndex, null)
+	assert.equal(runtime.isEvaluating, false)
+})
+
+test('SpringRuntime: sub-step と updateMatrixWorld が両方 throw → sub-step 由来が伝播', () => {
+	const stepErr = new Error('step failed')
+	const updateErr = new Error('update failed')
+	const calls = []
+	const { runtime, context, basePose } = makeRuntime(calls, {
+		throwOnStep: 1,
+		stepError: stepErr,
+		updateError: updateErr,
+	})
+	runtime.beginAnimation(context, basePose)
+	calls.length = 0
+
+	// 優先順位 sub-step > restorePose > updateMatrixWorld。 identity で判定する
+	assert.throws(() => runtime.evaluateSample(0.05), (e) => e === stepErr)
+	const names = fnNames(calls)
+	assert.ok(names.includes('restorePose'))
+	assert.ok(names.includes('updateMatrixWorld'))
+	assert.ok(!names.includes('applyOnlyOrdered'))
+	assert.equal(runtime.currentStepIndex, null)
+})
+
+test('SpringRuntime: session は beginAnimation ごとに独立 (= 張り直しで step cache が戻る)', () => {
+	// index.ts の ensurePreviewSession は BB 依存で node:test から触れないため、
+	// runtime 側の契約 (= beginAnimation が前 session を破棄する) で代替検証する。
+	const calls = []
+	const { runtime, context, basePose } = makeRuntime(calls)
+	runtime.beginAnimation(context, basePose)
+	runtime.evaluateSample(0.05)
+	calls.length = 0
+
+	// 同じ context で続けると step cache が維持される (= advance 経路)
+	const advance = runtime.evaluateSample(0.10)
+	assert.equal(advance.mode, 'advance')
+	assert.equal(runtime.currentStepIndex, 6)
+
+	// 別 context で beginAnimation し直すと step cache は null に戻る (= 次が replay)
+	const contextB = { animation: { name: 'B' } }
+	runtime.beginAnimation(contextB, basePose)
+	assert.equal(runtime.currentStepIndex, null)
+	calls.length = 0
+	const replay = runtime.evaluateSample(0.10)
+	assert.equal(replay.mode, 'replay')
+	assert.equal(runtime.currentStepIndex, 6)
+	// 新しい context が ops / evaluator へ届いている
+	for (const c of calls.filter((c) => ['resetAllToRest', 'stepAndApplyOrdered', 'applyOnlyOrdered'].includes(c.fn))) {
+		assert.ok(c.args[c.args.length - 1] === contextB, `${c.fn}`)
+	}
+})
+
+test('SpringRuntime: applyWithoutAdvance は applyOnlyOrdered を 1 回だけ呼ぶ', () => {
+	const calls = []
+	const { runtime, context, basePose } = makeRuntime(calls)
+	runtime.beginAnimation(context, basePose)
+	runtime.evaluateSample(0.05)
+	calls.length = 0
+
+	runtime.applyWithoutAdvance()
+	assert.deepEqual(fnNames(calls), ['applyOnlyOrdered'])
+	// step / base pose は呼ばれず、 step cache も変化しない
+	assert.equal(runtime.currentStepIndex, 3)
 })

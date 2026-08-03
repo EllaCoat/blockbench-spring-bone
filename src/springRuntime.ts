@@ -7,12 +7,23 @@ export const FIXED_DT_SECONDS = 1 / STEPS_PER_SECOND
 // (= これ以上の前進は cache 経路が重くなる + scrub の大ジャンプ判定)。
 export const FAST_FORWARD_STEP_THRESHOLD = 30
 
+// export の frame 格子 (= 20 fps) と物理 sub-step (= 60 Hz) の比。 整数比なので
+// 1 export frame = 3 sub-step に厳密対応する。
+export const EXPORT_FRAMES_PER_SECOND = 20
+export const SUBSTEPS_PER_EXPORT_FRAME = STEPS_PER_SECOND / EXPORT_FRAMES_PER_SECOND  // = 3
+
 // 秒 → step 番号。 非 finite 値 (= NaN / Infinity) は RangeError、 0 以下は 0 へ clamp。
 // 1/60 格子上の時刻は浮動小数誤差で最近傍整数から数 ULP ズレることがある
 // (= 2.05 * 60 = 122.99999999999999) ため、 ULP 許容幅内なら最近傍整数、 それ以外は
 // floor を返す。 固定 epsilon (= Math.floor(scaled + 1e-6) 等) は使わない : 格子の
 // わずかに手前の時刻 (= k/60 - 1e-10) を 1 step 先へ切り上げてしまう実測あり
 // (= 3600 ケース全件誤判定。 ULP 判定は 0 件)。
+// 注意 : 累積加算で作られた時刻 (= t += 0.05 の繰り返し等) は 1/60 格子上の点にならない
+// (= 60 回で 2.9999999999999973 → 179 と評価)。 これは tolerance を広げても根治しない
+// (= 倍率 4〜64 の 20000 回累積で破れ件数が単調に減らない実測)。 export のように厳密な
+// frame 対応が必要な経路ではこの関数を通さず stepIndexFromFrame を使うこと。
+// 戻り値が safe integer を外れる大きさ (= 秒数が巨大で scaled が overflow) の場合も
+// RangeError を throw する (= evaluateSample の sub-step ループが終了しなくなるのを防ぐ)。
 export function timeToStepIndex(timeSeconds: number): number {
 	if (!Number.isFinite(timeSeconds)) {
 		throw new RangeError(`timeToStepIndex: non-finite time ${timeSeconds}`)
@@ -22,12 +33,26 @@ export function timeToStepIndex(timeSeconds: number): number {
 	const nearest = Math.round(scaled)
 	// scale 不変にするため絶対項と相対項の max を取る
 	const tol = Math.max(Number.EPSILON * 4, Math.abs(scaled) * Number.EPSILON * 4)
-	return Math.abs(scaled - nearest) <= tol ? nearest : Math.floor(scaled)
+	const result = Math.abs(scaled - nearest) <= tol ? nearest : Math.floor(scaled)
+	if (!Number.isSafeInteger(result)) {
+		throw new RangeError(`timeToStepIndex: ${timeSeconds}s is out of safe integer step range`)
+	}
+	return result
 }
 
 // step 番号 → 秒。 applyPoseAt 等へ渡す時刻は必ずこの関数経由にする。
 export function stepIndexToTime(stepIndex: number): number {
 	return stepIndex / STEPS_PER_SECOND
+}
+
+// export frame 番号 → step 番号。 浮動小数の秒を経由しないため、 累積誤差が原理的に
+// 発生しない。 export driver (= Phase γ) はこちらを使い、 timeToStepIndex は通さない。
+export function stepIndexFromFrame(frameIndex: number): number {
+	if (!Number.isInteger(frameIndex)) {
+		throw new RangeError(`stepIndexFromFrame: frameIndex must be an integer, got ${frameIndex}`)
+	}
+	if (frameIndex <= 0) return 0
+	return frameIndex * SUBSTEPS_PER_EXPORT_FRAME
 }
 
 // per-animation 解決の口。 今は animation 参照のみ (= 値の解決は呼び出し側の
@@ -70,8 +95,9 @@ export interface EvaluationResult {
 //   各 sub-step で basePose + stepAndApplyOrdered → restorePose → updateMatrixWorld →
 //   applyOnlyOrdered の順を保証する。 例外時は restorePose / updateMatrixWorld を通した後
 //   step cache を null にして再 throw (= 次回が必ず 0 replay になる)。 例外時は
-//   applyOnlyOrdered を呼ばない。 sub-step と restorePose が両方 throw した場合は
-//   sub-step 由来の例外を伝播させる (= 原因に近い方。 restore 失敗は警告に落とす)
+//   applyOnlyOrdered を呼ばない。 例外が複数段で発生した場合は最も原因に近いものを
+//   伝播させる (= 優先順位 sub-step > restorePose > updateMatrixWorld、 後段の失敗は
+//   警告に落とす)
 // - applyWithoutAdvance = state を進めずに描画だけ更新する (= ops.applyOnlyOrdered)。
 //   session 未開始 / 初回評価前の呼び出しは契約違反として Error を throw する
 // - endAnimation = context / evaluator / step cache を破棄。 scene pose は変更しない
@@ -159,8 +185,19 @@ export class SpringRuntime<C extends AnimationContext, P> {
 						console.warn('[spring_bone] restorePose failed while another error was pending', restoreError)
 					}
 				} finally {
-					// restore が失敗しても matrix 更新は必ず通す
-					this.ops.updateMatrixWorld()
+					// restore が失敗しても matrix 更新は必ず通す。 matrix 更新の失敗も
+					// 同じく pendingError 経路に乗せる (= finally からの throw で元例外を
+					// 上書きしない)。 優先順位は sub-step > restorePose > updateMatrixWorld。
+					try {
+						this.ops.updateMatrixWorld()
+					} catch (updateError) {
+						if (!hasPendingError) {
+							pendingError = updateError
+							hasPendingError = true
+						} else {
+							console.warn('[spring_bone] updateMatrixWorld failed while another error was pending', updateError)
+						}
+					}
 				}
 			}
 			if (hasPendingError) {
