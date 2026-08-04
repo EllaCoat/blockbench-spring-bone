@@ -247,6 +247,27 @@ function registerProperties(): void {
 	patchMerge(stiffness_prop, 'spring_stiffness')
 	patchMerge(gravity_prop, 'spring_gravity')
 	patchMerge(enabled_prop, SPRING_ENABLED_KEY, SPRING_ENABLED_VALUES)
+
+	// **登録前から存在する Group instance への backfill** : Property は新規 instance の
+	// constructor で Property.reset 経由の default (= 'unset') が入るが、 登録より前から
+	// 生きている instance (= plugin を後から有効化した場合の既存 Group) には値が無いまま。
+	// enum Property の condition を外したため Property.copy は無条件に値を書く一方、
+	// merge 側 (= patchMerge) は undefined を skip する。 値が undefined のままだと Undo の
+	// before-copy に undefined が入り、 非 prefix Group の初回「Spring 化」を Undo しても
+	// 'enabled' のまま 'unset' に戻らない。 ここで 'unset' を補完して両経路を揃える。
+	// Group.all が取れない (= Project 未オープン) 場合は何もしない。
+	try {
+		const all = (Group as { all?: unknown[] })?.all
+		if (Array.isArray(all)) {
+			for (const g of all) {
+				if ((g as { spring_bone_enabled?: unknown } | null)?.spring_bone_enabled === undefined) {
+					;(g as Record<string, unknown>).spring_bone_enabled = 'unset'
+				}
+			}
+		}
+	} catch (e) {
+		console.warn(`[${PLUGIN_ID}] spring_bone_enabled backfill failed`, e)
+	}
 }
 
 // plugin onunload で Property を Group.properties から delete。 unload → reload で
@@ -604,8 +625,9 @@ function scanOutlinerMarkers(): void {
 		}
 	}
 	// li.outliner_node を走査し、 id (= uuid) が集合に含まれる行の内側 .outliner_object に
-	// class を toggle。 集合に無い行 (= cube 等の非 group node や解除済み行) は剥がす側に
-	// 回るため、 stale マーカーの掃除も同じ走査で済む。
+	// class を toggle。 集合に無い行 (= cube 等の非 group node や 'unset' の行) は剥がす側に
+	// 回るため、 stale マーカーの掃除も同じ走査で済む。 解除済み (= 'disabled') の行は
+	// capable 集合に含まれるため、 marker は維持される。
 	const nodes = document.querySelectorAll('li.outliner_node')
 	for (let i = 0; i < nodes.length; i++) {
 		const li = nodes[i] as HTMLElement
@@ -652,12 +674,17 @@ function registerOutlinerMarker(): () => void {
 	// attributeFilter は使わない (= Vue の v-model は attribute 経由でなく property 経由で
 	// 書くため、 attribute 監視では拾えず、 childList / subtree だけで十分)。
 	const outlinerRoot = document.getElementById('cubes_list') ?? document.body
-	let scanScheduled = false
+	// rAF の ID を保持する (= cleanup で cancel するため)。 boolean の coalesce flag だけだと
+	// plugin unload 後にコールバックが走り、 剥がしたはずのマーカーを DOM に再付与し得る。
+	// disposed guard は cancel 済みでも残りうるケース (= cancel 後の同一 frame 再予約等) の
+	// 保険。
+	let scanRafId: number | null = null
+	let scanDisposed = false
 	const scheduleScan = (): void => {
-		if (scanScheduled) return
-		scanScheduled = true
-		requestAnimationFrame(() => {
-			scanScheduled = false
+		if (scanRafId !== null) return
+		scanRafId = requestAnimationFrame(() => {
+			scanRafId = null
+			if (scanDisposed) return
 			try {
 				scanOutlinerMarkers()
 			} catch (e) {
@@ -684,6 +711,11 @@ function registerOutlinerMarker(): () => void {
 	scheduleScan()
 
 	return (): void => {
+		scanDisposed = true
+		if (scanRafId !== null) {
+			cancelAnimationFrame(scanRafId)
+			scanRafId = null
+		}
 		mo.disconnect()
 		Blockbench.removeListener?.('update_selection', scheduleScan)
 		Blockbench.removeListener?.('undo', scheduleScan)
@@ -732,6 +764,19 @@ let topoOrder: string[] = []
 // クリック保持は「構造不変 = fingerprint 不変」 のため session に影響なし。
 let lastGraphFingerprint = ''
 let inhibitTick = false   // applyPoseAt 由来の再描画で tick が再入するのを防ぐ
+// project 切替 (= select_project / load_project) 受信から rAF コールバックでの rescan 完了
+// までの間だけ立つ flag。 遅延中は旧 project の registry / session が生きたまま残るため、
+// parse 完了後に同期的に走る Animation.select() → Animator.preview() が旧 entry を評価
+// してしまう。 handler が同期的に立て + session 破棄し、 tick() が冒頭で見て止める
+// (= registry.clear() でも止められるが、 rescan が結局作り直すため flag で止める方を採る)。
+let projectSwitchPending = false
+// onProjectSwitch が予約した rAF の ID。 cleanup (= plugin unload) で cancel するため保持
+// する。 保持しないと unload 後にコールバックが走り、 cleanup 済みの registry の再充填や
+// 旧 prefix 移行、 Project.saved = false まで起こり得る。
+let projectRescanRafId: number | null = null
+// installTickLoop の cleanup 済みかの guard。 cancel 漏れ / 再予約された rAF コールバックが
+// cleanup 後に走っても何もしないようにする。
+let tickLoopDisposed = false
 
 function isSpringGroup(group: unknown): boolean {
 	// registry 加入条件 = **capable (= 'enabled' | 'disabled')** 基準。 解除済み
@@ -748,6 +793,18 @@ function isSpringGroup(group: unknown): boolean {
 // (= BB core の keyframe pose がそのまま描画される)。
 function isSpringActive(entry: BoneEntry): boolean {
 	return getSpringBoneState(entry.group) === 'enabled'
+}
+
+// active (= 実際に物理を掛ける 'enabled') な entry が 1 つでもあるか。 tick() の
+// early-return 判定用。 registry.size は capable (= 'enabled' + 'disabled') の件数なので、
+// 全 entry が 'disabled' だと size > 0 のまま runtime が pose 全体を capture し、
+// replay / advance のたびに Animator.stackAnimations を反復する無駄が出る。 毎 tick
+// registry を全走査するが、 entry 数は高々数十なので許容コストと判断する。
+function hasActiveSpringEntry(): boolean {
+	for (const entry of registry.values()) {
+		if (isSpringActive(entry)) return true
+	}
+	return false
 }
 
 // outliner 上を上に辿って最寄りの spring 祖先を返す。 中間に非 spring group を
@@ -1430,8 +1487,10 @@ function invalidatePreviewSession(): void {
 }
 
 function tick(): void {
-	if (inhibitTick || runtime.isEvaluating) return
-	if (registry.size === 0 || !Modes?.animate) {
+	if (inhibitTick || projectSwitchPending || runtime.isEvaluating) return
+	// active な entry が 1 つも無い (= registry 空 or 全 entry 'disabled') 場合は session を
+	// 畳んで終わる (= hasActiveSpringEntry 参照)。
+	if (!hasActiveSpringEntry() || !Modes?.animate) {
 		invalidatePreviewSession()
 		return
 	}
@@ -1446,6 +1505,8 @@ function installTickLoop(): () => void {
 	rescanRegistry()
 	invalidatePreviewSession()
 	inhibitTick = false
+	projectSwitchPending = false
+	tickLoopDisposed = false
 
 	// animation pose 由来の cache invalidation は BB event / Undo transaction を境界にする案 A を採用。
 	// 案 B (= keyframe 全値を fingerprint 化) は display frame ごとの走査と BB 内部構造への依存が増え、
@@ -1532,14 +1593,38 @@ function installTickLoop(): () => void {
 	// の両 event に同じ handler を登録して二重化する。 rescan は idempotent で重複しても
 	// 無害だが、 同一 frame での多重実行は無駄なので outliner marker 側の scheduleScan と
 	// 同じ「rAF 1 回にまとめる」 パターンで coalesce する。
-	let projectRescanScheduled = false
+	// **pending flag は event 受信のその場で同期的に立てる** : rAF までの間は旧 project の
+	// registry / session が有効なまま残り、 parse 完了後・コールバック実行前に同期的に走る
+	// Animation.select() → Animator.preview() が旧 entry を評価してしまう。 tick() が冒頭で
+	// flag を見て即 return するため、 遅延中の評価は遮断される (= module スコープ側の
+	// projectSwitchPending コメント参照)。
 	const onProjectSwitch = (): void => {
-		if (projectRescanScheduled) return
-		projectRescanScheduled = true
-		requestAnimationFrame(() => {
-			projectRescanScheduled = false
-			rescanRegistry()
-			invalidatePreviewSession()
+		projectSwitchPending = true
+		invalidatePreviewSession()
+		if (projectRescanRafId !== null) return
+		projectRescanRafId = requestAnimationFrame(() => {
+			projectRescanRafId = null
+			if (tickLoopDisposed) return
+			try {
+				rescanRegistry()
+				invalidatePreviewSession()
+			} catch (e) {
+				console.warn(`[${PLUGIN_ID}] project rescan failed`, e)
+			}
+			projectSwitchPending = false
+			// rescan 完了をその場で preview に反映する。 paused 中は display_animation_frame が
+			// 自然発火しないため、 明示 preview 無しだと parse 中に先行した preview (= 空 or 旧
+			// registry で評価済み) のまま、 次のユーザー操作まで新 project の spring physics が
+			// 表示されない。 **animate モード限定** にする理由は onSpringPropertyChange と同じ
+			// (= edit モードで呼ぶと Animator.preview 内の stackAnimations が playing=true の
+			// Animation を edit viewport に適用して pose 破壊)。
+			if (Modes?.animate) {
+				try {
+					Animator?.preview?.()
+				} catch (e) {
+					console.warn(`[${PLUGIN_ID}] Animator.preview failed after project switch`, e)
+				}
+			}
 		})
 	}
 	const onUpdateSelection = (): void => {
@@ -1589,6 +1674,14 @@ function installTickLoop(): () => void {
 	Blockbench.on('select_animation', onSelectAnimation)
 
 	return (): void => {
+		// 予約済み rAF の cancel + disposed guard (= unload 後にコールバックが走って
+		// cleanup 済みの registry を再充填するのを防ぐ)。 flag 類も元に戻す。
+		tickLoopDisposed = true
+		if (projectRescanRafId !== null) {
+			cancelAnimationFrame(projectRescanRafId)
+			projectRescanRafId = null
+		}
+		projectSwitchPending = false
 		Blockbench.removeListener?.('display_animation_frame', onAnimFrame)
 		Blockbench.removeListener?.('select_project', onProjectSwitch)
 		Blockbench.removeListener?.('load_project', onProjectSwitch)
@@ -1623,7 +1716,8 @@ Plugin.register(PLUGIN_ID, {
 		cleanups.push(installTickLoop())
 		// animate モード用の専用 Panel を register (= edit モードは element_panel input に任せる)。
 		// 値変更時は onSpringPropertyChange 経由で registry sync + fingerprint invalidate される。
-		// spring 化判定の述語 (= isSpringGroup) はこちらから注入し、 判定元を本 module に一元化する。
+		// spring 化判定の述語 (= isSpringGroup、 Property ベースの **capable** 判定) は
+		// こちらから注入し、 判定元を本 module に一元化する。
 		cleanups.push(registerSpringPanel(onSpringPropertyChange, isSpringGroup))
 		// Group 右クリ context menu に「Spring 化 / 解除」 の Property toggle action を追加。
 		// gesture (= 唯一の truth) は Group Property `spring_bone_enabled` の書き換えで、

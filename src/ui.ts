@@ -20,7 +20,10 @@ declare const Undo: any
 // spring 化判定の述語型。 判定の truth は index.ts 側の Group Property
 // (= `spring_bone_enabled`) に一元化されており、 本 module は name prefix を一切見ない
 // (= 以前の BONE_NAME_PREFIX 重複定義は廃止、 registerSpringPanel の引数で注入される)。
-type IsSpringActiveGroup = (group: unknown) => boolean
+// **capable (= 'enabled' | 'disabled') 判定の述語** であり、 実際に物理を掛けるかの
+// 'enabled' 判定 (= index.ts の isSpringActive) とは別物 (= 命名で混同しないよう
+// capable 系に揃える)。
+type IsSpringCapableGroup = (group: unknown) => boolean
 
 // Property 3 パラの UI メタ情報 (= registerProperties と 1:1 対応、 range / step も同値)。
 const PANEL_INPUTS = [
@@ -34,14 +37,14 @@ const PANEL_INPUTS = [
 let spring_panel: any = null
 let selection_listener: ((...args: unknown[]) => void) | null = null
 
-function isSpringSelectionActive(isSpringActiveGroup: IsSpringActiveGroup): boolean {
-	return isSpringActiveGroup(Group.first_selected)
+function isSpringSelectionCapable(isSpringCapableGroup: IsSpringCapableGroup): boolean {
+	return isSpringCapableGroup(Group.first_selected)
 }
 
 // 選択中 group の Property 値を form にプッシュ (= 選択切替時の値同期)。
 // group が spring bone でない場合は何もしない (= Panel は display_condition で自動非表示)。
-function pushValuesFromSelectedGroup(form: any, isSpringActiveGroup: IsSpringActiveGroup): void {
-	if (!isSpringSelectionActive(isSpringActiveGroup)) return
+function pushValuesFromSelectedGroup(form: any, isSpringCapableGroup: IsSpringCapableGroup): void {
+	if (!isSpringSelectionCapable(isSpringCapableGroup)) return
 	const g = Group.first_selected
 	const values: Record<string, number> = {}
 	for (const meta of PANEL_INPUTS) {
@@ -58,8 +61,8 @@ function pushValuesFromSelectedGroup(form: any, isSpringActiveGroup: IsSpringAct
 
 // Panel + form + selection listener を register して cleanup 関数を返す。
 // onChange = index.ts の onSpringPropertyChange (= registry sync + invalidatePreviewSession() による session 破棄)。
-// isSpringActiveGroup = index.ts の isSpringGroup (= Property ベースの capable 判定) を注入。
-export function registerSpringPanel(onChange: () => void, isSpringActiveGroup: IsSpringActiveGroup): () => void {
+// isSpringCapableGroup = index.ts の isSpringGroup (= Property ベースの capable 判定) を注入。
+export function registerSpringPanel(onChange: () => void, isSpringCapableGroup: IsSpringCapableGroup): () => void {
 	if (typeof Panel !== 'function' || typeof InputForm !== 'function') {
 		console.warn('[spring_bone] Panel or InputForm not available, skipping panel registration')
 		return () => {}
@@ -74,7 +77,7 @@ export function registerSpringPanel(onChange: () => void, isSpringActiveGroup: I
 		condition: { modes: ['animate'] },
 		// display_condition = spring bone (= capable) group が単独選択されているときのみ Panel 内容表示。
 		// 非選択時は Panel が collapse or 非表示になる (= BB core 側の挙動)。
-		display_condition: () => isSpringSelectionActive(isSpringActiveGroup),
+		display_condition: () => isSpringSelectionCapable(isSpringCapableGroup),
 		default_position: {
 			slot: 'right_bar',
 			float_position: [0, 0],
@@ -124,7 +127,7 @@ export function registerSpringPanel(onChange: () => void, isSpringActiveGroup: I
 		const slider = element?.slider
 		if (slider) {
 			slider.onBefore = () => {
-				if (!isSpringSelectionActive(isSpringActiveGroup)) return
+				if (!isSpringSelectionCapable(isSpringCapableGroup)) return
 				try {
 					Undo?.initEdit?.({ groups: [Group.first_selected] })
 					edit_started = true
@@ -149,7 +152,7 @@ export function registerSpringPanel(onChange: () => void, isSpringActiveGroup: I
 	// Undo wrap は onBefore/onAfter に寄せた (= per-gesture 集約) ため、 ここでは書き込みと
 	// registry sync だけ担う (= per-move-event で発火するが Undo entry は積まれない)。
 	form.on('input', ({ result, changed_keys }: { result: Record<string, number>; changed_keys: string[] }) => {
-		if (!isSpringSelectionActive(isSpringActiveGroup)) return
+		if (!isSpringSelectionCapable(isSpringCapableGroup)) return
 		const g = Group.first_selected
 		try {
 			// changed_keys は PANEL_INPUTS の key (= drag / stiffness / gravity) から来るので
@@ -175,11 +178,11 @@ export function registerSpringPanel(onChange: () => void, isSpringActiveGroup: I
 	})
 
 	// selection tracker : 選択 group 変わったら form 値を再同期。
-	selection_listener = () => pushValuesFromSelectedGroup(form, isSpringActiveGroup)
+	selection_listener = () => pushValuesFromSelectedGroup(form, isSpringCapableGroup)
 	Blockbench.on('update_selection', selection_listener)
 
 	// 初回値同期 (= plugin load 時に既に spring group を選択済ケース)。
-	pushValuesFromSelectedGroup(form, isSpringActiveGroup)
+	pushValuesFromSelectedGroup(form, isSpringCapableGroup)
 
 	return () => {
 		try {
