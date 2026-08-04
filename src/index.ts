@@ -84,7 +84,9 @@ function readSpringProp(group: unknown, key: SpringPropertyKey, fallback: number
 // (= Property 変更 hook) の 3 経路で共通。 戻り値に restLength / restLocalDir は
 // **含めない** : これらは子 group の origin から算出される rig geometry 由来の値で
 // Property 解決の対象外であり、 含めると geometry 算出値を DEFAULT へ戻す事故になる。
-// 呼び出し側は `Object.assign(entry.config, resolveConfig(entry, null))` で適用する。
+// 呼び出し側は `Object.assign(entry.base, resolveConfig(entry, null))` で base
+// (= Group 既定値) に適用する。 effective (= entry.config) への合成は
+// previewOps.resolveConfigs だけが行う (= effective の writer を 1 箇所に固定)。
 // _animationContext は将来の per-animation 解決用の口 (= 今は読まない)。
 function resolveConfig(
 	entry: BoneEntry,
@@ -98,14 +100,15 @@ function resolveConfig(
 }
 
 // Property 変更時の同期 hook。 element_panel input の onChange から呼ばれる。
-// - 全 registered spring group の Property 値を entry.config に反映
+// - 全 registered spring group の Property 値を entry.base (= Group 既定値) に反映
+//   (= effective への合成は次 tick の beginAnimation → resolveConfigs が行う)
 // - fingerprint invalidate (= 次 tick で 0 replay 経路が走り、 preview 即反映)
 // - `Animator.preview()` 明示呼び : playback 停止中は display_animation_frame が
 //   自然発火しないため、 fingerprint invalidate だけでは scrub まで値が反映されない。
 //   `Animator.preview()` を明示的に呼ぶことで停止中の即時反映を確保する (= 受け入れ条件 (c))。
 function onSpringPropertyChange(): void {
 	for (const entry of registry.values()) {
-		Object.assign(entry.config, resolveConfig(entry, null))
+		Object.assign(entry.base, resolveConfig(entry, null))
 	}
 	// fingerprint を空文字にすることで rescanRegistry 経由の invalidate を必ずトリガする
 	// (= 次 tick の rescanRegistry で fp !== lastGraphFingerprint 判定が真になる)。
@@ -649,9 +652,16 @@ function registerOutlinerMarker(): () => void {
 
 interface BoneEntry {
 	group: any
+	// base = Group Property 由来の既定値 (= 入力側)。 registerGroup / rescanRegistry /
+	// onSpringPropertyChange の 3 経路だけが書き、 effective には直接触れない。
+	base: { drag: number; stiffness: number; gravity: number }
+	// geometry = rig 幾何由来 (= 子 group の origin から算出)。 registerGroup /
+	// rescanRegistry が書く。 restLength / restLocalDir は同じ算出元なので 1 箇所にまとめる。
+	geometry: { restLength: number; restLocalDir: any }
+	// config = effective (解決済み = 出力側)。 previewOps.resolveConfigs だけが書く。
+	// springSim.step がそのまま読めるよう SpringConfig の形は維持する。
 	config: SpringConfig
 	state: SpringState
-	restLocalDir: any
 	// chain 情報。 parentUuid = 直上の spring group の uuid (= root なら null)、
 	// depth = chain root からの距離 (= root なら 0、 rebuildTopoOrder で再計算)。
 	parentUuid: string | null
@@ -746,7 +756,7 @@ function registerGroup(group: any): void {
 	// (= project 再オープン / delete → undo で新 Group instance 生成、 BB undo.js:509) が発生する。
 	// outliner_node の get mesh() は uuid 解決なので stale でも物理は動くが、 readSpringProp /
 	// element_panel / Panel からの書き込みは旧 instance を read/write するため、 UI 変更が
-	// entry.config に永遠に届かない (= 実機で観察された「値変更が preview に反映されない」
+	// entry.base (= Group 既定値) に永遠に届かない (= 実機で観察された「値変更が preview に反映されない」
 	// 症状 primary root cause)。 参照だけ張り替えれば両者が繋がる、 state (= 慣性など) は保持。
 	const existing = registry.get(group.uuid)
 	if (existing) {
@@ -772,11 +782,17 @@ function registerGroup(group: any): void {
 		}
 	}
 	// entry を先に組み立ててから Property 由来の物理パラ (= drag / stiffness / gravity) を
-	// resolveConfig で適用する。 残りの restLength は子 group の origin から算出した
+	// resolveConfig で base に適用する。 残りの restLength は子 group の origin から算出した
 	// rig geometry 由来の値で、 resolveConfig の対象外 (= DEFAULT へ戻さない)。
 	// registerGroup は idempotent スキップで state を保持するため、 このパスは新規 register 時のみ通る。
 	const entry: BoneEntry = {
 		group,
+		base: {
+			drag: DEFAULT_CONFIG.drag,
+			stiffness: DEFAULT_CONFIG.stiffness,
+			gravity: DEFAULT_CONFIG.gravity,
+		},
+		geometry: { restLength, restLocalDir },
 		config: {
 			drag: DEFAULT_CONFIG.drag,
 			stiffness: DEFAULT_CONFIG.stiffness,
@@ -784,11 +800,14 @@ function registerGroup(group: any): void {
 			restLength,
 		},
 		state: createState(),
-		restLocalDir,
 		parentUuid: getSpringParentUuid(group),
 		depth: 0, // rebuildTopoOrder で再計算される
 	}
-	Object.assign(entry.config, resolveConfig(entry, null))
+	// base を Group Property 由来の値で確定させ、 effective (= config) も base + geometry の
+	// 合成値で初期化する (= 最初の resolveConfigs が走る前に読まれても安全な値にする)。
+	// 以降の effective 更新は previewOps.resolveConfigs だけが行う。
+	Object.assign(entry.base, resolveConfig(entry, null))
+	Object.assign(entry.config, entry.base)
 	registry.set(group.uuid, entry)
 }
 
@@ -856,9 +875,12 @@ function computeGraphFingerprint(): string {
 	return uuids
 		.map((u) => {
 			const e = registry.get(u)!
-			const d = e.restLocalDir
-			const c = e.config
-			return `${u}:${e.parentUuid ?? '-'}:${c.restLength.toFixed(4)}:${d.x.toFixed(3)},${d.y.toFixed(3)},${d.z.toFixed(3)}:${c.drag.toFixed(3)},${c.stiffness.toFixed(3)},${c.gravity.toFixed(3)}`
+			// 入力側 (= base + geometry) から読む。 effective (= config) 読みだと
+			// rescan の fingerprint 計算と resolveConfigs の effective 書き込みが
+			// 互いを打ち消し合い、 毎 tick の無駄な invalidate か stale 固着のどちらかを招く。
+			const d = e.geometry.restLocalDir
+			const b = e.base
+			return `${u}:${e.parentUuid ?? '-'}:${e.geometry.restLength.toFixed(4)}:${d.x.toFixed(3)},${d.y.toFixed(3)},${d.z.toFixed(3)}:${b.drag.toFixed(3)},${b.stiffness.toFixed(3)},${b.gravity.toFixed(3)}`
 		})
 		.join('|')
 }
@@ -891,21 +913,24 @@ function rescanRegistry(): void {
 
 	// 既存 entry の chain link + rest 系 + Property 由来の物理パラを最新の rig 状態から refresh。
 	// registerGroup は idempotent スキップで state (= 慣性など) を保持するが、
-	// 構造情報 (= parentUuid / restLocalDir / restLength) は「rig 編集の瞬間」 の
+	// 構造情報 (= parentUuid / geometry) は「rig 編集の瞬間」 の
 	// 最新値を反映する。 rest 系の反映は length constraint が新値に合わせて hard snap
 	// するため若干のジャンプが出るが、 構造整合を優先する。
 	// Property 値 (= drag / stiffness / gravity) も同時に読み直す。 これで
 	// blueprint reload / Undo / 別チャネル (= 例 : 将来の専用 Panel) からの変更が
 	// tick 経路で自然に取り込まれる。
+	// 書き込み先は base / geometry のみ。 effective (= entry.config) はここでは触らず、
+	// 次 tick の beginAnimation → resolveConfigs に委ねる (= effective の writer を
+	// 1 箇所に固定し、 rescan が解決済み値を Group 既定値で上書きする経路を構造的に塞ぐ)。
 	for (const entry of registry.values()) {
 		entry.parentUuid = getSpringParentUuid(entry.group)
-		Object.assign(entry.config, resolveConfig(entry, null))
+		Object.assign(entry.base, resolveConfig(entry, null))
 		const child = findChildGroup(entry.group)
 		if (child) {
 			const d = originDelta(entry.group, child)
 			if (d.dir && d.length > 0) {
-				entry.restLocalDir = d.dir
-				entry.config.restLength = d.length
+				entry.geometry.restLocalDir = d.dir
+				entry.geometry.restLength = d.length
 			}
 		}
 	}
@@ -1064,7 +1089,7 @@ function getAnchorWorld(entry: BoneEntry, out: any): boolean {
 
 // Sol advice の Δ 加算合成 helper (= 「rest 直代入」 の keyframe 上書きを排除)。
 // 記号 :
-//   r          = entry.restLocalDir (parent-local frame の rest bone 軸単位ベクトル)
+//   r          = entry.geometry.restLocalDir (parent-local frame の rest bone 軸単位ベクトル)
 //   q_base     = 現時点の mesh.quaternion (= keyframe pose、 sub-step では applyPoseAt が当てた
 //                「時刻 t の keyframe pose」、 同時刻パスでは BB core が当てた「現時刻 pose」)
 //   q_parentW  = mesh.parent の world quaternion
@@ -1106,7 +1131,7 @@ function composeSpringPose(
 	if (stepSim) {
 		// boneAxisWorld = q_parentW × restLocalDir (own-rotation 独立化、 自身の keyframe rotation を
 		// solver 目標から排除。 親の rotation は q_parentW 経由で反映される)。
-		scratch.boneAxisWorld.copy(entry.restLocalDir).applyQuaternion(scratch.parentQuat)
+		scratch.boneAxisWorld.copy(entry.geometry.restLocalDir).applyQuaternion(scratch.parentQuat)
 		step(entry.state, scratch.anchorWorld, scratch.boneAxisWorld, entry.config, dt)
 	}
 
@@ -1118,7 +1143,7 @@ function composeSpringPose(
 	scratch.forward.normalize()
 
 	// d_animP = restLocalDir (parent-local frame の rest bone 軸、 own-rotation 独立化で qBase 削除)
-	scratch.dAnimP.copy(entry.restLocalDir).normalize()
+	scratch.dAnimP.copy(entry.geometry.restLocalDir).normalize()
 
 	// d_simP = inv(q_parentW) × d_simW (world → parent-local)
 	scratch.parentInv.copy(scratch.parentQuat).invert()
@@ -1208,7 +1233,10 @@ function resetAllToRest(): void {
 		if (!mesh || !meshParent) continue
 		if (!getAnchorWorld(entry, anchorWorld)) continue
 		meshParent.getWorldQuaternion(parentQuat)
-		boneAxisWorld.copy(entry.restLocalDir).applyQuaternion(parentQuat)
+		boneAxisWorld.copy(entry.geometry.restLocalDir).applyQuaternion(parentQuat)
+		// restLength は effective (= config) から読む。 beginAnimation で resolveConfigs が
+		// 先に走るためここに来る時点では必ず最新の解決済み値 (= 後続の animation 単位
+		// override とも step が読む値と一致する)。
 		restTip.copy(anchorWorld).addScaledVector(boneAxisWorld, entry.config.restLength)
 		resetState(entry.state, restTip)
 	}
@@ -1244,9 +1272,14 @@ function normalizeTimelineTime(t: unknown): number {
 }
 
 const previewOps: SpringRuntimeOps<PreviewAnimationContext, AnimatorPoseSnapshot> = {
-	resolveConfigs: (context) => {
+	resolveConfigs: (_context) => {
 		for (const entry of registry.values()) {
-			Object.assign(entry.config, resolveConfig(entry, context))
+			// effective (= entry.config) の唯一の writer。 base (= Group 既定値) +
+			// geometry (= rig 幾何) の合成で埋める。 現時点では animation context 由来の
+			// override は存在しない (= _context は読まない) ため結果は従来と同一。
+			// 後続 commit で animation 単位の override がここに挟まる。
+			Object.assign(entry.config, entry.base)
+			entry.config.restLength = entry.geometry.restLength
 		}
 	},
 	capturePose: () => captureAnimatorPose(),
@@ -1399,10 +1432,10 @@ function installTickLoop(): () => void {
 		invalidatePreviewSession()
 	}
 	// 症状 1 (Undo できない) の primary fix : undo / redo で group.spring_* 値は元に戻るが、
-	// plugin 側の entry.config は BB event 経由でしか同期されない。 この listener が無いと
-	// 「値は復元されたのに entry.config は旧値のまま」 で「Ctrl+Z が効いていないように見える」
-	// 症状となる。 rescanRegistry で config 再読込 + invalidatePreviewSession() で fingerprint 変化経由の
-	// 次 tick 0 replay を起動する。 keyframe undo は fingerprint を触らないので invalidate は
+	// plugin 側の entry.base (= Group 既定値) は BB event 経由でしか同期されない。 この listener が無いと
+	// 「値は復元されたのに entry.base は旧値のまま」 で「Ctrl+Z が効いていないように見える」
+	// 症状となる。 rescanRegistry で base 再読込 + invalidatePreviewSession() で fingerprint 変化経由の
+	// 次 tick 0 replay を起動する (= effective への反映は replay 冒頭の resolveConfigs が行う)。 keyframe undo は fingerprint を触らないので invalidate は
 	// unconditional 必要 (= Fable IMO-1、 undo-path の厳格さ)。
 	//
 	// updateSelection() は敢えて呼ばない : BB core の loadUndoSave が 'undo'/'redo' event
