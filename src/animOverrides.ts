@@ -27,12 +27,17 @@ function isValidParam(value: unknown): value is number {
 // 未知の key は検証せず保持する : 将来 schema が拡張されたファイルをこの version で
 // 開いて保存し直しても、 新しい項目が失われないようにするため (= 前方互換)。
 // 既知項目が 1 つも残らず未知 key も無い entry は map から除去する。
+// 返却する map と内側の entry は **null-prototype object** (= Object.create(null)) で作る :
+// 任意の JSON 由来の uuid を添字代入するため、 通常の object literal だと `__proto__` を
+// key に持つ入力で返却 map の prototype が書き換わり (= prototype pollution)、 正規化結果の
+// 欠落や継承値の混入が起こり得る。 null-prototype なら `__proto__` は常に own key として
+// 安全に保持される。
 export function normalizeOverrides(raw: unknown): SpringOverrideMap {
-	if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return {}
-	const out: SpringOverrideMap = {}
+	if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return Object.create(null)
+	const out: SpringOverrideMap = Object.create(null)
 	for (const [uuid, entry] of Object.entries(raw)) {
 		if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) continue
-		const cleaned: Record<string, unknown> = {}
+		const cleaned: Record<string, unknown> = Object.create(null)
 		for (const [key, value] of Object.entries(entry)) {
 			if (key === 'enabled') {
 				if (typeof value === 'boolean') cleaned[key] = value
@@ -50,6 +55,10 @@ export function normalizeOverrides(raw: unknown): SpringOverrideMap {
 
 // 項目を 1 つ書き換えた新しい map を返す。 対象 uuid が map に無ければ新規 entry を
 // 作る。 入力の map / entry は変異させない (= 変更対象の entry も必ず新しく作る)。
+// spread による複製は prototype を引き継がず、 `__proto__` も own key として安全に
+// コピーされる (= CreateDataProperty 経由) ため、 normalizeOverrides の null-prototype
+// 出力を入力にしても prototype pollution は起きない。 戻り値は通常の object になる
+// (= null-prototype への統一は normalize 側の責務とし、 ここでは持ち回らない)。
 export function setOverrideField(
 	map: SpringOverrideMap,
 	uuid: string,

@@ -3,11 +3,17 @@ import assert from 'node:assert/strict'
 
 const { normalizeOverrides, setOverrideField, clearOverrideField, overridesFingerprint } = await import('../dist-test/animOverrides.mjs')
 
+// 正規化結果は prototype pollution 耐性のため null-prototype object (= Object.create(null))
+// で返る。 assert/strict の deepEqual は prototype も比較するため、 期待値 (= 通常の object
+// literal) と比較する時は JSON round-trip で plain object に変換してから比較する
+// (= 検証する契約 = key / value の集合そのものは変わらない)。
+const toPlain = (value) => JSON.parse(JSON.stringify(value))
+
 // --- normalizeOverrides ---
 
 test('normalizeOverrides: 非 object 入力は空 map', () => {
 	for (const raw of [null, undefined, 42, 'spring', true, []]) {
-		assert.deepEqual(normalizeOverrides(raw), {}, `raw=${JSON.stringify(raw)}`)
+		assert.deepEqual(toPlain(normalizeOverrides(raw)), {}, `raw=${JSON.stringify(raw)}`)
 	}
 })
 
@@ -16,7 +22,7 @@ test('normalizeOverrides: 無効な項目だけを drop し、 有効な項目�
 	const normalized = normalizeOverrides({
 		bone1: { drag: Number.NaN, stiffness: 2, enabled: 'yes', gravity: Number.POSITIVE_INFINITY },
 	})
-	assert.deepEqual(normalized, { bone1: { stiffness: 2 } })
+	assert.deepEqual(toPlain(normalized), { bone1: { stiffness: 2 } })
 })
 
 test('normalizeOverrides: entry が object でなければその entry ごと drop', () => {
@@ -27,7 +33,7 @@ test('normalizeOverrides: entry が object でなければその entry ごと dr
 		bone4: [1, 2],
 		bone5: { drag: 0.1 },
 	})
-	assert.deepEqual(normalized, { bone5: { drag: 0.1 } })
+	assert.deepEqual(toPlain(normalized), { bone5: { drag: 0.1 } })
 })
 
 test('normalizeOverrides: 未知の key は保持する (= 前方互換)', () => {
@@ -35,7 +41,7 @@ test('normalizeOverrides: 未知の key は保持する (= 前方互換)', () =>
 	const normalized = normalizeOverrides({
 		bone1: { drag: 0.1, futureField: 'x', restLength: 2.5 },
 	})
-	assert.deepEqual(normalized, { bone1: { drag: 0.1, futureField: 'x', restLength: 2.5 } })
+	assert.deepEqual(toPlain(normalized), { bone1: { drag: 0.1, futureField: 'x', restLength: 2.5 } })
 })
 
 test('normalizeOverrides: 既知項目が全滅し未知 key も無い entry は除去する', () => {
@@ -44,7 +50,7 @@ test('normalizeOverrides: 既知項目が全滅し未知 key も無い entry は
 		bone2: {},
 		bone3: { drag: Number.NaN, future: 1 }, // 未知 key が残るので保持
 	})
-	assert.deepEqual(normalized, { bone3: { future: 1 } })
+	assert.deepEqual(toPlain(normalized), { bone3: { future: 1 } })
 })
 
 test('normalizeOverrides: JSON round-trip を通しても同じ正規形', () => {
@@ -67,6 +73,20 @@ test('normalizeOverrides: 入力を変異させない', () => {
 	normalizeOverrides(raw)
 	assert.deepEqual(entry, { drag: Number.NaN, stiffness: 2, future: 'x' })
 	assert.deepEqual(Object.keys(raw), ['bone1'])
+})
+
+test('normalizeOverrides: __proto__ を key に持つ入力でも prototype を汚染しない', () => {
+	// object literal の {'__proto__': ...} は prototype を設定してしまい own key にならない
+	// ため、 任意の JSON 由来の入力を再現するには JSON.parse で作る
+	const raw = JSON.parse('{"__proto__": {"drag": 0.1}, "bone1": {"stiffness": 2}}')
+	const normalized = normalizeOverrides(raw)
+	// 返却 map と内側の entry は null-prototype (= `__proto__` の添字代入で prototype が
+	// 書き換わらない)
+	assert.equal(Object.getPrototypeOf(normalized), null)
+	// '__proto__' は prototype 汚染ではなく own key の通常 entry として正規化結果に残る
+	assert.ok(Object.prototype.hasOwnProperty.call(normalized, '__proto__'))
+	assert.equal(Object.getPrototypeOf(normalized['__proto__']), null)
+	assert.deepEqual(toPlain(normalized), JSON.parse('{"__proto__": {"drag": 0.1}, "bone1": {"stiffness": 2}}'))
 })
 
 // --- setOverrideField / clearOverrideField の immutability ---
