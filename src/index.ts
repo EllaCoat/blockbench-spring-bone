@@ -57,10 +57,9 @@ const PLUGIN_VERSION = '0.0.11'
 
 // name prefix `spring_` = **旧方式** (= v0.0.10 まで) の spring 化 truth。 現在の truth は
 // Group Property `spring_bone_enabled` (= enum 3 値) に移行済みで、 prefix は
-// 「旧ファイルからの移行判定 (= shouldMigrate)」 と「save condition の noise 防止」
-// だけに使う。 bone 名自体は plugin から一切変更しない (= AnimatedJava の datapack
+// 「旧ファイルからの移行判定 (= springConfig.shouldMigrate)」 だけに使う。
+// bone 名自体は plugin から一切変更しない (= AnimatedJava の datapack
 // 出力名に直結するため、 名前を書き換えると出力側の識別子まで変わってしまう)。
-const BONE_NAME_PREFIX = 'spring_'
 
 // 物理パラ (= VRM SpringBone デフォルト相当)。 時刻刻み関連の定数 (= FIXED_DT_SECONDS /
 // FAST_FORWARD_STEP_THRESHOLD) は springRuntime.ts 側に集約。
@@ -71,7 +70,7 @@ const DEFAULT_CONFIG: Omit<SpringConfig, 'restLength'> = {
 }
 
 // Property key list (= register / unregister / read で共有)。 key 名は
-// `spring_<field>` にして、 name prefix (= BONE_NAME_PREFIX = 'spring_') と統一感を持たせる。
+// `spring_<field>` にして、 旧方式の name prefix (= 'spring_') と統一感を持たせる。
 const PROPERTY_KEYS = ['spring_drag', 'spring_stiffness', 'spring_gravity'] as const
 type SpringPropertyKey = (typeof PROPERTY_KEYS)[number]
 
@@ -167,25 +166,6 @@ function isSpringGroupForProperty(group?: unknown): boolean {
 	return isCapable(getSpringBoneState(group))
 }
 
-// 旧 prefix 判定の生き残り。 使うのは **save condition だけ** (= 移行判定は
-// springConfig.shouldMigrate 側の責務)。 それ以外の経路で新たに使わないこと。
-function hasSpringPrefix(name: unknown): boolean {
-	return typeof name === 'string' && name.startsWith(BONE_NAME_PREFIX)
-}
-
-// `spring_bone_enabled` の保存 condition。 Property.copy (= property.ts:200) と
-// Property.reset の gate として BB core が instance 付きで呼ぶ (= element_panel input を
-// 持たない本 Property には context 無し呼び出し経路が存在しない)。
-// - 値が 'unset' 以外 (= enabled / disabled) → 保存する
-// - 値が 'unset' でも名前が `spring_` 始まり → 保存する (= 旧方式 blueprint を load した
-//   直後は値が無い = 'unset' のまま。 rescan の移行が走る前に save されても、 prefix 由来の
-//   移行対象である痕跡と数値パラ保存 gate との整合を保つため保存対象に含める)
-// これら以外 (= 無関係な project の全 group) には 'unset' を書き出さない (= noise 防止)。
-function isSpringEnabledSavable(group?: unknown): boolean {
-	if (getSpringBoneState(group) !== 'unset') return true
-	return hasSpringPrefix((group as { name?: unknown } | null)?.name)
-}
-
 // Property 4 個 (= 数値 3 + enum `spring_bone_enabled`) を Group に register。
 // plugin onload で 1 回だけ呼ぶ。 数値 Property の element_panel input は edit モードのみ
 // 表示 (= BB 本体側の element_panel.ts condition)、 animate モードでは自然に消える。
@@ -217,23 +197,18 @@ function registerProperties(): void {
 	// これで .bbmodel reload で値が復帰する。 標準 merge の condition gate だけを迂回し、
 	// 値の妥当性検証は型ごとに残す (= 数値は finite number、 enum は SPRING_ENABLED_VALUES
 	// に含まれる文字列のみ)。
-	// copy / element_panel visibility は元の condition (= isSpringGroupForProperty /
-	// isSpringEnabledSavable) が保持 (= 非 spring group への Property 汚染ゼロ)。
+	// merge data に key が無い場合は **数値 / enum ともに skip** (= 何もしない)。
+	// enum に「key 欠落時に default へ書き戻す」 分岐があったが、 BB は `Group.extend({origin: ...})`
+	// のような一部 key だけを持つ data での部分更新に extend を日常的に使うため、 そのたびに
+	// spring 状態が 'unset' へ巻き戻り、 数値 Property の capable condition も連鎖で偽になって
+	// 保存時に spring_drag 等が丸ごと欠落する (= Critical review 指摘)。 enum Property の
+	// condition を外したことで Undo 捕捉 / blueprint 保存に key が必ず入るようになり、
+	// 「欠落 = 'unset' だった」 と解釈する必要自体が消えた。
+	// copy / element_panel visibility は数値 Property の condition (= isSpringGroupForProperty)
+	// が保持 (= 非 spring group への数値 Property 汚染ゼロ)。
 	const patchMerge = (prop: any, key: string, enumValues?: readonly string[]): void => {
 		prop.merge = function (instance: any, data: any) {
-			if (data?.[key] === undefined) {
-				// enum Property 限定 : merge data に key が無い場合は default (= 'unset') に戻す。
-				// BB の Undo 捕捉 (= getChildlessCopy → Property.copy、 undo.js:323 /
-				// group.js:392) は save condition と同じ condition gate を通るため、
-				// 'unset' + prefix 無しの group は捕捉時点で key が欠落する。 欠落を skip
-				// すると初回 springify (= 'unset' → 'enabled') の undo で値が戻らないため、
-				// 「欠落 = 捕捉時点で 'unset' だった」 と解釈して default に戻す。
-				// blueprint load でも key 欠落 = 未設定 = default と同義で矛盾しない。
-				// 数値 Property はこの問題を持たない (= 非 spring group の数値値は読まれず
-				// 保存もされない) ため、 従来通り skip する。
-				if (enumValues) instance[key] = enumValues[0]
-				return
-			}
+			if (data?.[key] === undefined) return
 			const value = data[key]
 			if (enumValues) {
 				if (typeof value === 'string' && enumValues.includes(value)) {
@@ -256,12 +231,16 @@ function registerProperties(): void {
 	// 再び有効化してしまう。 3 値なら移行済み判定が値そのものから出るため、 別の marker
 	// や project 単位の version は要らない。
 	// element_panel input は付けない (= 有効化 / 解除は右クリ action が担う)。
+	// **condition は付けない** : condition は save gate だけでなく Property.copy の gate
+	// も兼ねる (= property.ts:200) ため、 付けると 'unset' の group で Undo 捕捉
+	// (= getChildlessCopy → Property.copy) と blueprint 保存の両方から key が欠落する。
+	// 欠落した key は部分更新の merge 経路で巻き戻りを誘発するため、 condition を外して
+	// copy に常に値を書かせる (= 部分更新 merge も Undo 捕捉も key 欠落が起きない形に揃える)。
+	// 代償として無関係な project の全 group に "unset" が書き出されるが、 blueprint の
+	// サイズ微増のみで AnimatedJava の datapack 出力には影響しないため許容する。
 	const enabled_prop = new Property(Group, 'enum', SPRING_ENABLED_KEY, {
 		default: 'unset',
 		values: SPRING_ENABLED_VALUES,
-		// save condition = Property.copy / reset の gate。 'unset' のままでは保存しない
-		// (= 無関係な project の全 group に 'unset' が書き出される noise 防止)。
-		condition: isSpringEnabledSavable,
 	})
 
 	patchMerge(drag_prop, 'spring_drag')
@@ -889,11 +868,14 @@ function registerGroup(group: any): void {
 		parentUuid: getSpringParentUuid(group),
 		depth: 0, // rebuildTopoOrder で再計算される
 	}
-	// base を Group Property 由来の値で確定させ、 effective (= config) も base + geometry の
-	// 合成値で初期化する (= 最初の resolveConfigs が走る前に読まれても安全な値にする)。
-	// 以降の effective 更新は previewOps.resolveConfigs だけが行う。
+	// base を Group Property 由来の値で確定させる。 effective (= config) はここでは触らず、
+	// entry 生成時の初期値 (= DEFAULT_CONFIG + 算出済み restLength) のままにする :
+	// 「effective の writer は previewOps.resolveConfigs の 1 箇所だけ」 という契約を
+	// 守るため。 初期値のままで安全な理由 : config を読むのは物理 step
+	// (= stepAndApplyOrdered) と resetAllToRest だけで、 どちらも
+	// SpringRuntime.beginAnimation → resolveConfigs (= springRuntime.ts:135-145) の後に
+	// 走る replay 経路の中にあるため、 resolveConfigs 未実行の config を読む経路が無い。
 	Object.assign(entry.base, resolveConfig(entry, null))
-	Object.assign(entry.config, entry.base)
 	registry.set(group.uuid, entry)
 }
 
@@ -952,7 +934,12 @@ function rebuildTopoOrder(groups: unknown[]): void {
 
 // chain 構造 + Property パラの fingerprint 計算 (= topology / config 変化検知用)。 uuid
 // 昇順に整列した「uuid:state:parentUuid:restLength:restLocalDir:drag,stiffness,gravity」 の連結。
-// 数値は小数丸めで安定化。 restLocalDir も含めることで「同長で方向だけ変わった origin 編集」
+// 数値は **丸めずに** JSON.stringify でそのまま文字列化する (= animOverrides.ts の
+// overridesFingerprint と同じ表現)。 toFixed 等で丸めると丸め幅未満の変更で fingerprint が
+// 変わらず session が invalidate されない : rescanRegistry は effective (= entry.config) を
+// 直接更新しないため、 以前は rescan の直接更新で救われていた微小変更が、 別の event が
+// 来るまで stale のまま残ってしまう。 fingerprint 文字列は長くなるが比較にしか使わないため
+// 問題ない。 restLocalDir も含めることで「同長で方向だけ変わった origin 編集」
 // でも invalidate する。 drag / stiffness / gravity を含めることで、 Property 値変更が
 // 「topology 変化と同じ扱い」 で next tick に 0 replay をトリガする (= 値変更が scrub
 // を待たずに即 preview に反映される、 element_panel input の onChange と両輪で動作)。
@@ -969,7 +956,7 @@ function computeGraphFingerprint(): string {
 			// 互いを打ち消し合い、 毎 tick の無駄な invalidate か stale 固着のどちらかを招く。
 			const d = e.geometry.restLocalDir
 			const b = e.base
-			return `${u}:${getSpringBoneState(e.group)}:${e.parentUuid ?? '-'}:${e.geometry.restLength.toFixed(4)}:${d.x.toFixed(3)},${d.y.toFixed(3)},${d.z.toFixed(3)}:${b.drag.toFixed(3)},${b.stiffness.toFixed(3)},${b.gravity.toFixed(3)}`
+			return `${u}:${getSpringBoneState(e.group)}:${e.parentUuid ?? '-'}:${JSON.stringify(e.geometry.restLength)}:${JSON.stringify(d.x)},${JSON.stringify(d.y)},${JSON.stringify(d.z)}:${JSON.stringify(b.drag)},${JSON.stringify(b.stiffness)},${JSON.stringify(b.gravity)}`
 		})
 		.join('|')
 }
@@ -1534,9 +1521,26 @@ function installTickLoop(): () => void {
 	const onSelectAnimation = (): void => {
 		invalidateAnimationCache()
 	}
+	// **rAF 遅延が必要な理由** : `select_project` は ModelProject.select() 内で発火し
+	// (= js/io/project.ts:399)、 .bbmodel の parse 完了 (= js/formats/bbmodel.js:581 の
+	// `parsed` event、 Group 構築を含む) より **前** である。 `load_project` も同様に
+	// parse 前 (= js/formats/bbmodel.js:430、 parse dispatch は 431)。 同期で rescan すると
+	// Group がまだ存在せず空の registry を作るだけになり、 初回ロードした旧 blueprint の
+	// 移行と物理適用が update_selection 等の後続 event まで遅れる (= その間の保存で数値
+	// Property が capable condition により脱落し得る)。 parse は同期処理なので rAF
+	// コールバックは parse 完了後に走る。 切替 (= select_project) とロード (= load_project)
+	// の両 event に同じ handler を登録して二重化する。 rescan は idempotent で重複しても
+	// 無害だが、 同一 frame での多重実行は無駄なので outliner marker 側の scheduleScan と
+	// 同じ「rAF 1 回にまとめる」 パターンで coalesce する。
+	let projectRescanScheduled = false
 	const onProjectSwitch = (): void => {
-		rescanRegistry()
-		invalidatePreviewSession()
+		if (projectRescanScheduled) return
+		projectRescanScheduled = true
+		requestAnimationFrame(() => {
+			projectRescanScheduled = false
+			rescanRegistry()
+			invalidatePreviewSession()
+		})
 	}
 	const onUpdateSelection = (): void => {
 		// idempotent rescan で既存 entry の state は保持、 session もそのまま (= 物理継続)。
@@ -1576,6 +1580,7 @@ function installTickLoop(): () => void {
 
 	Blockbench.on('display_animation_frame', onAnimFrame)
 	Blockbench.on('select_project', onProjectSwitch)
+	Blockbench.on('load_project', onProjectSwitch)
 	Blockbench.on('update_selection', onUpdateSelection)
 	Blockbench.on('select_mode', onModeChange)
 	Blockbench.on('undo', onUndoRedo)
@@ -1586,6 +1591,7 @@ function installTickLoop(): () => void {
 	return (): void => {
 		Blockbench.removeListener?.('display_animation_frame', onAnimFrame)
 		Blockbench.removeListener?.('select_project', onProjectSwitch)
+		Blockbench.removeListener?.('load_project', onProjectSwitch)
 		Blockbench.removeListener?.('update_selection', onUpdateSelection)
 		Blockbench.removeListener?.('select_mode', onModeChange)
 		Blockbench.removeListener?.('undo', onUndoRedo)
