@@ -16,6 +16,7 @@
 
 import { createState, resetState, step, type SpringConfig, type SpringState } from './springSim'
 import { SpringRuntime, type SpringRuntimeOps, type AnimationContext } from './springRuntime'
+import { isCapable, shouldMigrate, toSpringBoneState, type SpringBoneState } from './springConfig'
 import { registerSpringPanel } from './ui'
 
 declare const Plugin: { register(id: string, opts: Record<string, unknown>): void }
@@ -23,7 +24,7 @@ declare const Blockbench: {
 	on(event: string, fn: (...args: unknown[]) => void): void
 	removeListener?(event: string, fn: (...args: unknown[]) => void): void
 }
-declare const Project: { groups?: unknown[] } | null
+declare const Project: { groups?: unknown[]; elements?: unknown[]; saved?: boolean } | null
 declare const Group: any
 declare const Canvas: { scene?: { updateMatrixWorld?(force?: boolean): void }; updateView?(opt: unknown): void }
 declare const Timeline: { time?: number; playing?: boolean }
@@ -52,11 +53,13 @@ declare const Undo: any
 declare function updateSelection(): void
 
 const PLUGIN_ID = 'spring_bone'
-const PLUGIN_VERSION = '0.0.10'
+const PLUGIN_VERSION = '0.0.11'
 
-// name prefix `spring_` = spring 化の唯一の truth (= per-group で spring 化を判定する gesture)。
-// per-bone UI (= drag / stiffness / gravity の Property + Panel + 右クリ rename sugar) は
-// この prefix を前提に register される。
+// name prefix `spring_` = **旧方式** (= v0.0.10 まで) の spring 化 truth。 現在の truth は
+// Group Property `spring_bone_enabled` (= enum 3 値) に移行済みで、 prefix は
+// 「旧ファイルからの移行判定 (= shouldMigrate)」 と「save condition の noise 防止」
+// だけに使う。 bone 名自体は plugin から一切変更しない (= AnimatedJava の datapack
+// 出力名に直結するため、 名前を書き換えると出力側の識別子まで変わってしまう)。
 const BONE_NAME_PREFIX = 'spring_'
 
 // 物理パラ (= VRM SpringBone デフォルト相当)。 時刻刻み関連の定数 (= FIXED_DT_SECONDS /
@@ -72,11 +75,23 @@ const DEFAULT_CONFIG: Omit<SpringConfig, 'restLength'> = {
 const PROPERTY_KEYS = ['spring_drag', 'spring_stiffness', 'spring_gravity'] as const
 type SpringPropertyKey = (typeof PROPERTY_KEYS)[number]
 
+// spring bone 化の truth となる enum Property の key と値候補。
+// registerProperties / patchMerge / unregisterProperties で共有する。
+const SPRING_ENABLED_KEY = 'spring_bone_enabled'
+const SPRING_ENABLED_VALUES = ['unset', 'enabled', 'disabled'] as const
+
 // Group instance に自動で生える Property 値を読む helper。 Property が未定義
 // or 未 register or NaN の場合は fallback を返す (= DEFAULT_CONFIG 値)。
 function readSpringProp(group: unknown, key: SpringPropertyKey, fallback: number): number {
 	const raw = (group as Record<string, unknown> | null)?.[key]
 	return typeof raw === 'number' && Number.isFinite(raw) ? raw : fallback
+}
+
+// Group instance の `spring_bone_enabled` を 3 値へ正規化して読む唯一の口。
+// Property 未 register / 旧ファイル / 手編集で変な値が入っていても 'unset' に倒れる
+// (= toSpringBoneState の「既知値以外はすべて 'unset'」 ルール)。
+function getSpringBoneState(group: unknown): SpringBoneState {
+	return toSpringBoneState((group as { spring_bone_enabled?: unknown } | null)?.spring_bone_enabled)
 }
 
 // Group Property から物理パラ (= drag / stiffness / gravity) を解決する唯一の口。
@@ -129,30 +144,52 @@ function onSpringPropertyChange(): void {
 	}
 }
 
-// spring group name prefix 判定 (= BB 側 condition callback から呼ばれる)。
-// **context 2 経路** :
+// 数値 Property 3 つ (= spring_drag / spring_stiffness / spring_gravity) の condition 判定。
+// **capable (= 'enabled' | 'disabled') 基準** : condition は Property.copy の gate でもある
+// (= property.ts:200) ため、 解除済み ('disabled') の group でも値が保存され続ける必要がある。
+// prefix 依存のままだと `spring_` を外す rename / Property 解除で物理パラメータが
+// 保存時に黙って消える。
+// **context 2 経路** は従来通り :
 //   (1) Property.merge / copy 経路 = BB core が instance を渡す (= 引数あり)
 //   (2) element_panel input.condition 経路 = BB core が **context 無し** で呼ぶ
 //       (element_panel.ts:56-58 `method: () => Condition(property.condition)` = 引数省略)
 // 引数省略時は Group.first_selected (= 現在 UI で選択中の group) を参照する。
-// これで edit モード element_panel でも「選択中 group が spring_ prefix ならば表示」 となる。
-// なお、 Property.merge の load 時ordering 問題 (= properties merge → name merge の順、
-// group.js:29-33) は本 condition では解消不可 (= merge 時点で name = default 'group')。
-// そのため Property 各 instance の `.merge` を override して condition 迂回する
-// (= registerProperties 内で instance method 直接差し替え)。
+// なお、 Property.merge の load 時 ordering 問題 (= properties merge が instance の
+// state 復元前に走る、 group.js:29-33) は本 condition では解消不可 (= merge 時点では
+// spring_bone_enabled がまだ default の 'unset')。 そのため Property 各 instance の
+// `.merge` を override して condition 迂回する (= registerProperties 内で instance
+// method 直接差し替え)。
 function isSpringGroupForProperty(group?: unknown): boolean {
 	if (group === undefined || group === null) {
 		// context 無し呼び出し = 現在選択中 group で判定
-		const first = (Group as { first_selected?: { name?: unknown } })?.first_selected
-		return !!(first && typeof first.name === 'string' && first.name.startsWith(BONE_NAME_PREFIX))
+		return isCapable(getSpringBoneState((Group as { first_selected?: unknown })?.first_selected))
 	}
-	const name = (group as { name?: unknown }).name
+	return isCapable(getSpringBoneState(group))
+}
+
+// 旧 prefix 判定の生き残り。 使うのは **save condition だけ** (= 移行判定は
+// springConfig.shouldMigrate 側の責務)。 それ以外の経路で新たに使わないこと。
+function hasSpringPrefix(name: unknown): boolean {
 	return typeof name === 'string' && name.startsWith(BONE_NAME_PREFIX)
 }
 
-// Property 3 個を Group に register。 plugin onload で 1 回だけ呼ぶ。
-// element_panel input は edit モードのみ表示 (= BB 本体側の element_panel.ts condition)、
-// animate モードでは自然に消える。 animate モード用の値編集は Commit 2 の専用 Panel で提供。
+// `spring_bone_enabled` の保存 condition。 Property.copy (= property.ts:200) と
+// Property.reset の gate として BB core が instance 付きで呼ぶ (= element_panel input を
+// 持たない本 Property には context 無し呼び出し経路が存在しない)。
+// - 値が 'unset' 以外 (= enabled / disabled) → 保存する
+// - 値が 'unset' でも名前が `spring_` 始まり → 保存する (= 旧方式 blueprint を load した
+//   直後は値が無い = 'unset' のまま。 rescan の移行が走る前に save されても、 prefix 由来の
+//   移行対象である痕跡と数値パラ保存 gate との整合を保つため保存対象に含める)
+// これら以外 (= 無関係な project の全 group) には 'unset' を書き出さない (= noise 防止)。
+function isSpringEnabledSavable(group?: unknown): boolean {
+	if (getSpringBoneState(group) !== 'unset') return true
+	return hasSpringPrefix((group as { name?: unknown } | null)?.name)
+}
+
+// Property 4 個 (= 数値 3 + enum `spring_bone_enabled`) を Group に register。
+// plugin onload で 1 回だけ呼ぶ。 数値 Property の element_panel input は edit モードのみ
+// 表示 (= BB 本体側の element_panel.ts condition)、 animate モードでは自然に消える。
+// animate モード用の値編集は専用 Panel (= ui.ts) で提供。
 function registerProperties(): void {
 	if (typeof Property !== 'function') {
 		console.warn(`[${PLUGIN_ID}] Property class not available, skipping property registration`)
@@ -174,17 +211,36 @@ function registerProperties(): void {
 		},
 	})
 
-	// Property.merge の load 時 ordering 問題 (= properties merge → name merge の順、
-	// group.js:29-33) を回避するため、 各 Property の .merge を override して condition 迂回。
-	// data 側に値がある (= 元々 spring_ prefix の group を save した証拠) 場合は無条件 copy。
-	// これで .bbmodel reload で 3 パラ値が復帰する (= 受け入れ条件 (a) を満たす)。
-	// copy / element_panel visibility は元の condition (= isSpringGroupForProperty) が保持
-	// (= 非 spring group への Property 汚染ゼロ)。
-	const patchMerge = (prop: any, key: string): void => {
+	// Property.merge の load 時 ordering 問題 (= properties merge が instance の state /
+	// name 復元前に走る、 group.js:29-33) を回避するため、 各 Property の .merge を
+	// override して condition 迂回。 data 側に値がある (= 保存済みの証拠) 場合は無条件 copy。
+	// これで .bbmodel reload で値が復帰する。 標準 merge の condition gate だけを迂回し、
+	// 値の妥当性検証は型ごとに残す (= 数値は finite number、 enum は SPRING_ENABLED_VALUES
+	// に含まれる文字列のみ)。
+	// copy / element_panel visibility は元の condition (= isSpringGroupForProperty /
+	// isSpringEnabledSavable) が保持 (= 非 spring group への Property 汚染ゼロ)。
+	const patchMerge = (prop: any, key: string, enumValues?: readonly string[]): void => {
 		prop.merge = function (instance: any, data: any) {
-			if (data?.[key] === undefined) return
-			if (typeof data[key] === 'number' && Number.isFinite(data[key])) {
-				instance[key] = data[key]
+			if (data?.[key] === undefined) {
+				// enum Property 限定 : merge data に key が無い場合は default (= 'unset') に戻す。
+				// BB の Undo 捕捉 (= getChildlessCopy → Property.copy、 undo.js:323 /
+				// group.js:392) は save condition と同じ condition gate を通るため、
+				// 'unset' + prefix 無しの group は捕捉時点で key が欠落する。 欠落を skip
+				// すると初回 springify (= 'unset' → 'enabled') の undo で値が戻らないため、
+				// 「欠落 = 捕捉時点で 'unset' だった」 と解釈して default に戻す。
+				// blueprint load でも key 欠落 = 未設定 = default と同義で矛盾しない。
+				// 数値 Property はこの問題を持たない (= 非 spring group の数値値は読まれず
+				// 保存もされない) ため、 従来通り skip する。
+				if (enumValues) instance[key] = enumValues[0]
+				return
+			}
+			const value = data[key]
+			if (enumValues) {
+				if (typeof value === 'string' && enumValues.includes(value)) {
+					instance[key] = value
+				}
+			} else if (typeof value === 'number' && Number.isFinite(value)) {
+				instance[key] = value
 			}
 		}
 	}
@@ -193,9 +249,25 @@ function registerProperties(): void {
 	const stiffness_prop = new Property(Group, 'number', 'spring_stiffness', makeConfig('Spring stiffness', DEFAULT_CONFIG.stiffness, 0, 10, 0.1))
 	const gravity_prop = new Property(Group, 'number', 'spring_gravity', makeConfig('Spring gravity', DEFAULT_CONFIG.gravity, 0, 100, 1))
 
+	// spring bone 化の唯一の truth となる enum Property。 **3 値にする理由** : boolean +
+	// default false だと「旧ファイルで未設定」と「明示的に解除した」が instance 上で区別
+	// できず、 BB が constructor で全 Property を default へ reset する
+	// (property.ts:225-236) ため、 prefix 付き bone の解除 → 保存 → 再読込で移行処理が
+	// 再び有効化してしまう。 3 値なら移行済み判定が値そのものから出るため、 別の marker
+	// や project 単位の version は要らない。
+	// element_panel input は付けない (= 有効化 / 解除は右クリ action が担う)。
+	const enabled_prop = new Property(Group, 'enum', SPRING_ENABLED_KEY, {
+		default: 'unset',
+		values: SPRING_ENABLED_VALUES,
+		// save condition = Property.copy / reset の gate。 'unset' のままでは保存しない
+		// (= 無関係な project の全 group に 'unset' が書き出される noise 防止)。
+		condition: isSpringEnabledSavable,
+	})
+
 	patchMerge(drag_prop, 'spring_drag')
 	patchMerge(stiffness_prop, 'spring_stiffness')
 	patchMerge(gravity_prop, 'spring_gravity')
+	patchMerge(enabled_prop, SPRING_ENABLED_KEY, SPRING_ENABLED_VALUES)
 }
 
 // plugin onunload で Property を Group.properties から delete。 unload → reload で
@@ -207,17 +279,16 @@ function unregisterProperties(): void {
 	for (const key of PROPERTY_KEYS) {
 		delete props[key]
 	}
+	delete props[SPRING_ENABLED_KEY]
 }
 
-// Group 右クリ context menu に「Spring 化 / Spring 解除」 の 2 action を追加する。
-// 実装 gesture (= 唯一の truth) は依然 name prefix (= `spring_`) の付け外し。
+// Group 右クリ context menu に「Spring 化 / Spring 解除」 の 4 action を追加する。
+// 実装 gesture (= 唯一の truth) は Group Property `spring_bone_enabled` の書き換え。
+// **名前は一切変更しない** (= bone 名は AnimatedJava の datapack 出力名に直結するため)。
 // action は BB core の Group.prototype.menu.structure に append され、 group 右クリで表示される。
-// condition で「対象 group の prefix 状態」 に応じて片方のみを visible にする (= mutually exclusive)。
+// condition で「対象 group の Property 状態」 に応じて片方のみを visible にする
+// (= mutually exclusive)。
 let registeredMenuEntries: unknown[] = []
-
-function hasSpringPrefix(name: unknown): boolean {
-	return typeof name === 'string' && name.startsWith(BONE_NAME_PREFIX)
-}
 
 // context が Group instance かの判定。 Group.all は BB core が全 Group を保持する list。
 // Action.trigger() 内での condition 再評価時に渡される context (= Action instance) を弾き、
@@ -270,7 +341,7 @@ function evaluateActionScope(
 // 指定 group + 全子孫 Group を DFS で列挙 (= 子孫再帰 spring 化用)。
 // - Group instance のみ収集 (= Cube / Element 等は除外)
 // - 循環回避 = visited Set (BB の Group tree では通常発生しないが malformed state 防御)
-// - 順序 = pre-order DFS (= 親 → 子)、 rename 側では順序に依存しないが consistency のため
+// - 順序 = pre-order DFS (= 親 → 子)、 Property 書き換え側では順序に依存しないが consistency のため
 function collectGroupAndDescendants(root: unknown): unknown[] {
 	const result: unknown[] = []
 	const visited = new Set<object>()
@@ -305,28 +376,26 @@ function registerContextMenuActions(): void {
 		name: 'Spring 化',
 		icon: 'gesture',
 		// menu 表示は clicked Group 単独、 Action.trigger 経由 (= keybind 等) は multi_selected 全体
-		// (空なら first_selected fallback) を対象に「非 spring group が 1 個でもあるか」 で判定。
+		// (空なら first_selected fallback) を対象に「'enabled' でない group が 1 個でもあるか」 で判定。
 		// 判定範囲を click 側 (= multi_selected filter) と一致させ、 状態が異なる複数選択で
 		// 「表示されるが発火しない」 症状を排除する (Sol Round 3 MUST-2 = 単独 action 側の同型 bug)。
 		condition: (context?: unknown) =>
-			evaluateActionScope(context, (g) =>
-				!hasSpringPrefix((g as { name?: unknown } | null)?.name),
-			false),
+			evaluateActionScope(context, (g) => getSpringBoneState(g) !== 'enabled', false),
 		click() {
 			const groups = ((Group as { multi_selected?: unknown[] })?.multi_selected ?? []).filter(
-				(g) => !hasSpringPrefix((g as { name?: unknown } | null)?.name),
-			) as Array<{ name: string }>
+				(g) => getSpringBoneState(g) !== 'enabled',
+			) as Array<{ spring_bone_enabled?: unknown }>
 			if (groups.length === 0) return
 			try {
 				Undo?.initEdit?.({ groups })
-				for (const g of groups) g.name = `${BONE_NAME_PREFIX}${g.name}`
+				for (const g of groups) g.spring_bone_enabled = 'enabled'
 				Undo?.finishEdit?.('Spring 化')
 			} catch (e) {
 				console.warn(`[${PLUGIN_ID}] springify failed`, e)
 			}
-			// rename 直後に registry を再構築 (= 新規 spring group を pick up、 fingerprint 変化で
-			// 次 tick に 0 replay 起動)。 これで context menu 直後の物理追従が selection 変更を
-			// 待たずに即発火する (= 受け入れ条件 (f) の物理側)。
+			// Property 変更直後に registry を再構築 (= 新規 spring group を pick up、 fingerprint
+			// 変化で次 tick に 0 replay 起動)。 これで context menu 直後の物理追従が selection
+			// 変更を待たずに即発火する。
 			try {
 				rescanRegistry()
 			} catch (e) {
@@ -355,33 +424,29 @@ function registerContextMenuActions(): void {
 		name: 'Spring 解除',
 		icon: 'link_off',
 		// springify 側と対称の evaluateActionScope 経由判定 (Sol Round 3 MUST-2)。
-		// 「spring group が 1 個でも選択範囲にあれば表示」、 click 側 (multi_selected filter) と一致する
-		// 走査で、 混在選択時の表示発火食い違い排除。
-		// 名前がちょうど `spring_` (= prefix のみで本体空) の Group は除外 = click 側の長さ guard と揃える
-		// (Sol Round 4 IMO-1、 表示されるが click で発火しない見せかけを排除)。
+		// 「'enabled' の group が 1 個でも選択範囲にあれば表示」、 click 側 (multi_selected filter)
+		// と一致する走査で、 混在選択時の表示発火食い違い排除。
 		condition: (context?: unknown) =>
-			evaluateActionScope(context, (g) => {
-				const n = (g as { name?: unknown } | null)?.name
-				return typeof n === 'string' && n.startsWith(BONE_NAME_PREFIX) && n.length > BONE_NAME_PREFIX.length
-			}, false),
+			evaluateActionScope(context, (g) => getSpringBoneState(g) === 'enabled', false),
 		click() {
-			// prefix 除去後に空文字にならない (= 「spring_」 だけの group を弾く、 N-3 guard) 条件込みで filter。
 			const groups = ((Group as { multi_selected?: unknown[] })?.multi_selected ?? []).filter(
-				(g) => {
-					const n = (g as { name?: unknown } | null)?.name
-					return typeof n === 'string' && n.startsWith(BONE_NAME_PREFIX) && n.length > BONE_NAME_PREFIX.length
-				},
-			) as Array<{ name: string }>
+				(g) => getSpringBoneState(g) === 'enabled',
+			) as Array<{ spring_bone_enabled?: unknown }>
 			if (groups.length === 0) return
 			try {
 				Undo?.initEdit?.({ groups })
-				for (const g of groups) g.name = g.name.slice(BONE_NAME_PREFIX.length)
+				// 解除は必ず 'disabled' にする。 'unset' に戻すと名前に prefix が残っている
+				// group (= 旧方式由来) で次の rescan の移行処理が再び有効化してしまう。
+				// なお animation 側の override は削除しない (= 後続 commit の animation 単位
+				// override 設計で、 再有効化時に復帰できるようにするため)。
+				for (const g of groups) g.spring_bone_enabled = 'disabled'
 				Undo?.finishEdit?.('Spring 解除')
 			} catch (e) {
 				console.warn(`[${PLUGIN_ID}] unspringify failed`, e)
 			}
-			// rename 直後に registry を再構築 (= 解除された group を registry から除外、 fingerprint 変化で
-			// 次 tick に replay 起動)。 これで残存 spring group の物理が selection 変更を待たずに継続する。
+			// Property 変更直後に registry を再構築 (= 解除された group は capable のため registry に
+			// 残るが、 fingerprint に含めた state 変化で次 tick に 0 replay が起動し、 step / apply の
+			// 対象から外れる)。 これで残存 spring group の物理が selection 変更を待たずに継続する。
 			try {
 				rescanRegistry()
 			} catch (e) {
@@ -393,7 +458,7 @@ function registerContextMenuActions(): void {
 			} catch (e) {
 				console.warn(`[${PLUGIN_ID}] updateSelection failed after unspringify`, e)
 			}
-			// 凍結解決の primary fix : 登録解除後、 mesh.rotation には plugin が最後に書いた
+			// 凍結解決の primary fix : 物理対象から外れた後、 mesh.rotation には plugin が最後に書いた
 			// 物理姿勢が残る。 paused / 純物理 bone (= keyframe を持たない) の場合、
 			// showDefaultPose → stackAnimations の loop が「何も当てない」 状態で rest 固定となり
 			// 「アニメーションが完全停止」 に見える (= 症状 3 凍結の真因)。 Animator.preview を明示発火し
@@ -411,35 +476,33 @@ function registerContextMenuActions(): void {
 
 	// 子孫再帰版の spring 化 sub-action (= 選択 group + 全子孫を一括で spring 化)。
 	// 単独 spring 化 (= springify) は残す、 opt-in で子孫再帰版を選ぶ形。
-	// condition = 選択 group または子孫のいずれかが非 spring group であれば表示
+	// condition = 選択 group または子孫のいずれかが 'enabled' でなければ表示
 	// (= 選択部分木が既に全 spring 化済みなら意味ないので隠す)。
 	const springify_recursive = new Action(`${PLUGIN_ID}_springify_recursive`, {
 		name: 'Spring 化 (子孫含む)',
 		icon: 'account_tree',
 		condition: (context?: unknown) =>
-			evaluateActionScope(context, (g) =>
-				!hasSpringPrefix((g as { name?: unknown } | null)?.name),
-			true),
+			evaluateActionScope(context, (g) => getSpringBoneState(g) !== 'enabled', true),
 		click() {
 			// multi-select 対応 = 選択中の全 root group と、 各々の子孫全部を集める
 			// (= uuid dedup で「兄弟同士で親子関係にある」 malformed 選択も安全)
 			const selected = ((Group as { multi_selected?: unknown[] })?.multi_selected ?? []) as unknown[]
 			const seenUuids = new Set<string>()
-			const targets: Array<{ name: string }> = []
+			const targets: Array<{ spring_bone_enabled?: unknown }> = []
 			for (const s of selected) {
 				for (const g of collectGroupAndDescendants(s)) {
 					const uuid = (g as { uuid?: unknown } | null)?.uuid
 					if (typeof uuid !== 'string' || seenUuids.has(uuid)) continue
 					seenUuids.add(uuid)
-					if (!hasSpringPrefix((g as { name?: unknown } | null)?.name)) {
-						targets.push(g as { name: string })
+					if (getSpringBoneState(g) !== 'enabled') {
+						targets.push(g as { spring_bone_enabled?: unknown })
 					}
 				}
 			}
 			if (targets.length === 0) return
 			try {
 				Undo?.initEdit?.({ groups: targets })
-				for (const g of targets) g.name = `${BONE_NAME_PREFIX}${g.name}`
+				for (const g of targets) g.spring_bone_enabled = 'enabled'
 				Undo?.finishEdit?.('Spring 化 (子孫含む)')
 			} catch (e) {
 				console.warn(`[${PLUGIN_ID}] springify_recursive failed`, e)
@@ -465,7 +528,7 @@ function registerContextMenuActions(): void {
 		},
 	})
 
-	// 子孫再帰版の spring 解除 sub-action (= 選択 group + 全子孫の spring_ prefix を一括剥がし)。
+	// 子孫再帰版の spring 解除 sub-action (= 選択 group + 全子孫を一括で 'disabled' にする)。
 	// springify_recursive の対称版、 chain 途中で不用意に spring 化した range を一気に戻す用途。
 	const unspringify_recursive = new Action(`${PLUGIN_ID}_unspringify_recursive`, {
 		name: 'Spring 解除 (子孫含む)',
@@ -473,29 +536,27 @@ function registerContextMenuActions(): void {
 		// 選択部分木 (context or multi_selected) に対象があれば表示、 evaluateActionScope で
 		// click 側 (= multi_selected 走査) と一致する範囲判定 = Action.trigger 経路の食い違い解消
 		condition: (context?: unknown) =>
-			evaluateActionScope(context, (g) => {
-				const n = (g as { name?: unknown } | null)?.name
-				return typeof n === 'string' && n.startsWith(BONE_NAME_PREFIX) && n.length > BONE_NAME_PREFIX.length
-			}, true),
+			evaluateActionScope(context, (g) => getSpringBoneState(g) === 'enabled', true),
 		click() {
 			const selected = ((Group as { multi_selected?: unknown[] })?.multi_selected ?? []) as unknown[]
 			const seenUuids = new Set<string>()
-			const targets: Array<{ name: string }> = []
+			const targets: Array<{ spring_bone_enabled?: unknown }> = []
 			for (const s of selected) {
 				for (const g of collectGroupAndDescendants(s)) {
 					const uuid = (g as { uuid?: unknown } | null)?.uuid
 					if (typeof uuid !== 'string' || seenUuids.has(uuid)) continue
 					seenUuids.add(uuid)
-					const n = (g as { name?: unknown } | null)?.name
-					if (typeof n === 'string' && n.startsWith(BONE_NAME_PREFIX) && n.length > BONE_NAME_PREFIX.length) {
-						targets.push(g as { name: string })
+					if (getSpringBoneState(g) === 'enabled') {
+						targets.push(g as { spring_bone_enabled?: unknown })
 					}
 				}
 			}
 			if (targets.length === 0) return
 			try {
 				Undo?.initEdit?.({ groups: targets })
-				for (const g of targets) g.name = g.name.slice(BONE_NAME_PREFIX.length)
+				// 単独版と同じく必ず 'disabled' にする (= 'unset' へ戻すと prefix 残存 group で
+				// 次の rescan の移行処理が再有効化する)。 animation 側の override は削除しない。
+				for (const g of targets) g.spring_bone_enabled = 'disabled'
 				Undo?.finishEdit?.('Spring 解除 (子孫含む)')
 			} catch (e) {
 				console.warn(`[${PLUGIN_ID}] unspringify_recursive failed`, e)
@@ -541,25 +602,37 @@ function unregisterContextMenuActions(): void {
 	registeredMenuEntries = []
 }
 
-// 別軸 B : Outliner 上の spring_ prefix group を視覚的に区別する軽量マーカー。
+// 別軸 B : Outliner 上の capable (= enabled / disabled) group を視覚的に区別する軽量マーカー。
 // - <style> で `.outliner_object.spring-bone-marker` に淡い teal 色を付与
-// - BB Outliner (= outliner.js:1183+) は Vue で描画、 group name は `input.cube_name` の value
-//   にバインドされる (= v-model)。 value 変化は DOM attribute には反映されないため、
-//   MutationObserver + BB event の 2 経路で scan トリガを取る。
-// - scanOutlinerMarkers = document 内 全 `.outliner_object.group` を走査、
-//   input.cube_name.value が spring_ 始まりなら class 付与、 それ以外なら剥がす。
+// - BB Outliner (= outliner.js:1187) は Vue で描画、 行要素 `li.outliner_node` の
+//   id 属性に node の uuid が入る。 capable な group の uuid 集合を作り、 uuid から
+//   行要素を引いて内側の `.outliner_object` に class を付け外しする (= 表示名は読まない。
+//   v-model バインドの input value 経由だと rename 途中の DOM 反映タイミングに依存するため)。
 // - 副作用ゼロ (= class 追加のみ、 group 内部データは触らない)、 unload で完全クリーンアップ。
 const OUTLINER_MARKER_CLASS = 'spring-bone-marker'
 const OUTLINER_MARKER_STYLE_ID = 'spring-bone-outliner-marker-style'
 
 function scanOutlinerMarkers(): void {
-	const objects = document.querySelectorAll('.outliner_object.group')
-	for (let i = 0; i < objects.length; i++) {
-		const obj = objects[i] as HTMLElement
-		const input = obj.querySelector('input.cube_name') as HTMLInputElement | null
-		const name = input?.value
-		const should = typeof name === 'string' && name.startsWith(BONE_NAME_PREFIX)
-		if (should) {
+	// capable な group の uuid 集合を作る。 Project 未取得 (= 起動直後等) は空集合 =
+	// 全マーカー剥がしで安全側に倒す。
+	const capableUuids = new Set<string>()
+	const groups = (Project as { groups?: unknown[] } | null)?.groups
+	if (Array.isArray(groups)) {
+		for (const g of groups) {
+			if (!isSpringGroup(g)) continue
+			const uuid = (g as { uuid?: unknown }).uuid
+			if (typeof uuid === 'string') capableUuids.add(uuid)
+		}
+	}
+	// li.outliner_node を走査し、 id (= uuid) が集合に含まれる行の内側 .outliner_object に
+	// class を toggle。 集合に無い行 (= cube 等の非 group node や解除済み行) は剥がす側に
+	// 回るため、 stale マーカーの掃除も同じ走査で済む。
+	const nodes = document.querySelectorAll('li.outliner_node')
+	for (let i = 0; i < nodes.length; i++) {
+		const li = nodes[i] as HTMLElement
+		const obj = li.querySelector(':scope > .outliner_object') as HTMLElement | null
+		if (!obj) continue
+		if (capableUuids.has(li.id)) {
 			obj.classList.add(OUTLINER_MARKER_CLASS)
 		} else {
 			obj.classList.remove(OUTLINER_MARKER_CLASS)
@@ -616,11 +689,12 @@ function registerOutlinerMarker(): () => void {
 	const mo = new MutationObserver(scheduleScan)
 	mo.observe(outlinerRoot, { childList: true, subtree: true })
 
-	// BB event 経路 : 選択 / rename / undo redo の直後にも scan を走らせる
-	// (= v-model 経由の value 変更は MutationObserver では拾えないため二重化)。
+	// BB event 経路 : 選択 / Property 変更 / undo redo の直後にも scan を走らせる
+	// (= MutationObserver は DOM 構造変化しか拾えず、 値だけ変わる Property toggle は
+	// DOM 変化を伴わない場合があるため二重化)。
 	// `finished_edit` は BB core が Undo commit 完了直後に fire (= js/undo.js:95)、
-	// これで outliner 上の dblclick → 直接 rename 確定経路 (= outliner_node.ts saveName)
-	// も他イベント待ちにならず即時ハイライト追従する (Opus WANT-1)。
+	// 右クリ action の Property toggle や outliner 上の dblclick rename 確定経路
+	// (= outliner_node.ts saveName) も他イベント待ちにならず即時ハイライト追従する (Opus WANT-1)。
 	Blockbench.on('update_selection', scheduleScan)
 	Blockbench.on('undo', scheduleScan)
 	Blockbench.on('redo', scheduleScan)
@@ -681,8 +755,20 @@ let lastGraphFingerprint = ''
 let inhibitTick = false   // applyPoseAt 由来の再描画で tick が再入するのを防ぐ
 
 function isSpringGroup(group: unknown): boolean {
-	const name = (group as { name?: unknown } | null)?.name
-	return typeof name === 'string' && name.startsWith(BONE_NAME_PREFIX)
+	// registry 加入条件 = **capable (= 'enabled' | 'disabled')** 基準。 解除済み
+	// ('disabled') の bone も registry に残す : 後続 commit の animation 単位 override で
+	// 「この animation だけ有効化」 を可能にするため、 および topology (= parentUuid /
+	// topoOrder / depth) を animation 非依存で安定させるため。
+	// 実際に物理を掛けるかどうかは isSpringActive が担う。
+	return isCapable(getSpringBoneState(group))
+}
+
+// 物理 sim (= step / apply / reset) の対象判定。 registry には capable 両方が入るが、
+// 実際に揺らすのは 'enabled' の entry のみ。 'disabled' は topology 上は残るため
+// chain 子孫の anchor / depth 解決には影響しないが、 pose は一切書かない
+// (= BB core の keyframe pose がそのまま描画される)。
+function isSpringActive(entry: BoneEntry): boolean {
+	return getSpringBoneState(entry.group) === 'enabled'
 }
 
 // outliner 上を上に辿って最寄りの spring 祖先を返す。 中間に非 spring group を
@@ -865,11 +951,14 @@ function rebuildTopoOrder(groups: unknown[]): void {
 }
 
 // chain 構造 + Property パラの fingerprint 計算 (= topology / config 変化検知用)。 uuid
-// 昇順に整列した「uuid:parentUuid:restLength:restLocalDir:drag,stiffness,gravity」 の連結。
+// 昇順に整列した「uuid:state:parentUuid:restLength:restLocalDir:drag,stiffness,gravity」 の連結。
 // 数値は小数丸めで安定化。 restLocalDir も含めることで「同長で方向だけ変わった origin 編集」
 // でも invalidate する。 drag / stiffness / gravity を含めることで、 Property 値変更が
 // 「topology 変化と同じ扱い」 で next tick に 0 replay をトリガする (= 値変更が scrub
 // を待たずに即 preview に反映される、 element_panel input の onChange と両輪で動作)。
+// state (= enabled / disabled) も含める : registry 加入条件が capable 化して以降、
+// spring 化 / 解除の toggle では entry の増減が起きないため、 state 自体を fingerprint に
+// 入れないと「step / apply 対象集合の変化」を検知できず replay が起きない。
 function computeGraphFingerprint(): string {
 	const uuids = Array.from(registry.keys()).sort()
 	return uuids
@@ -880,7 +969,7 @@ function computeGraphFingerprint(): string {
 			// 互いを打ち消し合い、 毎 tick の無駄な invalidate か stale 固着のどちらかを招く。
 			const d = e.geometry.restLocalDir
 			const b = e.base
-			return `${u}:${e.parentUuid ?? '-'}:${e.geometry.restLength.toFixed(4)}:${d.x.toFixed(3)},${d.y.toFixed(3)},${d.z.toFixed(3)}:${b.drag.toFixed(3)},${b.stiffness.toFixed(3)},${b.gravity.toFixed(3)}`
+			return `${u}:${getSpringBoneState(e.group)}:${e.parentUuid ?? '-'}:${e.geometry.restLength.toFixed(4)}:${d.x.toFixed(3)},${d.y.toFixed(3)},${d.z.toFixed(3)}:${b.drag.toFixed(3)},${b.stiffness.toFixed(3)},${b.gravity.toFixed(3)}`
 		})
 		.join('|')
 }
@@ -897,6 +986,29 @@ function rescanRegistry(): void {
 		lastGraphFingerprint = ''
 		return
 	}
+
+	// 旧方式 (= name prefix) から Property への移行。 'unset' かつ prefix 付きの group だけを
+	// 'enabled' にする (= shouldMigrate は冪等、 一度 'enabled' / 'disabled' になった group は
+	// 名前と無関係になる)。 副作用として「editor 内で `spring_` 名を新しく付けた unset の
+	// group も次の rescan で自動有効化される」 が、 これは旧 gesture の graceful
+	// degradation として仕様に含める。
+	// Undo entry は積まない : 本関数は event listener 内から走り、 undo で戻されても次の
+	// rescan で再適用されるため状態は一貫する。
+	// **書き込みが 1 件でも発生した時だけ** Project.saved = false で dirty 化する
+	// (= undo.js:93 の BB core 慣習に合わせる。 毎 rescan で dirty にすると選択操作の
+	// たびに「未保存」 表示が出るため、 変化時のみに限定)。
+	let migrated = false
+	for (const g of groups) {
+		if (!(g instanceof Group)) continue
+		if (shouldMigrate(getSpringBoneState(g), (g as { name?: unknown }).name)) {
+			;(g as { spring_bone_enabled?: unknown }).spring_bone_enabled = 'enabled'
+			migrated = true
+		}
+	}
+	if (migrated && Project) {
+		Project.saved = false
+	}
+
 	const currentUuids = new Set<string>()
 	for (const g of groups) {
 		if (isSpringGroup(g)) {
@@ -1198,7 +1310,8 @@ function stepAndApplyOrdered(dt: number): void {
 	const scratch = makeComposeScratch()
 	for (const uuid of topoOrder) {
 		const entry = registry.get(uuid)
-		if (!entry) continue
+		// 'disabled' の entry は topology には残るが物理は掛けない (= isSpringActive 参照)
+		if (!entry || !isSpringActive(entry)) continue
 		composeSpringPose(entry, dt, true, scratch)
 	}
 }
@@ -1212,7 +1325,7 @@ function applyOnlyOrdered(): void {
 	const scratch = makeComposeScratch()
 	for (const uuid of topoOrder) {
 		const entry = registry.get(uuid)
-		if (!entry || !entry.state.initialized) continue
+		if (!entry || !entry.state.initialized || !isSpringActive(entry)) continue
 		composeSpringPose(entry, 0, false, scratch)
 	}
 }
@@ -1227,7 +1340,9 @@ function resetAllToRest(): void {
 	const parentQuat = new THREE.Quaternion()
 	for (const uuid of topoOrder) {
 		const entry = registry.get(uuid)
-		if (!entry) continue
+		// 'disabled' の state は reset しない (= step / apply の対象外なので値を使われず、
+		// 再有効化時は fingerprint 変化経由の replay で必ず reset される)。
+		if (!entry || !isSpringActive(entry)) continue
 		const mesh = entry.group?.mesh
 		const meshParent = mesh?.parent
 		if (!mesh || !meshParent) continue
@@ -1494,18 +1609,21 @@ Plugin.register(PLUGIN_ID, {
 	version: PLUGIN_VERSION,
 	onload() {
 		console.log(`[${PLUGIN_ID}] loaded v${PLUGIN_VERSION}`)
-		// Property 3 個 (= spring_drag / spring_stiffness / spring_gravity) を Group に register。
-		// element_panel input (= 数値 + NumSlider) が edit モードで自動生成される。
+		// Property 4 個 (= spring_drag / spring_stiffness / spring_gravity + enum
+		// `spring_bone_enabled`) を Group に register。 数値 Property の element_panel
+		// input (= 数値 + NumSlider) が edit モードで自動生成される。
 		// tick loop は Property が生えている前提で config 値を読むため、 Property 登録が先。
 		registerProperties()
 		cleanups.push(installTickLoop())
 		// animate モード用の専用 Panel を register (= edit モードは element_panel input に任せる)。
 		// 値変更時は onSpringPropertyChange 経由で registry sync + fingerprint invalidate される。
-		cleanups.push(registerSpringPanel(onSpringPropertyChange))
-		// Group 右クリ context menu に「Spring 化 / 解除」 の rename sugar action を追加。
-		// gesture (= 唯一の truth) は依然 name prefix 「spring_」 の付け外し。
+		// spring 化判定の述語 (= isSpringGroup) はこちらから注入し、 判定元を本 module に一元化する。
+		cleanups.push(registerSpringPanel(onSpringPropertyChange, isSpringGroup))
+		// Group 右クリ context menu に「Spring 化 / 解除」 の Property toggle action を追加。
+		// gesture (= 唯一の truth) は Group Property `spring_bone_enabled` の書き換えで、
+		// 名前は一切変更しない。
 		registerContextMenuActions()
-		// Outliner 上で spring_ prefix group を視覚的に区別する軽量マーカーを install。
+		// Outliner 上で capable な spring group を視覚的に区別する軽量マーカーを install。
 		cleanups.push(registerOutlinerMarker())
 	},
 	onunload() {
