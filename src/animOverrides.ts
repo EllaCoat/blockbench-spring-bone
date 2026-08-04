@@ -91,18 +91,24 @@ export function clearOverrideField(
 // override 変更を検知して replay を起こすための決定的な fingerprint。
 // 対象は uuids に含まれる uuid のみ (= 関係ない bone の変更では replay しない)。
 // uuid と entry 内 key の両方を昇順に並べるため、 map の key 挿入順には依存しない。
-// 数値は JSON.stringify でそのまま文字列化する : toFixed 等で丸めると
-// 0.0500001 → 0.05 のような細かい値変更で fingerprint が変わらず、
-// replay がトリガされなくなるため。
+// **sorted な [key, value] tuple 全体を JSON.stringify する** : 未 escape の
+// `key=value` カンマ連結だと、 保持対象の未知 key (= 前方互換でそのまま保持する key)
+// に `=` や `,` が含まれる場合に衝突し得る (= {a: null, b: null} と {'a=null,b': null}
+// が同じ文字列になり、 将来 field の変更を見逃す)。 JSON.stringify なら key 文字列も
+// escape されるため衝突しない。 数値は JSON.stringify でそのまま文字列化する :
+// toFixed 等で丸めると 0.0500001 → 0.05 のような細かい値変更で fingerprint が
+// 変わらず、 replay がトリガされなくなるため。
 export function overridesFingerprint(map: SpringOverrideMap, uuids: readonly string[]): string {
-	const parts: string[] = []
+	const parts: Array<[string, Array<[string, unknown]>]> = []
 	for (const uuid of [...new Set(uuids)].sort()) {
 		const entry = map[uuid]
 		if (entry === undefined) continue
 		const keys = Object.keys(entry).sort()
 		if (keys.length === 0) continue
-		const fields = keys.map((key) => `${key}=${JSON.stringify((entry as Record<string, unknown>)[key])}`)
-		parts.push(`${uuid}:${fields.join(',')}`)
+		const fields = keys.map(
+			(key): [string, unknown] => [key, (entry as Record<string, unknown>)[key]],
+		)
+		parts.push([uuid, fields])
 	}
-	return parts.join('|')
+	return JSON.stringify(parts)
 }

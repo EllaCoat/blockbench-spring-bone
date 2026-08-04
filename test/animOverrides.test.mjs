@@ -175,3 +175,12 @@ test('overridesFingerprint: 数値を丸めない (= 0.0500001 と 0.05 は別�
 	const b = overridesFingerprint({ bone1: { drag: 0.05 } }, ['bone1'])
 	assert.notEqual(a, b)
 })
+
+test('overridesFingerprint: `=` や `,` を含む未知 key で衝突しない', () => {
+	// 旧実装 (= 未 escape の `key=value` カンマ連結) では下記 2 つの entry が同じ
+	// fingerprint 文字列になり、 将来 schema 拡張で保持された未知 key の変更を
+	// 見逃し得た。 JSON.stringify 化で key 文字列も escape されることを固定する
+	const a = overridesFingerprint({ bone1: { a: null, b: null } }, ['bone1'])
+	const b = overridesFingerprint({ bone1: { 'a=null,b': null } }, ['bone1'])
+	assert.notEqual(a, b)
+})
