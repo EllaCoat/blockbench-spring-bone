@@ -18,6 +18,7 @@ import { createState, resetState, step, type SpringConfig, type SpringState } fr
 import { SpringRuntime, type SpringRuntimeOps, type AnimationContext } from './springRuntime'
 import { makeExportAnimationContext, type PreviewAnimationContext } from './animationContext'
 import { createExportGate } from './exportGate'
+import { createPreviewSession } from './previewSession'
 import { isCapable, resolveEffective, resolveEnabled, shouldMigrate, toSpringBoneState, type SpringBoneState } from './springConfig'
 import {
 	ANIM_OVERRIDES_KEY,
@@ -1696,51 +1697,21 @@ const previewOps: SpringRuntimeOps<PreviewAnimationContext, AnimatorPoseSnapshot
 }
 const runtime = new SpringRuntime<PreviewAnimationContext, AnimatorPoseSnapshot>(previewOps)
 
-// 現在の session が張られた時の animationStack / animation。 ensurePreviewSession が
-// identity 比較で張り直し要否を判定する。 previewSessionStack === null = session 未開始
-// or invalidate 済み (= 次 tick で begin し直す)。
-let previewSessionStack: readonly any[] | null = null
-let previewSessionAnimation: any = null
+// session の張り直し判定と invalidate は previewSession.ts に集約する。 ここには
+// 「BB / runtime 側の値を ops へ繋ぐ」 だけを置く。
+const previewSession = createPreviewSession<PreviewAnimationContext>({
+	// **getter で委譲する** : 値をコピーすると gate の状態変化が反映されない。
+	get isExportActive(): boolean { return exportGate.isExportActive },
+	getAnimation: (context) => context.animation,
+	getStack: (context) => context.animationStack,
+	endAnimation: () => { runtime.endAnimation() },
+	beginAnimation: (context) => { runtime.beginAnimation(context, applyPoseAt) },
+})
 
-// 現 session と新 context を比較し、 違う場合だけ session を張り直す。
-// 同一判定は **両方** の一致を要求する :
-// - animationStack の要素 identity 列 (===)
-// - animation の === (= stack 中身が同じ [A] でも animation: null → A 遷移を検出する。
-//   Phase β の per-animation パラメータ解決で context.animation が resolver の入力になるため)
-// 同じなら何もしない (= step cache を維持して cache advance 経路を生かす)。
-function ensurePreviewSession(context: PreviewAnimationContext): void {
-	const current = previewSessionStack
-	const next = context.animationStack
-	const same = current !== null &&
-		previewSessionAnimation === context.animation &&
-		current.length === next.length &&
-		current.every((a, i) => a === next[i])
-	if (same) return
-	runtime.endAnimation()
-	runtime.beginAnimation(context, applyPoseAt)
-	previewSessionStack = next
-	previewSessionAnimation = context.animation
-}
-
-// preview session の invalidate 唯一の口。 全 invalidate 経路 (= Property 変更 / topology 変化 /
-// keyframe edit / undo / mode 切替 / cleanup) はここに集約する。
-// previewSessionStack を null にすることで、 ensurePreviewSession が次回必ず begin し直す
-// (= runtime の step cache も endAnimation で破棄される = 次回は必ず 0 replay)。
-//
-// **export 中は丸ごと no-op にする** : runtime は preview と共用なので、 ここで
-// runtime.endAnimation() を通すと進行中の export session が壊れ、 次の onPose が
-// applyWithoutAdvance の「session not started」 で throw する。 listener 側で経路を
-// 列挙して塞ぐ形は漏れる (= finished_edit / project 切替 / mode 切替 / undo / Property 変更
-// も invalidate 経路) ため、 **唯一の口であるここ 1 箇所で止める**。 export 中の preview
-// invalidate はそもそも不要 : export 終了時に driver の onEndRendering が
-// invalidatePreview() を必ず呼ぶ (= その時点では既に resumeTick 済みで exportActive は
-// false なので、 この guard には引っかからない)。
-function invalidatePreviewSession(): void {
-	if (exportGate.isExportActive) return
-	previewSessionStack = null
-	previewSessionAnimation = null
-	runtime.endAnimation()
-}
+// 呼び出し側から見た口は従来どおりこの 2 関数 (= invalidate は 14 箇所から呼ばれる)。
+// **判定を足さないこと** : 判定は previewSession.ts 側に置く。
+function ensurePreviewSession(context: PreviewAnimationContext): void { previewSession.ensure(context) }
+function invalidatePreviewSession(): void { previewSession.invalidate() }
 
 function tick(): void {
 	// exportActive 中は preview session を張らない : 張ると runtime.evaluateSample が走り、
