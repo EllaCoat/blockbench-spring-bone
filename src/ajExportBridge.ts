@@ -88,6 +88,39 @@ export function createExportDriver<C>(host: ExportDriverHost<C>): ExportDriver {
 	// 失敗した場合は false のままで、 以降の onPose は no-op になる。
 	let animationActive = false
 
+	// export session の後始末 (= onEndRendering の本体)。 **冪等** : 非 active なら no-op。
+	// onEndRendering と、 契約違反の二重 onBeginRendering の両方から呼ぶ。
+	// 例外経路からも呼ばれるため、 途中で throw しても残りの後始末を必ず通す
+	// (= tick を止めたまま復帰しない状態を作らない)。 伝播させるのは最初の例外だけで、
+	// 2 件目以降は警告に落とす (= springRuntime.ts の pendingError 経路と同じ方針)。
+	const finishRendering = (): void => {
+		// 先に flag を倒すことで、 後始末中に再入しても二度走らない
+		if (!renderingActive) return
+		renderingActive = false
+		animationActive = false
+		let pendingError: unknown = null
+		let hasPendingError = false
+		const runCleanup = (label: string, cleanup: () => void): void => {
+			try {
+				cleanup()
+			} catch (e) {
+				if (!hasPendingError) {
+					pendingError = e
+					hasPendingError = true
+				} else {
+					console.warn(`[spring_bone] export driver cleanup failed (${label}) while another error was pending`, e)
+				}
+			}
+		}
+		// onBeginRendering で立てた状態を必ず戻す : runtime の session を破棄 →
+		// tick 再開 → preview session を畳む (= export 中の物理 state を preview へ
+		// 持ち越さず、 次 tick で 0 replay させる)。
+		runCleanup('endAnimation', () => host.endAnimation())
+		runCleanup('resumeTick', () => host.resumeTick())
+		runCleanup('invalidatePreview', () => host.invalidatePreview())
+		if (hasPendingError) throw pendingError
+	}
+
 	return {
 		get isRenderingActive(): boolean {
 			return renderingActive
@@ -98,9 +131,12 @@ export function createExportDriver<C>(host: ExportDriverHost<C>): ExportDriver {
 		},
 
 		onBeginRendering(): void {
-			// 前回の session が例外で end を受け取れなかった場合に備えて、 判定前に落とす
-			renderingActive = false
-			animationActive = false
+			// **判定より先に前 session を畳む** : 契約違反で onBeginRendering が二重に届き、
+			// かつ 2 回目の isEnabled() が false だと、 flag を落とすだけでは
+			// 「1 回目の suspendTick が解除されないまま以降の onEndRendering が no-op」 に
+			// なり、 呼び出し側の tick が永久に止まる。 finishRendering は冪等なので
+			// 通常の 1 回目では no-op。
+			finishRendering()
 			if (!host.isEnabled()) return
 			// preview session を先に畳んでから tick を止める。 逆順だと preview session が
 			// 生きたまま止まり、 export 後の resume で stale な state から再開する。
@@ -149,36 +185,10 @@ export function createExportDriver<C>(host: ExportDriverHost<C>): ExportDriver {
 			host.endAnimation()
 		},
 
+		// 何度呼ばれても安全 (= 2 回目以降は no-op)。 呼び出し側の unload 時に
+		// 「driver を非 active にする」 目的で直接呼んでもよい。
 		onEndRendering(): void {
-			// 何度呼ばれても安全にする (= 2 回目以降は no-op)。 先に flag を倒すことで、
-			// 後始末中に再入しても二度走らない。
-			if (!renderingActive) return
-			renderingActive = false
-			animationActive = false
-			// ここは例外経路からも呼ばれる。 途中で throw しても残りの後始末を必ず通す
-			// (= tick を止めたまま復帰しない状態を作らない)。 伝播させるのは最初の例外だけで、
-			// 2 件目以降は警告に落とす (= springRuntime.ts の pendingError 経路と同じ方針)。
-			let pendingError: unknown = null
-			let hasPendingError = false
-			const runCleanup = (label: string, cleanup: () => void): void => {
-				try {
-					cleanup()
-				} catch (e) {
-					if (!hasPendingError) {
-						pendingError = e
-						hasPendingError = true
-					} else {
-						console.warn(`[spring_bone] export driver cleanup failed (${label}) while another error was pending`, e)
-					}
-				}
-			}
-			// onBeginRendering で立てた状態を必ず戻す : runtime の session を破棄 →
-			// tick 再開 → preview session を畳む (= export 中の物理 state を preview へ
-			// 持ち越さず、 次 tick で 0 replay させる)。
-			runCleanup('endAnimation', () => host.endAnimation())
-			runCleanup('resumeTick', () => host.resumeTick())
-			runCleanup('invalidatePreview', () => host.invalidatePreview())
-			if (hasPendingError) throw pendingError
+			finishRendering()
 		},
 	}
 }

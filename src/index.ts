@@ -786,10 +786,10 @@ function unregisterContextMenuActions(): void {
 	registeredMenuEntries = []
 }
 
-// 別軸 B : Outliner 上の capable (= enabled / disabled) group を視覚的に区別する軽量マーカー。
+// 別軸 B : Outliner 上で Group Property が 'enabled' の group を視覚的に区別する軽量マーカー。
 // - <style> で `.outliner_object.spring-bone-marker` に淡い teal 色を付与
 // - BB Outliner (= outliner.js:1187) は Vue で描画、 行要素 `li.outliner_node` の
-//   id 属性に node の uuid が入る。 capable な group の uuid 集合を作り、 uuid から
+//   id 属性に node の uuid が入る。 'enabled' な group の uuid 集合を作り、 uuid から
 //   行要素を引いて内側の `.outliner_object` に class を付け外しする (= 表示名は読まない。
 //   v-model バインドの input value 経由だと rename 途中の DOM 反映タイミングに依存するため)。
 // - 副作用ゼロ (= class 追加のみ、 group 内部データは触らない)、 unload で完全クリーンアップ。
@@ -797,12 +797,14 @@ const OUTLINER_MARKER_CLASS = 'spring-bone-marker'
 const OUTLINER_MARKER_STYLE_ID = 'spring-bone-outliner-marker-style'
 
 function scanOutlinerMarkers(): void {
-	// **'enabled' の group だけ**の uuid 集合を作る。 Project 未取得 (= 起動直後等) は
-	// 空集合 = 全マーカー剥がしで安全側に倒す。
-	// registry の加入条件 (= isSpringGroup / isCapable) とは **別基準**にしている :
-	// registry は 'disabled' も保持する (= animation 単位 override で再有効化できるように
-	// するため) が、 marker は「今この bone に spring が効くか」 を示すものなので、
-	// Spring 解除した bone に色が残ると「解除できていない」 ように見える。
+	// **Group Property が 'enabled' の group だけ**の uuid 集合を作る。 Project 未取得
+	// (= 起動直後等) は空集合 = 全マーカー剥がしで安全側に倒す。
+	// 判定基準は **Group Property の値のみ**で確定 : registry の加入条件 (= isSpringGroup /
+	// isCapable、 'disabled' も保持する) とは別基準にし、 Spring 解除した bone に色が残って
+	// 「解除できていない」 ように見えるのを避ける。
+	// **選択中 animation の override は意図的に見ない** : animation を切り替えるたびに
+	// outliner の色が変わると、 marker が示す rig の構造情報としての意味が失われるため
+	// (= 確定仕様。 「override も反映すべき」 の方向へは変更しない)。
 	const enabledUuids = new Set<string>()
 	const groups = (Project as { groups?: unknown[] } | null)?.groups
 	if (Array.isArray(groups)) {
@@ -1755,7 +1757,17 @@ function ensurePreviewSession(context: PreviewAnimationContext): void {
 // keyframe edit / undo / mode 切替 / cleanup) はここに集約する。
 // previewSessionStack を null にすることで、 ensurePreviewSession が次回必ず begin し直す
 // (= runtime の step cache も endAnimation で破棄される = 次回は必ず 0 replay)。
+//
+// **export 中は丸ごと no-op にする** : runtime は preview と共用なので、 ここで
+// runtime.endAnimation() を通すと進行中の export session が壊れ、 次の onPose が
+// applyWithoutAdvance の「session not started」 で throw する。 listener 側で経路を
+// 列挙して塞ぐ形は漏れる (= finished_edit / project 切替 / mode 切替 / undo / Property 変更
+// も invalidate 経路) ため、 **唯一の口であるここ 1 箇所で止める**。 export 中の preview
+// invalidate はそもそも不要 : export 終了時に driver の onEndRendering が
+// invalidatePreview() を必ず呼ぶ (= その時点では既に resumeTick 済みで exportActive は
+// false なので、 この guard には引っかからない)。
 function invalidatePreviewSession(): void {
+	if (exportActive) return
 	previewSessionStack = null
 	previewSessionAnimation = null
 	runtime.endAnimation()
@@ -1792,6 +1804,10 @@ function tick(): void {
 let cleanups: Array<() => void> = []
 
 function installTickLoop(): () => void {
+	// **rescanRegistry / invalidatePreviewSession より前に倒す** : invalidatePreviewSession は
+	// exportActive 中 no-op になるため、 後に倒すと install 時の session 破棄が空振りする
+	// (= export 中に plugin reload が挟まった場合に「止まったまま」 で復帰しない)。
+	exportActive = false
 	rescanRegistry()
 	invalidatePreviewSession()
 	inhibitTick = false
@@ -1802,9 +1818,6 @@ function installTickLoop(): () => void {
 	lastSessionFingerprint = ''
 	overridesMemo = null
 	warnedNewerSchemaUuids.clear()
-	// export 中に plugin reload が挟まった場合に「止まったまま」 で復帰しないよう、
-	// install 時点で必ず preview 側へ主導権を戻す。
-	exportActive = false
 
 	// animation pose 由来の cache invalidation は BB event / Undo transaction を境界にする案 A を採用。
 	// 案 B (= keyframe 全値を fingerprint 化) は display frame ごとの走査と BB 内部構造への依存が増え、
@@ -1858,10 +1871,10 @@ function installTickLoop(): () => void {
 	const onAnimFrame = (): void => {
 		// **export 中は listener 本体ごと止める** (= tick() 冒頭の guard だけでは足りない)。
 		// AJ は frame ごとに updatePreview を走らせ、 その中の Animator.preview() が
-		// display_animation_frame を **同期発火** する (= animation_mode.js:454)。 guard が
-		// 無いと invalidatePreviewSession() で export session が破棄され、 さらに
-		// invalidateAnimationCache() が Animator.preview() を呼んで AJ の frame ループへ
-		// 再入する。
+		// display_animation_frame を **同期発火** する (= animation_mode.js:454)。 session
+		// 破棄自体は invalidatePreviewSession 側の guard で止まるが、 それだけだと
+		// invalidateAnimationCache() が Animator.preview() を呼び返し、 AJ の frame ループへ
+		// 再入する経路が残る。
 		if (exportActive) return
 		try {
 			// keyframe edit transaction 中は値が preview ごとに変わり得るため、各 frame を 0 replay。
@@ -1887,7 +1900,7 @@ function installTickLoop(): () => void {
 	const onSelectAnimation = (): void => {
 		// AJ は animation ごとに Animation.select() を呼び、 その末尾で select_animation を
 		// dispatch する (= animation.js:256)。 guard しないと invalidateAnimationCache() が
-		// export session を破棄した上で Animator.preview() を呼ぶ。
+		// Animator.preview() を呼び、 export の最中に BB 側の preview が割り込む。
 		// なお onAnimFrame 側の guard も別途必要 : Animator.preview() は select_animation の
 		// dispatch **より前** に Animation.select() 内から呼ばれる (= animation.js:246)。
 		if (exportActive) return
@@ -1948,10 +1961,11 @@ function installTickLoop(): () => void {
 		// export 中は registry を作り直さない : Animation.select() → unselectAllElements() が
 		// TickUpdates.selection を立て (= misc.js:256)、 AJ の render loop が
 		// await sleepForAnimationFrame() で main loop に制御を返した時点で updateSelection()
-		// が update_selection を dispatch する (= misc.js:235)。 rescan 自体は idempotent だが、
-		// 末尾の graph fingerprint 判定が変化を拾うと invalidatePreviewSession() =
-		// runtime.endAnimation() が走り、 進行中の **export session** ごと破棄される
-		// (= runtime は preview / export で共用)。
+		// が update_selection を dispatch する (= misc.js:235)。 session 破棄自体は
+		// invalidatePreviewSession 側の guard で止まるが、 rescan は registry / topoOrder /
+		// entry.base を **その場で差し替える** ため、 進行中の export が参照している
+		// entry 集合を frame の途中で入れ替えてしまう。 rig は export 中に変化しないので、
+		// ここは丸ごと後回しにして問題ない (= export 後の update_selection で拾い直す)。
 		if (exportActive) return
 		// idempotent rescan で既存 entry の state は保持、 session もそのまま (= 物理継続)。
 		rescanRegistry()
@@ -2062,7 +2076,15 @@ const exportDriverHost: ExportDriverHost<PreviewAnimationContext> = {
 function installAjExportDriver(): () => void {
 	if (!ENABLE_AJ_EXPORT) return (): void => {}
 	const driver = createExportDriver(exportDriverHost)
-	let registered = false
+	// 登録先 registry の identity を保持する。 **AJ を単独 reload すると
+	// window.AnimatedJava.renderHooks が新しい object に差し替わり、 内部の登録 Map ごと
+	// 作り直される** ため、 旧 registry に居る driver は以後無言で呼ばれなくなる。 参照比較なら
+	// 「後から load された」 と「reload された」 を同じ経路で拾える。
+	// registeredApi = 実際に登録できた registry (= cleanup の unregister 先)。
+	// attemptedApi = 成否によらず register を試した registry (= 同じ相手への再試行を避ける。
+	// 失敗は id 重複が主因で、 再試行しても同じ結果になり warn だけが溜まる)。
+	let registeredApi: AjRenderHooksApi | null = null
+	let attemptedApi: AjRenderHooksApi | null = null
 	let retryListener: ((...args: unknown[]) => void) | null = null
 
 	const detachRetry = (): void => {
@@ -2071,45 +2093,51 @@ function installAjExportDriver(): () => void {
 		retryListener = null
 	}
 
-	// 戻り値 = 「もう再試行しなくてよいか」。 API が生えていない間だけ false を返す
-	// (= register が throw した場合は再試行しても同じ結果なので true に倒す)。
-	const tryRegister = (): boolean => {
+	// 現在の API を見て、 未登録 or 別 object に差し替わっていたら登録し直す。
+	const syncRegistration = (): void => {
 		const api = window?.AnimatedJava?.renderHooks
-		if (!api || api.version !== 1 || typeof api.register !== 'function') return false
+		if (!api || api.version !== 1 || typeof api.register !== 'function') return
+		if (api === attemptedApi) return
+		attemptedApi = api
 		try {
 			api.register(PLUGIN_ID, driver)
-			registered = true
+			registeredApi = api
 			console.log(`[${PLUGIN_ID}] AnimatedJava export driver registered`)
 		} catch (e) {
 			console.warn(`[${PLUGIN_ID}] AnimatedJava export driver registration failed`, e)
 		}
-		return true
 	}
 
 	// AJ は module 評価時に window.AnimatedJava を代入し (= AJ src/index.ts)、 loaded_plugin は
-	// plugin register 後に発火する (= plugin_loader.ts:391)。 我々が先に load された場合でも
-	// この経路で確実に捕まる。 決着したら listener を外す (= 以降の plugin load で無駄に走らせない)。
-	// **除去は dispatch 中に行わない** : BB の dispatchEvent は listener 配列を for...of で
-	// 走査するため (= js/util/event_system.ts:15)、 自分を remove すると配列が詰まって次の
-	// listener が 1 個読み飛ばされる。 settled flag で二重登録を止め、 実際の除去は rAF
-	// (= dispatch 外) に逃がす。 rAF の id は保持しない : cleanup 後に走っても detachRetry は
-	// retryListener === null で no-op になるため。
-	let settled = false
-	if (!tryRegister()) {
-		retryListener = (): void => {
-			if (settled || !tryRegister()) return
-			settled = true
-			requestAnimationFrame(() => detachRetry())
-		}
-		Blockbench.on('loaded_plugin', retryListener)
-	}
+	// plugin register 後に発火する (= plugin_loader.ts:391、 reload 経路も
+	// loadFromFile → Plugin.register → runOnLoad で同じ event を通る)。 我々が先に load された
+	// 場合も AJ が reload された場合も、 この listener が identity 比較で拾い直す。
+	// **listener は unload まで外さない** : 外すと reload 検知ができなくなる。 dispatch 中に
+	// 自分を remove しない形になるので、 BB の dispatchEvent が listener 配列を for...of で
+	// 走査する件 (= js/util/event_system.ts:15) にも触れない。
+	syncRegistration()
+	retryListener = (): void => { syncRegistration() }
+	Blockbench.on('loaded_plugin', retryListener)
 
 	return (): void => {
 		detachRetry()
-		if (!registered) return
-		registered = false
+		// **unregister より先に driver を畳む** : AJ は beginRenderingSession の時点で
+		// participant を snapshot するため、 export 進行中に unregister しても残りの hook は
+		// 旧 driver へ届き続ける。 一方 cleanups の実行順 (= tick loop → panel → marker →
+		// driver) の都合で、 この時点では registry.clear() が済んでいる。 driver を非 active に
+		// しておかないと、 残りの onPose が壊れた state の上で走る。
+		// onEndRendering は冪等なので、 export 中でなければ no-op。
 		try {
-			window?.AnimatedJava?.renderHooks?.unregister?.(PLUGIN_ID)
+			driver.onEndRendering()
+		} catch (e) {
+			console.warn(`[${PLUGIN_ID}] AnimatedJava export driver shutdown failed`, e)
+		}
+		attemptedApi = null
+		const api = registeredApi
+		if (api === null) return
+		registeredApi = null
+		try {
+			api.unregister?.(PLUGIN_ID)
 		} catch (e) {
 			console.warn(`[${PLUGIN_ID}] AnimatedJava export driver unregistration failed`, e)
 		}
@@ -2148,7 +2176,7 @@ Plugin.register(PLUGIN_ID, {
 		// gesture (= 唯一の truth) は Group Property `spring_bone_enabled` の書き換えで、
 		// 名前は一切変更しない。
 		registerContextMenuActions()
-		// Outliner 上で capable な spring group を視覚的に区別する軽量マーカーを install。
+		// Outliner 上で Property が 'enabled' の spring group を視覚的に区別する軽量マーカーを install。
 		cleanups.push(registerOutlinerMarker())
 		// AnimatedJava の datapack export へ物理を注入する driver を登録する。 AJ 不在でも
 		// 失敗せず、 後から AJ が load された場合は loaded_plugin 経由で再試行する。
