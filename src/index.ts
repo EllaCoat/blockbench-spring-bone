@@ -16,7 +16,8 @@
 
 import { createState, resetState, step, type SpringConfig, type SpringState } from './springSim'
 import { SpringRuntime, type SpringRuntimeOps, type AnimationContext } from './springRuntime'
-import { isCapable, shouldMigrate, toSpringBoneState, type SpringBoneState } from './springConfig'
+import { isCapable, resolveEffective, resolveEnabled, shouldMigrate, toSpringBoneState, type SpringBoneState } from './springConfig'
+import { normalizeOverrides, overridesFingerprint, type SpringOverrideMap } from './animOverrides'
 import { registerSpringPanel } from './ui'
 
 declare const Plugin: { register(id: string, opts: Record<string, unknown>): void }
@@ -79,6 +80,15 @@ type SpringPropertyKey = (typeof PROPERTY_KEYS)[number]
 const SPRING_ENABLED_KEY = 'spring_bone_enabled'
 const SPRING_ENABLED_VALUES = ['unset', 'enabled', 'disabled'] as const
 
+// animation 単位 override の schema version。 override map の構造を変える時に上げる。
+// 読み込み側 (= readOverrides) は自分より新しい version の override を解釈できないため
+// 無視して Group 既定値へ fallback する (= raw データ自体は保持し、 新しい version の
+// plugin で開き直せば復活する)。
+const SPRING_SCHEMA_VERSION = 1
+// Animation に登録する Property key。 register / unregister / backfill / read で共有する。
+const ANIM_OVERRIDES_KEY = 'spring_bone_overrides'
+const ANIM_SCHEMA_VERSION_KEY = 'spring_bone_schema_version'
+
 // Group instance に自動で生える Property 値を読む helper。 Property が未定義
 // or 未 register or NaN の場合は fallback を返す (= DEFAULT_CONFIG 値)。
 function readSpringProp(group: unknown, key: SpringPropertyKey, fallback: number): number {
@@ -111,6 +121,53 @@ function resolveConfig(
 		stiffness: readSpringProp(entry.group, 'spring_stiffness', DEFAULT_CONFIG.stiffness),
 		gravity: readSpringProp(entry.group, 'spring_gravity', DEFAULT_CONFIG.gravity),
 	}
+}
+
+// --- animation 単位 override の読み取り口 ---
+
+// readOverrides の 1 件 memo。 この関数は previewOps.resolveConfigs と
+// hasActiveSpringEntry (= session fingerprint 経由) から毎 tick 呼ばれるため、
+// 毎回 normalizeOverrides を走らせると object 生成が積む。 UI 側 (= setOverrideField) は
+// 必ず新しい map object を代入する契約なので、 「animation instance が同一」 かつ
+// 「raw の object identity が同一」 なら前回結果を再利用できる (= BB の Undo / merge 経路も
+// structuredClone / normalize で必ず新しい object を入れるため、 値が変われば identity も
+// 変わる)。 project 切替 / cleanup でクリアする (= 旧 project の instance 参照を握り続けない)。
+let overridesMemo: { animation: any; raw: unknown; map: SpringOverrideMap } | null = null
+
+// schema version が新しすぎて override を無視した旨を警告済みの animation uuid。
+// readOverrides は毎 tick 呼ばれるため、 同一 animation への警告は 1 回だけに絞る。
+const warnedNewerSchemaUuids = new Set<string>()
+
+// animation の override map を読む唯一の口。 normalizeOverrides を通して返すため、
+// 返却値は既知項目が検証済み (= 壊れた値は drop) の null-prototype map。
+// - animation が null / undefined → 空 map
+// - spring_bone_schema_version が SPRING_SCHEMA_VERSION より大きい → 未知構造の
+//   override を解釈して壊さないよう無視して空 map を返す (= Group 既定値へ fallback)。
+//   raw データ自体は書き換えない。 警告は animation ごとに 1 回だけ
+function readOverrides(animation: any): SpringOverrideMap {
+	const raw = animation?.[ANIM_OVERRIDES_KEY]
+	if (overridesMemo && overridesMemo.animation === animation && overridesMemo.raw === raw) {
+		return overridesMemo.map
+	}
+	let map: SpringOverrideMap
+	const version = animation?.[ANIM_SCHEMA_VERSION_KEY]
+	if (
+		animation && typeof animation === 'object' &&
+		typeof version === 'number' && Number.isFinite(version) && version > SPRING_SCHEMA_VERSION
+	) {
+		const uuid = typeof animation.uuid === 'string' ? animation.uuid : null
+		if (uuid === null || !warnedNewerSchemaUuids.has(uuid)) {
+			if (uuid !== null) warnedNewerSchemaUuids.add(uuid)
+			console.warn(
+				`[${PLUGIN_ID}] animation "${animation.name ?? uuid ?? '?'}" has newer ${ANIM_SCHEMA_VERSION_KEY} (${version} > ${SPRING_SCHEMA_VERSION}), ignoring spring bone overrides`,
+			)
+		}
+		map = normalizeOverrides(undefined)
+	} else {
+		map = normalizeOverrides(raw)
+	}
+	overridesMemo = { animation, raw, map }
+	return map
 }
 
 // Property 変更時の同期 hook。 element_panel input の onChange から呼ばれる。
@@ -220,6 +277,18 @@ function registerProperties(): void {
 		}
 	}
 
+	// object 型 Property (= spring_bone_overrides) 用の merge patch。
+	// BB 標準の object merge (= property.ts:188-192) は structuredClone してそのまま入れる
+	// だけで中身を検証しないため、 こちらでは normalizeOverrides を通して既知項目の妥当性を
+	// 検証する (= 壊れた項目だけを drop し、 未知 key は前方互換のため保持)。
+	// data[key] === undefined は skip (= 部分更新の extend で override が巻き戻らないようにする)。
+	const patchMergeObject = (prop: any, key: string): void => {
+		prop.merge = function (instance: any, data: any) {
+			if (data?.[key] === undefined) return
+			instance[key] = normalizeOverrides(data[key])
+		}
+	}
+
 	const drag_prop = new Property(Group, 'number', 'spring_drag', makeConfig('Spring drag', DEFAULT_CONFIG.drag, 0, 1, 0.01))
 	const stiffness_prop = new Property(Group, 'number', 'spring_stiffness', makeConfig('Spring stiffness', DEFAULT_CONFIG.stiffness, 0, 10, 0.1))
 	const gravity_prop = new Property(Group, 'number', 'spring_gravity', makeConfig('Spring gravity', DEFAULT_CONFIG.gravity, 0, 100, 1))
@@ -248,6 +317,48 @@ function registerProperties(): void {
 	patchMerge(gravity_prop, 'spring_gravity')
 	patchMerge(enabled_prop, SPRING_ENABLED_KEY, SPRING_ENABLED_VALUES)
 
+	// --- Animation Property (= animation ごとの override) ---
+	// **condition は付けない** (Group の enum Property と同じ理由) : BB の Property.copy は
+	// condition が false のとき key を丸ごと落とす (= property.ts:200) ため、 付けると
+	// Undo の before/after copy で key が欠落し、 「override を全部消す → Redo」 で after 側に
+	// key が無く merge が skip され、 消したはずの override が復活する (= PR-A で Group の
+	// enum Property に condition を付けて踏んだ致命バグと同型)。
+	// 代償として無関係な project の全 animation に `{}` と `1` が serialize されるが、
+	// blueprint のサイズ微増のみで許容する。
+	// element_panel input は付けない (= 値編集は後続 commit の専用 UI が担う)。
+	// object default は BB の getDefault が instance ごとに複製する (= property.ts:156-158)
+	// ため、 全 animation で default object を共有することはない。
+	if (typeof Animation === 'function') {
+		const overrides_prop = new Property(Animation, 'object', ANIM_OVERRIDES_KEY, {
+			default: {},
+		})
+		const version_prop = new Property(Animation, 'number', ANIM_SCHEMA_VERSION_KEY, {
+			default: SPRING_SCHEMA_VERSION,
+		})
+		patchMergeObject(overrides_prop, ANIM_OVERRIDES_KEY)
+		patchMerge(version_prop, ANIM_SCHEMA_VERSION_KEY)
+
+		// **登録前から存在する Animation instance への backfill** (= Group 側と同じ理由 :
+		// Property の default は新規 instance の constructor でしか入らないため、 plugin を
+		// 後から有効化した場合の既存 Animation には値が無いまま)。
+		// Animation.all が取れない (= Project 未オープン) 場合は何もしない。
+		try {
+			const all = (Animation as { all?: unknown[] }).all
+			if (Array.isArray(all)) {
+				for (const a of all) {
+					const anim = a as Record<string, unknown> | null
+					if (anim == null) continue
+					if (anim[ANIM_OVERRIDES_KEY] === undefined) anim[ANIM_OVERRIDES_KEY] = {}
+					if (anim[ANIM_SCHEMA_VERSION_KEY] === undefined) anim[ANIM_SCHEMA_VERSION_KEY] = SPRING_SCHEMA_VERSION
+				}
+			}
+		} catch (e) {
+			console.warn(`[${PLUGIN_ID}] animation property backfill failed`, e)
+		}
+	} else {
+		console.warn(`[${PLUGIN_ID}] Animation class not available, skipping animation property registration`)
+	}
+
 	// **登録前から存在する Group instance への backfill** : Property は新規 instance の
 	// constructor で Property.reset 経由の default (= 'unset') が入るが、 登録より前から
 	// 生きている instance (= plugin を後から有効化した場合の既存 Group) には値が無いまま。
@@ -275,11 +386,19 @@ function registerProperties(): void {
 // されていれば reload 時に自動で復帰する。
 function unregisterProperties(): void {
 	const props = (Group as { properties?: Record<string, unknown> } | undefined)?.properties
-	if (!props) return
-	for (const key of PROPERTY_KEYS) {
-		delete props[key]
+	if (props) {
+		for (const key of PROPERTY_KEYS) {
+			delete props[key]
+		}
+		delete props[SPRING_ENABLED_KEY]
 	}
-	delete props[SPRING_ENABLED_KEY]
+	// Animation 側 (= animation ごとの override) も同様に delete。
+	// instance 側の値は blueprint に serialize されていれば reload 時に復帰する。
+	const animProps = (Animation as { properties?: Record<string, unknown> } | undefined)?.properties
+	if (animProps) {
+		delete animProps[ANIM_OVERRIDES_KEY]
+		delete animProps[ANIM_SCHEMA_VERSION_KEY]
+	}
 }
 
 // Group 右クリ context menu に「Spring 化 / Spring 解除」 の 4 action を追加する。
@@ -746,6 +865,10 @@ interface BoneEntry {
 	// config = effective (解決済み = 出力側)。 previewOps.resolveConfigs だけが書く。
 	// springSim.step がそのまま読めるよう SpringConfig の形は維持する。
 	config: SpringConfig
+	// enabled = effective の有効判定 (= この entry に物理を掛けるか)。 これも
+	// previewOps.resolveConfigs だけが書く。 **SpringConfig 型には入れない**
+	// (= springSim が読む型を override 解決の概念で汚さないため)。
+	enabled: boolean
 	state: SpringState
 	// chain 情報。 parentUuid = 直上の spring group の uuid (= root なら null)、
 	// depth = chain root からの距離 (= root なら 0、 rebuildTopoOrder で再計算)。
@@ -763,6 +886,12 @@ let topoOrder: string[] = []
 // 変化時に invalidatePreviewSession() で次 tick の 0 replay をトリガする。 update_selection の
 // クリック保持は「構造不変 = fingerprint 不変」 のため session に影響なし。
 let lastGraphFingerprint = ''
+// session 層 fingerprint (= computeSessionFingerprint) の保持。 fp 変化の検出専用の
+// 独立変数で、 **invalidatePreviewSession() からは触らない** : 触ると 「tick で代入 →
+// 直後に invalidate でリセット」 で毎 tick invalidate になる。 他経路からの invalidate は
+// previewSessionStack === null を ensurePreviewSession が見て張り直すため整合する。
+// installTickLoop の初期化と cleanup で '' に戻す。
+let lastSessionFingerprint = ''
 let inhibitTick = false   // applyPoseAt 由来の再描画で tick が再入するのを防ぐ
 // project 切替 (= select_project / load_project) 受信から rAF コールバックでの rescan 完了
 // までの間だけ立つ flag。 遅延中は旧 project の registry / session が生きたまま残るため、
@@ -787,22 +916,30 @@ function isSpringGroup(group: unknown): boolean {
 	return isCapable(getSpringBoneState(group))
 }
 
-// 物理 sim (= step / apply / reset) の対象判定。 registry には capable 両方が入るが、
-// 実際に揺らすのは 'enabled' の entry のみ。 'disabled' は topology 上は残るため
-// chain 子孫の anchor / depth 解決には影響しないが、 pose は一切書かない
-// (= BB core の keyframe pose がそのまま描画される)。
+// 物理 sim (= step / apply) の対象判定。 解決済みの effective (= entry.enabled) を
+// 読むだけにする : Group 既定値と animation 単位 override の合成は
+// previewOps.resolveConfigs に閉じており (= effective の writer は 1 箇所)、
+// ここで再解決すると判定元が 2 箇所に分裂する。
+// **resolveConfigs 実行前に呼んではいけない** (= 前 session の解決結果 = stale)。
+// resolveConfigs より前の判定が必要な経路 (= tick 冒頭の early-return) は
+// hasActiveSpringEntry 側で context から再解決する。
 function isSpringActive(entry: BoneEntry): boolean {
-	return getSpringBoneState(entry.group) === 'enabled'
+	return entry.enabled
 }
 
-// active (= 実際に物理を掛ける 'enabled') な entry が 1 つでもあるか。 tick() の
+// active (= 実際に物理を掛ける) な entry が 1 つでもあるか。 tick() の
 // early-return 判定用。 registry.size は capable (= 'enabled' + 'disabled') の件数なので、
-// 全 entry が 'disabled' だと size > 0 のまま runtime が pose 全体を capture し、
+// 全 entry が無効だと size > 0 のまま runtime が pose 全体を capture し、
 // replay / advance のたびに Animator.stackAnimations を反復する無駄が出る。 毎 tick
 // registry を全走査するが、 entry 数は高々数十なので許容コストと判断する。
-function hasActiveSpringEntry(): boolean {
-	for (const entry of registry.values()) {
-		if (isSpringActive(entry)) return true
+// **context を引数で受けて override を再解決する** : この関数は tick() 冒頭で
+// resolveConfigs より前に呼ばれるため、 entry.enabled (= 前 session の stale 値) を
+// 読んではいけない (= animation 切替直後の初回 tick では旧 animation の解決結果が
+// 残っている)。 生の Group 状態と context の override から resolveEnabled で判定する。
+function hasActiveSpringEntry(context: PreviewAnimationContext): boolean {
+	const overrides = readOverrides(context.animation)
+	for (const [uuid, entry] of registry) {
+		if (resolveEnabled(getSpringBoneState(entry.group), overrides[uuid])) return true
 	}
 	return false
 }
@@ -921,6 +1058,10 @@ function registerGroup(group: any): void {
 			gravity: DEFAULT_CONFIG.gravity,
 			restLength,
 		},
+		// effective の初期値。 registerGroup 時点では animation 単位 override を引けない
+		// (= context 不在) ため Group 状態からの仮値で、 直後の replay 経路
+		// (= beginAnimation → resolveConfigs) で必ず解決済み値に上書きされる。
+		enabled: getSpringBoneState(group) === 'enabled',
 		state: createState(),
 		parentUuid: getSpringParentUuid(group),
 		depth: 0, // rebuildTopoOrder で再計算される
@@ -1016,6 +1157,24 @@ function computeGraphFingerprint(): string {
 			return `${u}:${getSpringBoneState(e.group)}:${e.parentUuid ?? '-'}:${JSON.stringify(e.geometry.restLength)}:${JSON.stringify(d.x)},${JSON.stringify(d.y)},${JSON.stringify(d.z)}:${JSON.stringify(b.drag)},${JSON.stringify(b.stiffness)},${JSON.stringify(b.gravity)}`
 		})
 		.join('|')
+}
+
+// session 層の fingerprint (= animation 単位 override / animation 切替の変化検知用)。
+// fingerprint は二層構造 :
+// - registry 層 = computeGraphFingerprint (= topology / Group Property)。 rescanRegistry
+//   が更新して lastGraphFingerprint に保持する
+// - session 層 = この関数 (= registry 層 + animation uuid + override map)。 tick が毎回
+//   計算して lastSessionFingerprint と比較する
+// registry 層を二層に分ける理由 : override 編集は registry (= topology / base) を変えない
+// ため registry 層では検知できない一方、 session 層は毎 tick 走るため registry 層の
+// 再計算 (= 全 entry の走査と文字列化) を毎 tick やりたくない。 lastGraphFingerprint を
+// そのまま畳み込むことで、 registry 層の変化 (= rescan で更新済み) も session 層の
+// 差分として自然に検知される。 override の fingerprint 対象は registry に存在する bone
+// の uuid のみ (= 関係ない bone の override 変更では replay しない)。
+function computeSessionFingerprint(context: PreviewAnimationContext): string {
+	const map = readOverrides(context.animation)
+	const animUuid = (context.animation as { uuid?: unknown } | null)?.uuid ?? '-'
+	return `${lastGraphFingerprint}|@${animUuid}|${overridesFingerprint(map, Array.from(registry.keys()))}`
 }
 
 // idempotent rescan : 既存 entry の state は保持、 不在 group のみ削除、 新規 group のみ追加。
@@ -1354,7 +1513,10 @@ function stepAndApplyOrdered(dt: number): void {
 	const scratch = makeComposeScratch()
 	for (const uuid of topoOrder) {
 		const entry = registry.get(uuid)
-		// 'disabled' の entry は topology には残るが物理は掛けない (= isSpringActive 参照)
+		// 物理を掛けない entry (= Group 状態と animation override の解決で disabled) は
+		// topology には残るが step / apply の両方を skip する (= isSpringActive =
+		// 解決済み entry.enabled 参照)。 apply だけ止めて step を回し続けると、
+		// 再有効化した瞬間に「見えなかった期間の慣性」 が噴き出すため両方止める。
 		if (!entry || !isSpringActive(entry)) continue
 		composeSpringPose(entry, dt, true, scratch)
 	}
@@ -1384,9 +1546,10 @@ function resetAllToRest(): void {
 	const parentQuat = new THREE.Quaternion()
 	for (const uuid of topoOrder) {
 		const entry = registry.get(uuid)
-		// 'disabled' の state は reset しない (= step / apply の対象外なので値を使われず、
-		// 再有効化時は fingerprint 変化経由の replay で必ず reset される)。
-		if (!entry || !isSpringActive(entry)) continue
+		// registry 全件 (= capable) を reset する。 Group 状態や animation override で
+		// 現時点 disabled の entry も対象にする : disabled 期間中の慣性 (= state.pos) が
+		// 残ると、 再有効化した瞬間に「見えなかった期間の慣性」 が噴き出すため。
+		if (!entry) continue
 		const mesh = entry.group?.mesh
 		const meshParent = mesh?.parent
 		if (!mesh || !meshParent) continue
@@ -1431,13 +1594,21 @@ function normalizeTimelineTime(t: unknown): number {
 }
 
 const previewOps: SpringRuntimeOps<PreviewAnimationContext, AnimatorPoseSnapshot> = {
-	resolveConfigs: (_context) => {
-		for (const entry of registry.values()) {
-			// effective (= entry.config) の唯一の writer。 base (= Group 既定値) +
-			// geometry (= rig 幾何) の合成で埋める。 現時点では animation context 由来の
-			// override は存在しない (= _context は読まない) ため結果は従来と同一。
-			// 後続 commit で animation 単位の override がここに挟まる。
-			Object.assign(entry.config, entry.base)
+	resolveConfigs: (context) => {
+		// animation 単位の override を引き当てる。 key = bone (Group) の uuid。
+		const overrides = readOverrides(context.animation)
+		for (const [uuid, entry] of registry) {
+			// effective (= entry.enabled / entry.config) の唯一の writer。
+			// 合成は resolveEffective に委譲 (= override → base (= Group 既定値) →
+			// DEFAULT_CONFIG の項目単位 sparse)。 restLength は rig 幾何由来で
+			// override 対象外のため、 現行どおり geometry から入れる。
+			// Object.assign(entry.config, eff) は使わない : eff.enabled が config に
+			// 混入して SpringConfig の形を壊すため、 enabled と数値項目は分けて書く。
+			const eff = resolveEffective(entry.base, getSpringBoneState(entry.group), overrides[uuid], DEFAULT_CONFIG)
+			entry.enabled = eff.enabled
+			entry.config.drag = eff.drag
+			entry.config.stiffness = eff.stiffness
+			entry.config.gravity = eff.gravity
 			entry.config.restLength = entry.geometry.restLength
 		}
 	},
@@ -1488,13 +1659,25 @@ function invalidatePreviewSession(): void {
 
 function tick(): void {
 	if (inhibitTick || projectSwitchPending || runtime.isEvaluating) return
-	// active な entry が 1 つも無い (= registry 空 or 全 entry 'disabled') 場合は session を
-	// 畳んで終わる (= hasActiveSpringEntry 参照)。
-	if (!hasActiveSpringEntry() || !Modes?.animate) {
+	// context 生成は Animation.selected 参照 + playing filter だけで軽いため先に作る。
+	// hasActiveSpringEntry が override 解決の入力として必要とするため順序は固定。
+	const context = makePreviewAnimationContext()
+	// active な entry が 1 つも無い (= registry 空 or 全 entry が Group 状態と
+	// animation override の両方で無効) 場合は session を畳んで終わる
+	// (= hasActiveSpringEntry 参照)。
+	if (!hasActiveSpringEntry(context) || !Modes?.animate) {
 		invalidatePreviewSession()
 		return
 	}
-	const context = makePreviewAnimationContext()
+	// session 層 fingerprint (= registry 層 + animation + override) の変化で session を
+	// 張り直す (= override 編集が次 tick で 0 replay を起動し、 preview に即反映される)。
+	// lastSessionFingerprint は変化検出専用で、 invalidatePreviewSession() からは触らない
+	// (= 代入 → リセットの循環で毎 tick invalidate 化するのを防ぐ)。
+	const sfp = computeSessionFingerprint(context)
+	if (sfp !== lastSessionFingerprint) {
+		lastSessionFingerprint = sfp
+		invalidatePreviewSession()
+	}
 	ensurePreviewSession(context)
 	runtime.evaluateSample(normalizeTimelineTime(Timeline?.time))
 }
@@ -1507,6 +1690,10 @@ function installTickLoop(): () => void {
 	inhibitTick = false
 	projectSwitchPending = false
 	tickLoopDisposed = false
+	// session 層 fingerprint と override memo を初期化 (= 前回 install 時の値が残っていると
+	// 初回 tick の変化検知をすり抜ける / 旧 project の instance 参照を握り続ける)。
+	lastSessionFingerprint = ''
+	overridesMemo = null
 
 	// animation pose 由来の cache invalidation は BB event / Undo transaction を境界にする案 A を採用。
 	// 案 B (= keyframe 全値を fingerprint 化) は display frame ごとの走査と BB 内部構造への依存が増え、
@@ -1601,6 +1788,9 @@ function installTickLoop(): () => void {
 	const onProjectSwitch = (): void => {
 		projectSwitchPending = true
 		invalidatePreviewSession()
+		// override memo をクリア (= 旧 project の animation instance 参照を握り続けない。
+		// identity 比較なので残っていても誤ヒットはしないが、 参照保持を避ける)。
+		overridesMemo = null
 		if (projectRescanRafId !== null) return
 		projectRescanRafId = requestAnimationFrame(() => {
 			projectRescanRafId = null
@@ -1694,6 +1884,8 @@ function installTickLoop(): () => void {
 		registry.clear()
 		topoOrder = []
 		lastGraphFingerprint = ''
+		lastSessionFingerprint = ''
+		overridesMemo = null
 		invalidatePreviewSession()
 	}
 }

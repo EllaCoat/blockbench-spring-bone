@@ -54,8 +54,21 @@ function pickParam(
 	return defaults[key]
 }
 
+// enabled だけの解決 (= resolveEffective の enabled 部分を単独で使う経路向け)。
+// tick() 冒頭の「active な entry があるか」判定 (= index.ts hasActiveSpringEntry) は
+// resolveConfigs より前に走るため前 session の解決結果 (= entry.enabled) を読めず、
+// 生の groupState と override から毎回ここで判定する必要がある。
+// resolveEffective 内部もこれを呼び、 ロジックの重複を防ぐ。
+export function resolveEnabled(
+	groupState: SpringBoneState,
+	override: SpringOverride | null | undefined,
+): boolean {
+	return typeof override?.enabled === 'boolean' ? override.enabled : groupState === 'enabled'
+}
+
 // 実効 config の解決。 毎回新しい object を返し、 入力の base / override は変異させない。
-// enabled は boolean の override があればそれを優先し、 無ければ Group の状態から決める。
+// enabled は boolean の override があればそれを優先し、 無ければ Group の状態から決める
+// (= resolveEnabled 参照)。
 export function resolveEffective(
 	base: Partial<SpringBaseConfig> | null | undefined,
 	groupState: SpringBoneState,
@@ -63,7 +76,7 @@ export function resolveEffective(
 	defaults: SpringBaseConfig,
 ): ResolvedSpringConfig {
 	return {
-		enabled: typeof override?.enabled === 'boolean' ? override.enabled : groupState === 'enabled',
+		enabled: resolveEnabled(groupState, override),
 		drag: pickParam('drag', base, override, defaults),
 		stiffness: pickParam('stiffness', base, override, defaults),
 		gravity: pickParam('gravity', base, override, defaults),

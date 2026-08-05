@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-const { toSpringBoneState, isCapable, shouldMigrate, resolveEffective } = await import('../dist-test/springConfig.mjs')
+const { toSpringBoneState, isCapable, shouldMigrate, resolveEffective, resolveEnabled } = await import('../dist-test/springConfig.mjs')
 
 const DEFAULTS = { drag: 0.05, stiffness: 1.0, gravity: 0 }
 
@@ -72,6 +72,39 @@ test('resolveEffective: enabled は boolean の override を優先、 無けれ�
 	// boolean でない enabled (= 破損データ) は無視して groupState から決める
 	assert.equal(resolveEffective(undefined, 'enabled', { enabled: 1 }, DEFAULTS).enabled, true)
 	assert.equal(resolveEffective(undefined, 'disabled', { enabled: 'yes' }, DEFAULTS).enabled, false)
+})
+
+// --- resolveEnabled ---
+
+test('resolveEnabled: groupState 3 値 × override enabled 3 値の 9 通り', () => {
+	for (const groupState of ['unset', 'enabled', 'disabled']) {
+		for (const overrideEnabled of [true, false, undefined]) {
+			const override = overrideEnabled === undefined ? undefined : { enabled: overrideEnabled }
+			const expected = overrideEnabled ?? (groupState === 'enabled')
+			assert.equal(resolveEnabled(groupState, override), expected, `groupState=${groupState} override.enabled=${overrideEnabled}`)
+		}
+	}
+	// boolean でない enabled (= 破損データ) は無視して groupState から決める
+	assert.equal(resolveEnabled('enabled', { enabled: 1 }), true)
+	assert.equal(resolveEnabled('disabled', { enabled: 'yes' }), false)
+	// override そのものが null でも groupState から決める
+	assert.equal(resolveEnabled('enabled', null), true)
+	assert.equal(resolveEnabled('disabled', null), false)
+})
+
+test('resolveEnabled: resolveEffective の enabled 解決と一致する (= ロジック共有の固定)', () => {
+	// resolveEffective が内部で resolveEnabled を呼ぶ構成の固定。 片方だけ変更されると
+	// tick 冒頭の active 判定 (= resolveEnabled) と実際の物理対象 (= resolveEffective) が
+	// ズレるため、 同じ入力で必ず同じ結果になることを固定する
+	for (const groupState of ['unset', 'enabled', 'disabled']) {
+		for (const override of [undefined, null, { enabled: true }, { enabled: false }, { enabled: 1 }]) {
+			assert.equal(
+				resolveEffective(undefined, groupState, override, DEFAULTS).enabled,
+				resolveEnabled(groupState, override),
+				`groupState=${groupState} override=${JSON.stringify(override)}`,
+			)
+		}
+	}
 })
 
 // --- resolveEffective: restLength の遮断 ---
