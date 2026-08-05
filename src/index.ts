@@ -25,6 +25,7 @@ import {
 	overridesFingerprint,
 	type SpringOverrideMap,
 } from './animOverrides'
+import { createExportDriver, type ExportDriverHost } from './ajExportBridge'
 import { registerSpringPanel } from './ui'
 
 declare const Plugin: { register(id: string, opts: Record<string, unknown>): void }
@@ -59,6 +60,16 @@ declare const Undo: any
 // Panel の display_condition、 outliner ハイライト等が再評価される)。 spring 化 / 解除の
 // name 変更後や undo/redo 後に手動で叩いて UI 状態と rig state のズレを解消する。
 declare function updateSelection(): void
+// AnimatedJava が公開する render hook registry。 AJ は module 評価時 (= plugin 読み込み時)
+// に window.AnimatedJava を代入するため、 我々の onload より後に生えることがある
+// (= installAjExportDriver の loaded_plugin 再試行経路)。 AJ 不在 / 旧 version / 将来の
+// 契約変更いずれでも壊れないよう、 全て optional で受けて呼ぶ前に形を確認する。
+interface AjRenderHooksApi {
+	version?: number
+	register?(id: string, hooks: unknown): void
+	unregister?(id: string): void
+}
+declare const window: { AnimatedJava?: { renderHooks?: AjRenderHooksApi } } | undefined
 
 const PLUGIN_ID = 'spring_bone'
 const PLUGIN_VERSION = '0.0.12'
@@ -947,6 +958,14 @@ let lastGraphFingerprint = ''
 // installTickLoop の初期化と cleanup で '' に戻す。
 let lastSessionFingerprint = ''
 let inhibitTick = false   // applyPoseAt 由来の再描画で tick が再入するのを防ぐ
+// AnimatedJava の datapack export 中だけ立つ flag。 export 中は AJ が pose の主導権を持ち、
+// runtime は export driver (= ajExportBridge) 側が駆動するため、 preview 側の tick /
+// invalidate 経路を全部止めて runtime を明け渡す。
+// **inhibitTick を流用してはいけない** : applyPoseAt が finally で inhibitTick = false に
+// 戻すため、 export 中に base pose 評価が走るたび抑制が解けてしまう。
+// **counter ではなく boolean 代入にする** : AJ 側が onEndRendering を届けられなかった後に
+// onBeginRendering が来ると suspend が二重に呼ばれ得るため、 counter だと解除されなくなる。
+let exportActive = false
 // project 切替 (= select_project / load_project) 受信から rAF コールバックでの rescan 完了
 // までの間だけ立つ flag。 遅延中は旧 project の registry / session が生きたまま残るため、
 // parse 完了後に同期的に走る Animation.select() → Animator.preview() が旧 entry を評価
@@ -1629,6 +1648,10 @@ function resetAllToRest(): void {
 // Animation.selected を再参照させない (= 選択中 animation への暗黙依存の排除)。
 interface PreviewAnimationContext extends AnimationContext<any> {
 	animationStack: readonly any[]
+	// AJ export の excluded_nodes 由来 (= 出力に載らない node の uuid 集合)。
+	// **export 経路だけが詰める** optional。 preview 経路では undefined になり、
+	// resolveConfigs の除外判定が常に false = 従来と完全に同一挙動になる。
+	excludedNodeUuids?: ReadonlySet<string>
 }
 
 // 選択中 animation (= selected があればそれだけ、 無ければ playing 群) を解決して
@@ -1649,6 +1672,18 @@ function makePreviewAnimationContext(): PreviewAnimationContext {
 	return { animation: animSelected, animationStack }
 }
 
+// AJ export 用の context。 animation は AJ が渡してきたものをそのまま使い、
+// **Animation.selected は参照しない** (= export 対象は選択中 animation とは限らず、
+// AJ は全 animation を順に回すため)。 animationStack は型の要求を満たすためだけに
+// [animation] を入れる : export 経路の base pose 評価は AJ 側の evaluateBasePose が
+// 担い、 applyPoseAt を通らないので実際には読まれない。
+function makeExportAnimationContext(
+	animation: unknown,
+	excludedNodeUuids: ReadonlySet<string>,
+): PreviewAnimationContext {
+	return { animation, animationStack: [animation], excludedNodeUuids }
+}
+
 // timeToStepIndex は非 finite で RangeError を throw するため、 preview 側で 0 へ正規化する
 // (= Timeline 未初期化や NaN の frame で tick 全体が死なないようにする)。
 function normalizeTimelineTime(t: unknown): number {
@@ -1667,7 +1702,11 @@ const previewOps: SpringRuntimeOps<PreviewAnimationContext, AnimatorPoseSnapshot
 			// Object.assign(entry.config, eff) は使わない : eff.enabled が config に
 			// 混入して SpringConfig の形を壊すため、 enabled と数値項目は分けて書く。
 			const eff = resolveEffective(entry.base, getSpringBoneState(entry.group), overrides[uuid], DEFAULT_CONFIG)
-			entry.enabled = eff.enabled
+			// AJ export で除外された node は物理も止める (= 出力に載らない bone を計算しても
+			// 無駄で、 除外前提の pose と食い違う)。 判定を resolveConfigs の中に置くのは
+			// **effective の writer を 1 箇所に保つため** (= isSpringActive 側で再解決すると
+			// 判定元が分裂する)。 preview 経路は excludedNodeUuids が undefined なので不変。
+			entry.enabled = eff.enabled && !(context.excludedNodeUuids?.has(uuid) ?? false)
 			entry.config.drag = eff.drag
 			entry.config.stiffness = eff.stiffness
 			entry.config.gravity = eff.gravity
@@ -1720,7 +1759,10 @@ function invalidatePreviewSession(): void {
 }
 
 function tick(): void {
-	if (inhibitTick || projectSwitchPending || runtime.isEvaluating) return
+	// exportActive 中は preview session を張らない : 張ると runtime.evaluateSample が走り、
+	// AJ が確定させた scene pose を preview 側の評価結果で上書きしてしまう
+	// (= runtime は preview / export で共用する module singleton)。
+	if (exportActive || inhibitTick || projectSwitchPending || runtime.isEvaluating) return
 	// context 生成は Animation.selected 参照 + playing filter だけで軽いため先に作る。
 	// hasActiveSpringEntry が override 解決の入力として必要とするため順序は固定。
 	const context = makePreviewAnimationContext()
@@ -1757,6 +1799,9 @@ function installTickLoop(): () => void {
 	lastSessionFingerprint = ''
 	overridesMemo = null
 	warnedNewerSchemaUuids.clear()
+	// export 中に plugin reload が挟まった場合に「止まったまま」 で復帰しないよう、
+	// install 時点で必ず preview 側へ主導権を戻す。
+	exportActive = false
 
 	// animation pose 由来の cache invalidation は BB event / Undo transaction を境界にする案 A を採用。
 	// 案 B (= keyframe 全値を fingerprint 化) は display frame ごとの走査と BB 内部構造への依存が増え、
@@ -1808,6 +1853,13 @@ function installTickLoop(): () => void {
 	// より先に移動済 (= 内部で flag reset するため)、 これで onFinishedEdit / onSelectAnimation の
 	// 経路と onAnimFrame の状態遷移検知が共通で「1 回だけ発火」 を保証する。
 	const onAnimFrame = (): void => {
+		// **export 中は listener 本体ごと止める** (= tick() 冒頭の guard だけでは足りない)。
+		// AJ は frame ごとに updatePreview を走らせ、 その中の Animator.preview() が
+		// display_animation_frame を **同期発火** する (= animation_mode.js:454)。 guard が
+		// 無いと invalidatePreviewSession() で export session が破棄され、 さらに
+		// invalidateAnimationCache() が Animator.preview() を呼んで AJ の frame ループへ
+		// 再入する。
+		if (exportActive) return
 		try {
 			// keyframe edit transaction 中は値が preview ごとに変わり得るため、各 frame を 0 replay。
 			// 個人スコープでは長 timeline + 多 chain rig で drag スタッター可能性あるが、
@@ -1830,6 +1882,12 @@ function installTickLoop(): () => void {
 		if (Array.isArray(keyframes)) invalidateAnimationCache()
 	}
 	const onSelectAnimation = (): void => {
+		// AJ は animation ごとに Animation.select() を呼び、 その末尾で select_animation を
+		// dispatch する (= animation.js:256)。 guard しないと invalidateAnimationCache() が
+		// export session を破棄した上で Animator.preview() を呼ぶ。
+		// なお onAnimFrame 側の guard も別途必要 : Animator.preview() は select_animation の
+		// dispatch **より前** に Animation.select() 内から呼ばれる (= animation.js:246)。
+		if (exportActive) return
 		invalidateAnimationCache()
 	}
 	// **rAF 遅延が必要な理由** : `select_project` は ModelProject.select() 内で発火し
@@ -1884,6 +1942,14 @@ function installTickLoop(): () => void {
 		})
 	}
 	const onUpdateSelection = (): void => {
+		// export 中は registry を作り直さない : Animation.select() → unselectAllElements() が
+		// TickUpdates.selection を立て (= misc.js:256)、 AJ の render loop が
+		// await sleepForAnimationFrame() で main loop に制御を返した時点で updateSelection()
+		// が update_selection を dispatch する (= misc.js:235)。 rescan 自体は idempotent だが、
+		// 末尾の graph fingerprint 判定が変化を拾うと invalidatePreviewSession() =
+		// runtime.endAnimation() が走り、 進行中の **export session** ごと破棄される
+		// (= runtime は preview / export で共用)。
+		if (exportActive) return
 		// idempotent rescan で既存 entry の state は保持、 session もそのまま (= 物理継続)。
 		rescanRegistry()
 	}
@@ -1938,6 +2004,9 @@ function installTickLoop(): () => void {
 			projectRescanRafId = null
 		}
 		projectSwitchPending = false
+		// export 中に unload されても flag を残さない (= 次の install / reload で preview が
+		// 止まったままになるのを防ぐ)。
+		exportActive = false
 		Blockbench.removeListener?.('display_animation_frame', onAnimFrame)
 		Blockbench.removeListener?.('select_project', onProjectSwitch)
 		Blockbench.removeListener?.('load_project', onProjectSwitch)
@@ -1954,6 +2023,93 @@ function installTickLoop(): () => void {
 		overridesMemo = null
 		warnedNewerSchemaUuids.clear()
 		invalidatePreviewSession()
+	}
+}
+
+// --- AnimatedJava export driver の接続 ---
+// 判定と時刻管理は ajExportBridge の driver が持つ。 ここには「driver が要求する注入口を
+// BB / module 状態へ繋ぐ」 「AJ の render hook registry へ登録 / 解除する」 だけを置く。
+
+// rollback 用の feature flag (= コード内定数のみ、 設定 UI は作らない)。 false にすると
+// 登録自体を行わず、 AJ の export 出力は plugin 導入前と完全に同一に戻る。
+const ENABLE_AJ_EXPORT = true
+
+const exportDriverHost: ExportDriverHost<PreviewAnimationContext> = {
+	// runtime は preview と共用する module singleton (= 同時に走らないよう exportActive で
+	// preview 側を止める)。 currentStepIndex / isEvaluating は **getter で委譲** する :
+	// 値をコピーすると driver が古い state を見て advance / reapply を誤判定する。
+	beginAnimation: (context, evaluateBasePose) => { runtime.beginAnimation(context, evaluateBasePose) },
+	evaluateStepIndex: (stepIndex) => { runtime.evaluateStepIndex(stepIndex) },
+	applyWithoutAdvance: () => { runtime.applyWithoutAdvance() },
+	endAnimation: () => { runtime.endAnimation() },
+	get currentStepIndex(): number | null { return runtime.currentStepIndex },
+	get isEvaluating(): boolean { return runtime.isEvaluating },
+	suspendTick: () => { exportActive = true },
+	resumeTick: () => { exportActive = false },
+	invalidatePreview: () => { invalidatePreviewSession() },
+	makeExportContext: (animation, excludedNodeUuids) => makeExportAnimationContext(animation, excludedNodeUuids),
+	// capable な bone が 1 つも無い project では export に一切介入しない : 介入すると
+	// frame ごとに pose の capture / restore と 3 sub-step 分の base pose 再評価が乗り、
+	// 物理を掛ける対象がゼロのまま export だけが重くなる。
+	isEnabled: () => ENABLE_AJ_EXPORT && registry.size > 0,
+}
+
+// driver を AJ の render hook registry (= window.AnimatedJava.renderHooks) へ登録する。
+// AJ 不在時は何もせず、 plugin の他機能 (= preview / Panel / context menu) には影響しない。
+function installAjExportDriver(): () => void {
+	if (!ENABLE_AJ_EXPORT) return (): void => {}
+	const driver = createExportDriver(exportDriverHost)
+	let registered = false
+	let retryListener: ((...args: unknown[]) => void) | null = null
+
+	const detachRetry = (): void => {
+		if (retryListener === null) return
+		Blockbench.removeListener?.('loaded_plugin', retryListener)
+		retryListener = null
+	}
+
+	// 戻り値 = 「もう再試行しなくてよいか」。 API が生えていない間だけ false を返す
+	// (= register が throw した場合は再試行しても同じ結果なので true に倒す)。
+	const tryRegister = (): boolean => {
+		const api = window?.AnimatedJava?.renderHooks
+		if (!api || api.version !== 1 || typeof api.register !== 'function') return false
+		try {
+			api.register(PLUGIN_ID, driver)
+			registered = true
+			console.log(`[${PLUGIN_ID}] AnimatedJava export driver registered`)
+		} catch (e) {
+			console.warn(`[${PLUGIN_ID}] AnimatedJava export driver registration failed`, e)
+		}
+		return true
+	}
+
+	// AJ は module 評価時に window.AnimatedJava を代入し (= AJ src/index.ts)、 loaded_plugin は
+	// plugin register 後に発火する (= plugin_loader.ts:391)。 我々が先に load された場合でも
+	// この経路で確実に捕まる。 決着したら listener を外す (= 以降の plugin load で無駄に走らせない)。
+	// **除去は dispatch 中に行わない** : BB の dispatchEvent は listener 配列を for...of で
+	// 走査するため (= js/util/event_system.ts:15)、 自分を remove すると配列が詰まって次の
+	// listener が 1 個読み飛ばされる。 settled flag で二重登録を止め、 実際の除去は rAF
+	// (= dispatch 外) に逃がす。 rAF の id は保持しない : cleanup 後に走っても detachRetry は
+	// retryListener === null で no-op になるため。
+	let settled = false
+	if (!tryRegister()) {
+		retryListener = (): void => {
+			if (settled || !tryRegister()) return
+			settled = true
+			requestAnimationFrame(() => detachRetry())
+		}
+		Blockbench.on('loaded_plugin', retryListener)
+	}
+
+	return (): void => {
+		detachRetry()
+		if (!registered) return
+		registered = false
+		try {
+			window?.AnimatedJava?.renderHooks?.unregister?.(PLUGIN_ID)
+		} catch (e) {
+			console.warn(`[${PLUGIN_ID}] AnimatedJava export driver unregistration failed`, e)
+		}
 	}
 }
 
@@ -1991,6 +2147,9 @@ Plugin.register(PLUGIN_ID, {
 		registerContextMenuActions()
 		// Outliner 上で capable な spring group を視覚的に区別する軽量マーカーを install。
 		cleanups.push(registerOutlinerMarker())
+		// AnimatedJava の datapack export へ物理を注入する driver を登録する。 AJ 不在でも
+		// 失敗せず、 後から AJ が load された場合は loaded_plugin 経由で再試行する。
+		cleanups.push(installAjExportDriver())
 	},
 	onunload() {
 		for (const fn of cleanups) {
