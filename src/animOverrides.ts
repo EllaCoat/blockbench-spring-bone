@@ -16,6 +16,19 @@ export interface SpringOverride {
 // key = bone (Group) の uuid
 export type SpringOverrideMap = Record<string, SpringOverride>
 
+// Animation に登録する Property key。 index.ts の register / unregister / backfill /
+// read と、 ui.ts の override 書き込みで共有する。 BB API には依存しない純粋な
+// 文字列定数としてここに置く (= 本 module の非依存制約を維持したまま、 key 名の
+// 定義箇所を 1 つにするため)。
+export const ANIM_OVERRIDES_KEY = 'spring_bone_overrides'
+export const ANIM_SCHEMA_VERSION_KEY = 'spring_bone_schema_version'
+
+// animation 単位 override の schema version。 override map の構造を変える時に上げる。
+// 読み込み側 (= index.ts の readOverrides) は自分より新しい version の override を
+// 解釈できないため無視して Group 既定値へ fallback する (= raw データ自体は保持し、
+// 新しい version の plugin で開き直せば復活する)。
+export const SPRING_SCHEMA_VERSION = 1
+
 // 数値項目の有効値判定 (= NaN / Infinity / 非数値を「書かれていない」として扱う)
 function isValidParam(value: unknown): value is number {
 	return typeof value === 'number' && Number.isFinite(value)
