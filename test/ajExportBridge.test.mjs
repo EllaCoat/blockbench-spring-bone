@@ -19,8 +19,11 @@ const SIDE_SAMPLE_OFFSET = 0.001
 //   - beginAnimation / endAnimation で null (= 未評価)
 //   - evaluateStepIndex 成功で target を保持
 //   - evaluateStepIndex 失敗で null へ戻す (= 次回が必ず 0 replay になる runtime の契約)
+// enabledSequence を渡すと isEnabled() の戻り値を呼ばれた順に消費する
+// (= 「1 回目 true / 2 回目 false」 のような切り替わりを再現する口)。 尽きたら enabled を返す。
 function makeHost({
 	enabled = true,
+	enabledSequence = [],
 	beginAnimationError = null,
 	evaluateError = null,
 	endAnimationError = null,
@@ -28,6 +31,7 @@ function makeHost({
 	invalidatePreviewError = null,
 } = {}) {
 	const log = []
+	const pendingEnabled = [...enabledSequence]
 	let stepIndex = null
 	let evaluating = false
 	let lastBasePoseWrapper = null
@@ -81,7 +85,7 @@ function makeHost({
 		},
 		isEnabled() {
 			log.push({ fn: 'isEnabled' })
-			return enabled
+			return pendingEnabled.length > 0 ? pendingEnabled.shift() : enabled
 		},
 	}
 	return {
@@ -416,4 +420,69 @@ test('ExportDriver: beginAnimation に渡る wrapper は AJ の evaluateBasePose
 	wrapper(0, exportContext)
 	wrapper(0.05, exportContext)
 	assert.deepEqual(animationContext.basePoseTimes, [0, 0.05])
+})
+
+// --- 二重 onBeginRendering (= 契約違反) ---
+
+test('ExportDriver: 二重 onBeginRendering で 2 回目が isEnabled() false でも suspend は解除される', () => {
+	// **onBeginRendering は判定より先に前 session を畳む** ことの担保。 flag を落とすだけの
+	// 実装だと「1 回目の suspendTick が解除されないまま、 以降の onEndRendering は
+	// 非 active で no-op」 になり、 呼び出し側の tick が永久に止まったままになる。
+	const { host, log } = makeHost({ enabledSequence: [true, false] })
+	const driver = createExportDriver(host)
+	driver.onBeginRendering()
+	assert.deepEqual(trace(log), ['isEnabled', 'invalidatePreview', 'suspendTick'])
+	assert.equal(driver.isRenderingActive, true)
+
+	log.length = 0
+	driver.onBeginRendering()
+	// 後始末が先、 isEnabled() は その後 (= false なので新 session は張らない)
+	assert.deepEqual(trace(log), ['endAnimation', 'resumeTick', 'invalidatePreview', 'isEnabled'])
+	assert.equal(countOf(log, 'resumeTick'), 1)
+	assert.equal(driver.isRenderingActive, false)
+	assert.equal(driver.isAnimationActive, false)
+
+	// 以降の hook は no-op のまま (= 片側だけ実行される状態にならない)
+	log.length = 0
+	driver.onEndRendering()
+	assert.deepEqual(trace(log), [])
+})
+
+test('ExportDriver: 二重 onBeginRendering で 2 回目も有効なら前 session を畳んでから張り直す', () => {
+	const { host, log } = makeHost()
+	const driver = createExportDriver(host)
+	const animationContext = makeAnimationContext('anim')
+	driver.onBeginRendering()
+	driver.onBeginAnimation(animationContext)
+	emitMeasuredFrame(driver, animationContext, 0)
+
+	log.length = 0
+	driver.onBeginRendering()
+	// 前 session の後始末 (= runtime session 破棄 → tick 再開 → preview 畳み) を通してから、
+	// 新 session を preview 畳み → tick 停止の順で張る
+	assert.deepEqual(trace(log), [
+		'endAnimation', 'resumeTick', 'invalidatePreview',
+		'isEnabled', 'invalidatePreview', 'suspendTick',
+	])
+	assert.equal(driver.isRenderingActive, true)
+	// animation session は 1 回目のものごと畳まれている (= onBeginAnimation 待ちに戻る)
+	assert.equal(driver.isAnimationActive, false)
+	log.length = 0
+	emitMeasuredFrame(driver, animationContext, 1)
+	assert.deepEqual(trace(log), [])
+})
+
+test('ExportDriver: session が無い状態の onBeginRendering は余計な cleanup を走らせない', () => {
+	// 前 session を畳む処理は冪等 (= 非 active なら no-op)。 通常の 1 回目や、
+	// isEnabled() false が続く場合に endAnimation / resumeTick を無駄に叩かないことを固定する。
+	const { host, log } = makeHost()
+	const driver = createExportDriver(host)
+	driver.onBeginRendering()
+	assert.deepEqual(trace(log), ['isEnabled', 'invalidatePreview', 'suspendTick'])
+
+	const disabled = makeHost({ enabled: false })
+	const disabledDriver = createExportDriver(disabled.host)
+	disabledDriver.onBeginRendering()
+	disabledDriver.onBeginRendering()
+	assert.deepEqual(trace(disabled.log), ['isEnabled', 'isEnabled'])
 })
