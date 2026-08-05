@@ -65,6 +65,19 @@ function isAnimationAlive(anim: any): boolean {
 	return Array.isArray(all) && all.includes(anim)
 }
 
+// group が **現在の project に** まだ存在するかの判定。 Group.all = Project.groups
+// (= BB outliner/types/group.js:534-540) なので、 削除済み group だけでなく
+// 「別 project の group」 も false になる。 slider gesture の書き込み対象検証で使う :
+// BB の Undo は現在 project の UndoSystem を返す getter のため、 project A で drag を
+// 始めて B へ切り替えてから mouse を離すと、 A の group への変更を B の Undo 履歴へ
+// 積んで B を dirty 化してしまう (= B 側で Undo すると B の group を壊す / 旧 group を
+// 生やす)。 選択されているかは見ない (= 選択同一性の検証は「開始時に掴んだ対象へ
+// 書き続ける」 gesture context の設計と矛盾する)。
+function isGroupAlive(group: any): boolean {
+	const all = Group?.all
+	return Array.isArray(all) && all.includes(group)
+}
+
 // Property 3 パラの UI メタ情報 (= registerProperties と 1:1 対応、 range / step も同値)。
 const PANEL_INPUTS = [
 	{ key: 'drag', label: 'Drag', min: 0, max: 1, step: 0.01, defaultValue: 0.05 },
@@ -298,9 +311,12 @@ export function registerSpringPanel(deps: {
 	// 見に行かない)。 drag 中に選択や checkbox 状態が変わっても開始時に掴んだ対象へ
 	// 書き続けるため、 別の bone / animation へ値が飛ばない。
 
-	// gesture 対象が今も書き込み可能か。 animation 対象のときだけ検証する
-	// (= 削除済み animation / 未知の上位 schema version には書かない)。
+	// gesture 対象が今も書き込み可能か。 kind に関わらず **対象が現在の project に
+	// 生存しているか** を必ず見る : group / animation のどちらも、 削除や project 切替で
+	// 現在の project から外れた対象へ Undo transaction を張ると、 別 project の Undo 履歴を
+	// 汚染する (= isGroupAlive のコメント参照)。 animation はさらに schema version gate を通す。
 	const isGestureTargetValid = (ctx: SliderGestureContext): boolean => {
+		if (!isGroupAlive(ctx.group)) return false
 		if (ctx.kind !== 'animation') return true
 		const anim = ctx.animation
 		return anim !== null && isAnimationAlive(anim) && canWriteOverrides(anim)
@@ -328,15 +344,45 @@ export function registerSpringPanel(deps: {
 		}
 		ctx.group[`spring_${ctx.key}`] = value
 	}
+
+	// gesture の書き込みを drag 前の値へ戻す (= Undo に載らなかった変更を消す)。
+	// 中断 gesture (= onAfter が来ない経路) と失効 gesture (= 対象が project から
+	// 外れた / 削除された) の後始末で使う。 **commit ではなく rollback を選ぶ理由** :
+	// drag 中の書き込みは Undo transaction の外なので、 そのまま残すと復元不能な変更が
+	// `Project.saved === true` のまま実データに残る。 中断された途中値をユーザーが
+	// 意図したとは限らないため、 「操作が無かった」 状態へ戻す方が一貫する。
+	// 書き戻し先が上位 schema version の animation の場合だけ skip する
+	// (= gate を迂回して未知構造の raw を壊さない)。 対象が project から外れていても
+	// 参照は context が握っているため書き戻し自体は成立する (= 代入は Undo に触れない)。
+	const rollbackGesture = (ctx: SliderGestureContext): void => {
+		try {
+			if (ctx.kind === 'animation' && !canWriteOverrides(ctx.animation)) return
+			writeGestureValue(ctx, ctx.before)
+			// preview / registry を巻き戻し後の実データに揃える (= drag 中の onChange で
+			// 途中値が反映されたままになるのを防ぐ)。
+			onChange()
+		} catch (e) {
+			console.warn('[spring_bone] gesture rollback failed', e)
+		}
+	}
 	for (const meta of PANEL_INPUTS) {
 		const element = (form as any).form_data?.[meta.key]
 		const slider = element?.slider
 		if (slider) {
 			slider.onBefore = () => {
-				// 前 gesture の context は捨てる。 onAfter が来ない中断経路
-				// (= window blur / touchcancel 等) で残っていても、 開いた Undo
-				// transaction は存在しない (= drag 中は開かない) ので破棄で足りる。
+				// 前 gesture が onAfter を受け取らずに終わっていた場合 (= touchcancel /
+				// mouseup 取りこぼし / gesture 中の Panel 破棄) の後始末。 開いた Undo
+				// transaction は無い (= drag 中は開かない) が、 **drag 中に書いた値は
+				// 実データに残っている** ため、 放置すると Undo 不能な変更が
+				// Project.saved === true のまま残る。 drag 前の値へ rollback する。
+				const stale = gesture_context
 				gesture_context = null
+				if (stale !== null) {
+					rollbackGesture(stale)
+					// widget の表示値は中断時点のまま動いているので実データへ張り直す
+					// (= context を null にした後に呼ぶこと、 でないと setValues が抑止される)。
+					sync()
+				}
 				if (!isSpringSelectionCapable(isSpringCapableGroup)) return
 				const g = Group.first_selected
 				const boneUuid = typeof g?.uuid === 'string' ? g.uuid : null
@@ -372,14 +418,24 @@ export function registerSpringPanel(deps: {
 				// onAfter を無条件発火する (= actions.ts)。
 				const ctx = gesture_context
 				if (ctx === null || !isGestureTargetValid(ctx)) {
-					// 書き込み先が無い / gesture 中に無効化した (= animation 削除等)。
-					// 開いた transaction は無いので閉じる処理は不要。 ただし widget の
-					// 表示値だけは動いている (= onBefore の早期 return は BB の NumSlider
-					// 操作自体をキャンセルしない) ため、 実データから再同期する。
+					// 書き込み先が無い / gesture 中に失効した (= animation 削除 /
+					// project 切替で対象が現在の project から外れた等)。 開いた
+					// transaction は無いので閉じる処理は不要だが、 **drag 中の書き込みは
+					// 実データに残っている** ため rollback する (= 失効した対象へ
+					// Undo entry を張ると別 project の履歴を汚染するので commit しない)。
 					gesture_context = null
+					if (ctx !== null) rollbackGesture(ctx)
+					// widget の表示値だけは動いている (= onBefore の早期 return は BB の
+					// NumSlider 操作自体をキャンセルしない) ため、 実データから再同期する。
 					sync()
 					return
 				}
+				// initEdit を呼ぶ前に UndoSystem を local に確保する : BB の Undo は
+				// 現在 project の UndoSystem を返す getter なので、 例外処理で再評価すると
+				// 別 project の transaction を掴んで閉じる事故になる。 この同期区間だけの
+				// ローカル追跡で足りる (= module scope の状態は増やさない)。
+				let owner: any = null
+				let save: any = null
 				try {
 					// drag 中に書き込まれた最終値を退避する。
 					const after = readGestureValue(ctx)
@@ -394,13 +450,38 @@ export function registerSpringPanel(deps: {
 					writeGestureValue(ctx, ctx.before)
 					const aspects =
 						ctx.kind === 'animation' ? { animations: [ctx.animation] } : { groups: [ctx.group] }
-					Undo?.initEdit?.(aspects)
+					owner = Undo ?? null
+					save = owner?.initEdit?.(aspects) ?? null
 					writeGestureValue(ctx, after)
-					Undo?.finishEdit?.('Change spring config')
+					owner?.finishEdit?.('Change spring config')
 					// registry sync + preview invalidate は巻き戻しを挟まない最終状態で 1 回だけ。
-					onChange()
+					// **onChange は独立して catch する** : ここまで来た時点で Undo entry は
+					// 確定済みなので、 onChange の例外で下の rollback を走らせると
+					// 「entry は after / 実データは before」 という不整合になる。
+					try {
+						onChange()
+					} catch (e) {
+						console.warn('[spring_bone] onChange failed', e)
+					}
 				} catch (e) {
+					// 巻き戻し区間は原子的に扱う : initEdit / finishEdit は同期 event を
+					// dispatch するため listener の例外も伝播し得る。 中断すると
+					// (a) 値が巻き戻し途中 (b) transaction が開いたまま (c) preview だけ
+					// drag 後、 という 3 重の不整合が残るので個別に始末する。
 					console.warn('[spring_bone] slider onAfter failed', e)
+					// 自分が開いた transaction だけを破棄する (= cancelEdit の既定は
+					// revert しない = current_save を捨てるだけ、 BB undo.js:143-151)。
+					// current_save が別物なら他所の transaction なので触らない。
+					try {
+						if (owner !== null && save !== null && owner.current_save === save) {
+							owner.cancelEdit?.()
+						}
+					} catch (e2) {
+						console.warn('[spring_bone] slider onAfter cancelEdit failed', e2)
+					}
+					// Undo entry を作れなかった変更は残さない (= 中断 gesture と同じ扱い)。
+					// rollback 内で onChange まで済むので preview / registry も揃う。
+					rollbackGesture(ctx)
 				} finally {
 					// 例外経路でも context を残さない (= 次 gesture が古い対象へ書くのを防ぐ)。
 					gesture_context = null
@@ -463,6 +544,12 @@ export function registerSpringPanel(deps: {
 			const boneUuid = typeof g?.uuid === 'string' ? g.uuid : null
 			const canWriteOverride = anim !== null && boneUuid !== null
 			if (canWriteOverride && canWriteOverrides(anim)) {
+				// slider 経路と同じく、 initEdit を呼ぶ前に UndoSystem を local に確保する
+				// (= 例外時に Undo を再評価して別 project の transaction を閉じないため)。
+				let owner: any = null
+				let save: any = null
+				// 例外で transaction を作れなかった場合に書き込みを取り消すための退避。
+				const prevRaw = anim[ANIM_OVERRIDES_KEY]
 				try {
 					let map = readOverrides(anim)
 					// 実際に値が変わる操作があったか。 no-op 操作 (= 現在値の再クリック等)
@@ -518,12 +605,31 @@ export function registerSpringPanel(deps: {
 						// この transaction は handler 内で init → 書き込み → finish が
 						// 同期的に完結する (= 開いている区間に project 切替や中断が
 						// 割り込めない = slider gesture 側と同じ原則)。
-						Undo?.initEdit?.({ animations: [anim] })
+						owner = Undo ?? null
+						save = owner?.initEdit?.({ animations: [anim] }) ?? null
 						anim[ANIM_OVERRIDES_KEY] = map
-						Undo?.finishEdit?.('Change spring animation override')
+						owner?.finishEdit?.('Change spring animation override')
 					}
 				} catch (e) {
+					// slider 経路と同じ後始末 : initEdit / finishEdit は同期 event を
+					// dispatch するため listener の例外も伝播し得る。 開いたままの
+					// transaction を残すと後続の Undo が壊れ、 Undo entry 無しの書き込みを
+					// 残すと復元不能な変更になる。
 					console.warn('[spring_bone] panel override handler failed', e)
+					try {
+						if (owner !== null && save !== null && owner.current_save === save) {
+							owner.cancelEdit?.()
+						}
+					} catch (e2) {
+						console.warn('[spring_bone] panel override cancelEdit failed', e2)
+					}
+					// 書き込み済みなら退避しておいた raw へ戻す (= 代入は 1 文なので
+					// 部分適用は起きず、 戻せば「操作が無かった」 状態に一致する)。
+					try {
+						anim[ANIM_OVERRIDES_KEY] = prevRaw
+					} catch (e2) {
+						console.warn('[spring_bone] panel override rollback failed', e2)
+					}
 				}
 				// 書き込み後の再同期 (= ON → OFF で slider を継承値へ戻し、
 				// last_override_checks を新しい map の truth に張り直す)。
@@ -570,9 +676,12 @@ export function registerSpringPanel(deps: {
 
 	return () => {
 		try {
-			// gesture 中の Panel 破棄 / plugin unload で context が残っても、 開いた
-			// Undo transaction は存在しない (= drag 中は開かない) ので破棄で足りる。
+			// gesture 中の Panel 破棄 / plugin unload。 開いた Undo transaction は無い
+			// (= drag 中は開かない) が、 drag 中に書いた値は Undo に載らないまま実データに
+			// 残るため、 onBefore の中断経路と同じく drag 前の値へ rollback する。
+			const stale = gesture_context
 			gesture_context = null
+			if (stale !== null) rollbackGesture(stale)
 			for (const { event, fn } of sync_listeners) {
 				Blockbench.removeListener?.(event, fn)
 			}

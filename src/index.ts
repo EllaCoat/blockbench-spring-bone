@@ -148,6 +148,9 @@ function normalizeSchemaVersion(raw: unknown): number | null {
 
 // schema version が新しすぎて override を無視した旨を警告済みの animation uuid。
 // readOverrides は毎 tick 呼ばれるため、 同一 animation への警告は 1 回だけに絞る。
+// **project 切替 / install / cleanup でクリアする** : uuid 単位の抑止なので、 同一
+// blueprint を複数 project で開くと 2 つ目以降の project で警告が出なくなる。
+// overridesMemo と同じ 3 箇所でリセットして project ごとに 1 回は出るようにする。
 const warnedNewerSchemaUuids = new Set<string>()
 
 // animation の override map を読む唯一の口。 normalizeOverrides を通して返すため、
@@ -1740,6 +1743,7 @@ function installTickLoop(): () => void {
 	// 初回 tick の変化検知をすり抜ける / 旧 project の instance 参照を握り続ける)。
 	lastSessionFingerprint = ''
 	overridesMemo = null
+	warnedNewerSchemaUuids.clear()
 
 	// animation pose 由来の cache invalidation は BB event / Undo transaction を境界にする案 A を採用。
 	// 案 B (= keyframe 全値を fingerprint 化) は display frame ごとの走査と BB 内部構造への依存が増え、
@@ -1837,6 +1841,9 @@ function installTickLoop(): () => void {
 		// override memo をクリア (= 旧 project の animation instance 参照を握り続けない。
 		// identity 比較なので残っていても誤ヒットはしないが、 参照保持を避ける)。
 		overridesMemo = null
+		// 上位 schema 警告の抑止も project 単位に戻す (= 同一 blueprint を別 project で
+		// 開いたときに警告が黙るのを防ぐ)。
+		warnedNewerSchemaUuids.clear()
 		if (projectRescanRafId !== null) return
 		projectRescanRafId = requestAnimationFrame(() => {
 			projectRescanRafId = null
@@ -1932,6 +1939,7 @@ function installTickLoop(): () => void {
 		lastGraphFingerprint = ''
 		lastSessionFingerprint = ''
 		overridesMemo = null
+		warnedNewerSchemaUuids.clear()
 		invalidatePreviewSession()
 	}
 }
