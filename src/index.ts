@@ -1873,11 +1873,13 @@ function installTickLoop(): () => void {
 	// 経路と onAnimFrame の状態遷移検知が共通で「1 回だけ発火」 を保証する。
 	const onAnimFrame = (): void => {
 		// **export 中は listener 本体ごと止める** (= tick() 冒頭の guard だけでは足りない)。
-		// AJ は frame ごとに updatePreview を走らせ、 その中の Animator.preview() が
-		// display_animation_frame を **同期発火** する (= animation_mode.js:454)。 session
-		// 破棄自体は invalidatePreviewSession 側の guard で止まるが、 それだけだと
-		// invalidateAnimationCache() が Animator.preview() を呼び返し、 AJ の frame ループへ
-		// 再入する経路が残る。
+		// export 中にこの event が飛ぶ主経路は AJ の frame ループではなく `Animation.select()`
+		// (= animation ごとに 1 回、 Modes.animate なら内部で Animator.preview() を呼び、 それが
+		// display_animation_frame を **同期発火** する = animation.js:246 / animation_mode.js:454)。
+		// AJ の frame ループ自体は updatePreviewBase() で animator を直接評価するため、 この
+		// event を発火しない。 session 破棄は invalidatePreviewSession 側の guard で止まるが、
+		// それだけだと invalidateAnimationCache() が Animator.preview() を呼び返し、 AJ の
+		// frame ループへ再入する経路が残る。
 		if (exportActive) return
 		try {
 			// keyframe edit transaction 中は値が preview ごとに変わり得るため、各 frame を 0 replay。
@@ -1954,15 +1956,15 @@ function installTickLoop(): () => void {
 		})
 	}
 	const onUpdateSelection = (): void => {
-		// export 中は registry を作り直さない : Animation.select() → unselectAllElements() が
+		// export 中の扱いは rescanRegistry() 側の guard に委ねる (= ここで早期 return しない)。
+		// この event は AJ の export 中にも飛ぶ : Animation.select() → unselectAllElements() が
 		// TickUpdates.selection を立て (= misc.js:256)、 AJ の render loop が
 		// await sleepForAnimationFrame() で main loop に制御を返した時点で updateSelection()
-		// が update_selection を dispatch する (= misc.js:235)。 session 破棄自体は
-		// invalidatePreviewSession 側の guard で止まるが、 rescan は registry / topoOrder /
-		// entry.base を **その場で差し替える** ため、 進行中の export が参照している
-		// entry 集合を frame の途中で入れ替えてしまう。 rig は export 中に変化しないので、
-		// ここは丸ごと後回しにして問題ない (= export 後の update_selection で拾い直す)。
-		if (exportActive) return
+		// が update_selection を dispatch する (= misc.js:235)。 rescan は registry / topoOrder /
+		// entry.base を **その場で差し替える** ため進行中の export に触らせてはいけないが、
+		// **ここで return すると pendingRescanAfterExport が立たず**、 この event でしか
+		// 通知されない構造変更が export 後も反映されないまま残る。 guard 済みの
+		// rescanRegistry() を通せば skip と予約が同時に成立する。
 		// idempotent rescan で既存 entry の state は保持、 session もそのまま (= 物理継続)。
 		rescanRegistry()
 	}
