@@ -1634,11 +1634,19 @@ interface PreviewAnimationContext extends AnimationContext<any> {
 // 選択中 animation (= selected があればそれだけ、 無ければ playing 群) を解決して
 // animationStack に確定させる。 stack の解決はこの関数 1 箇所だけ。
 function makePreviewAnimationContext(): PreviewAnimationContext {
-	const animSelected = (Animation as any)?.selected
+	// **削除済み animation は未選択として扱う** : Animation.remove() は
+	// Animator.animations.remove() → remove_animation dispatch → selected = null の順で
+	// 進む (= animation.js:406-428) ため、 listener が同期的に preview を呼ぶと
+	// Animation.selected は削除済み instance を指したままになる。 生存確認なしだと
+	// 削除済み animation を stack に積んでその override まで解決してしまい、 UI 側
+	// (= isAnimationAlive で未選択扱い) と BB 標準 preview の挙動から乖離する。
+	const all: any[] = Array.isArray((Animation as any)?.all) ? (Animation as any).all : []
+	const rawSelected = (Animation as any)?.selected
+	const animSelected = rawSelected && all.includes(rawSelected) ? rawSelected : null
 	const animationStack: any[] = animSelected
 		? [animSelected]
-		: ((Animation as any)?.all ?? []).filter((a: any) => a?.playing)
-	return { animation: animSelected ?? null, animationStack }
+		: all.filter((a: any) => a?.playing)
+	return { animation: animSelected, animationStack }
 }
 
 // timeToStepIndex は非 finite で RangeError を throw するため、 preview 側で 0 へ正規化する

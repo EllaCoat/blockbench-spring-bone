@@ -459,6 +459,15 @@ export function registerSpringPanel(deps: {
 						ctx.kind === 'animation' ? { animations: [ctx.animation] } : { groups: [ctx.group] }
 					owner = Undo ?? null
 					prev_save = owner?.current_save ?? null
+					if (prev_save !== null) {
+						// 既に開いている transaction がある = 他所の編集の最中。 BB の
+						// initEdit は guard 無しで current_save を置換する (= undo.js:24) ので、
+						// ここで開くとその編集が Undo から丸ごと消える。 gesture 側を諦めて
+						// 「操作が無かった」 状態へ戻す (= 中断 gesture と同じ扱い)。
+						console.warn('[spring_bone] slider onAfter skipped: another undo transaction is open')
+						rollbackGesture(ctx)
+						return
+					}
 					owner?.initEdit?.(aspects)
 					writeGestureValue(ctx, after)
 					owner?.finishEdit?.('Change spring config')
@@ -641,9 +650,18 @@ export function registerSpringPanel(deps: {
 						// 割り込めない = slider gesture 側と同じ原則)。
 						owner = Undo ?? null
 						prev_save = owner?.current_save ?? null
-						owner?.initEdit?.({ animations: [anim] })
-						anim[ANIM_OVERRIDES_KEY] = map
-						owner?.finishEdit?.('Change spring animation override')
+						if (prev_save !== null) {
+							// 既に開いている transaction がある = 他所の編集の最中。
+							// initEdit は guard 無しで current_save を置換する (= undo.js:24)
+							// ため、 ここで開くとその編集が Undo から消える。 書き込み自体を
+							// 中止し、 失敗経路と同じく後段の sync() で form を実データから
+							// 再同期する (= クリック済みの表示だけが残るのを防ぐ)。
+							console.warn('[spring_bone] override write skipped: another undo transaction is open')
+						} else {
+							owner?.initEdit?.({ animations: [anim] })
+							anim[ANIM_OVERRIDES_KEY] = map
+							owner?.finishEdit?.('Change spring animation override')
+						}
 					}
 				} catch (e) {
 					// slider 経路と同じ後始末 : initEdit / finishEdit は同期 event を
