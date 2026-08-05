@@ -160,6 +160,20 @@ const poseTrace = (log) => trace(log).filter((name) => name === 'reapply' || nam
 const advanceTargets = (log) => log.filter((e) => e.fn === 'evaluateStepIndex').map((e) => e.target)
 const countOf = (log, fn) => log.filter((e) => e.fn === fn).length
 
+// fn 実行中の console.warn を捕まえて引数列を返す (= 警告の回数を数えるため)。
+// 差し替えた console.warn は finally で必ず戻す。
+function captureWarnings(fn) {
+	const original = console.warn
+	const warnings = []
+	console.warn = (...args) => { warnings.push(args) }
+	try {
+		fn()
+	} finally {
+		console.warn = original
+	}
+	return warnings
+}
+
 // rendering + animation session を張った driver を返す共通の下ごしらえ。
 function startSession(options = {}, animationContext = makeAnimationContext('anim')) {
 	const { host, log, setEvaluating, getBasePoseWrapper } = makeHost(options)
@@ -485,4 +499,62 @@ test('ExportDriver: session が無い状態の onBeginRendering は余計な cle
 	disabledDriver.onBeginRendering()
 	disabledDriver.onBeginRendering()
 	assert.deepEqual(trace(disabled.log), ['isEnabled', 'isEnabled'])
+})
+
+// --- animation identity の検証 ---
+
+test('ExportDriver: onBeginAnimation と別 animation の onPose は no-op、 同じ animation は通常どおり', () => {
+	// runtime が持っているのは onBeginAnimation で受けた animation の evaluator と物理 state。
+	// 別 animation の frame をそのまま評価すると、 旧 animation の state で別 animation の
+	// scene を上書きする。 契約違反は throw せず静かに見送る。
+	const animA = makeAnimationContext('A')
+	const animB = makeAnimationContext('B')
+	const { driver, log } = startSession({}, animA)
+	log.length = 0
+	captureWarnings(() => {
+		driver.onPose(poseContext(animB, 0))
+		emitMeasuredFrame(driver, animB, 1)
+	})
+	assert.deepEqual(trace(log), [])
+
+	// session の animation なら advance / reapply が従来どおり走る (= 正常系を壊していない)
+	emitMeasuredFrame(driver, animA, 0)
+	assert.deepEqual(poseTrace(log), ['eval:0', 'reapply', 'reapply', 'reapply', 'reapply'])
+})
+
+test('ExportDriver: animation 不一致の警告は session ごとに 1 回だけ', () => {
+	// 不一致は frame ごとに届き得るので、 毎回警告すると log が溢れる。
+	const animA = makeAnimationContext('A')
+	const animB = makeAnimationContext('B')
+	const { driver, log } = startSession({}, animA)
+	log.length = 0
+	const warnings = captureWarnings(() => {
+		for (let frameIndex = 0; frameIndex < 3; frameIndex++) {
+			emitMeasuredFrame(driver, animB, frameIndex)
+		}
+	})
+	// 15 回の onPose すべてが不一致でも警告は 1 回
+	assert.equal(warnings.length, 1)
+	assert.deepEqual(trace(log), [])
+})
+
+test('ExportDriver: onEndAnimation → onBeginAnimation で新しい animation が正になる', () => {
+	const animA = makeAnimationContext('A')
+	const animB = makeAnimationContext('B')
+	const { driver, log } = startSession({}, animA)
+	const firstSessionWarnings = captureWarnings(() => driver.onPose(poseContext(animB, 0)))
+	assert.equal(firstSessionWarnings.length, 1)
+
+	driver.onEndAnimation()
+	driver.onBeginAnimation(animB)
+	log.length = 0
+	// 正となる animation が入れ替わり、 前 session の animation が今度は no-op 側になる。
+	// 警告は session ごとに arm し直されるので、 新 session でも 1 回は出る。
+	const secondSessionWarnings = captureWarnings(() => emitMeasuredFrame(driver, animA, 0))
+	assert.equal(secondSessionWarnings.length, 1)
+	assert.deepEqual(trace(log), [])
+
+	// 新しい animation は frame 0 から通常どおり評価される
+	emitMeasuredFrame(driver, animB, 0)
+	assert.deepEqual(poseTrace(log), ['eval:0', 'reapply', 'reapply', 'reapply', 'reapply'])
 })
