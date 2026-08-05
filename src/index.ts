@@ -250,7 +250,8 @@ function isSpringGroupForProperty(group?: unknown): boolean {
 	return isCapable(getSpringBoneState(group))
 }
 
-// Property 4 個 (= 数値 3 + enum `spring_bone_enabled`) を Group に register。
+// Property 6 個を register (= Group 側 4 個 : 数値 3 + enum `spring_bone_enabled`、
+// Animation 側 2 個 : object `spring_bone_overrides` + number `spring_bone_schema_version`)。
 // plugin onload で 1 回だけ呼ぶ。 数値 Property の element_panel input は edit モードのみ
 // 表示 (= BB 本体側の element_panel.ts condition)、 animate モードでは自然に消える。
 // animate モード用の値編集は専用 Panel (= ui.ts) で提供。
@@ -320,6 +321,13 @@ function registerProperties(): void {
 			if (data?.[key] === undefined) return
 			const version = normalizeSchemaVersion(data?.[ANIM_SCHEMA_VERSION_KEY])
 			if (version !== null && version > SPRING_SCHEMA_VERSION) {
+				// **前提契約 (= Round 7 WANT-2)** : この raw 保持が保存まで機能するには、
+				// `spring_bone_overrides` の top-level が将来の schema version でも
+				// 常に object である必要がある。 Property の登録型は 'object' で、
+				// BB の Property.copy は `typeof value === 'object'` の値しか出力
+				// しない (= property.ts:217-220) ため、 将来の schema で top-level が
+				// 文字列等の primitive に変わると、 開いて保存するだけで raw が
+				// 黙って消える。 version を上げる際は top-level を object に保つこと。
 				instance[key] = structuredClone(data[key])
 			} else {
 				instance[key] = normalizeOverrides(data[key])

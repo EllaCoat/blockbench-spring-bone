@@ -279,6 +279,18 @@ export function registerSpringPanel(deps: {
 	//   - 書き込みが成立しなかった gesture の transaction は cancelEdit で閉じる
 	//     (= BB の finishEdit は空 edit でも entry を push して Project.saved = false
 	//     にするため、 no-op で Undo entry を作らない契約を守れない)
+	// Round 7 での追加保証 :
+	//   - gesture 開始時に Undo の owner (= UndoSystem instance) と initEdit の
+	//     戻り値 (= transaction を識別する save object) を保持し、 閉じる側は
+	//     owner.current_save === save を確認してから finishEdit / cancelEdit を
+	//     呼ぶ (= Round 7 MUST-1 : gesture 中の project 切替で、 global Undo が
+	//     新 project の UndoSystem を返すようになり、 新 project 側へ誤って
+	//     transaction を発行するのを防ぐ)
+	//   - 非 slider 操作 (= checkbox / selector) の開始時にも残留 gesture を
+	//     回収する (= Round 7 MUST-2 : 残留したまま initEdit すると既存の
+	//     Undo.current_save が無条件に置換され、 成立済みの slider 書き込みが
+	//     Undo 対象から脱落する)。 回収処理は collectStaleGesture 1 関数に集約し、
+	//     slider onBefore / 非 slider 操作 / cleanup の 3 箇所から呼ぶ
 	interface SliderGestureContext {
 		// 書き込み種別 (= onBefore 時点の checkbox 状態で決まる)
 		kind: 'group' | 'animation'
@@ -302,6 +314,16 @@ export function registerSpringPanel(deps: {
 	// gesture 中に延期された form 再同期の flag (= Round 6 MUST-1)。 onAfter で
 	// 1 回だけまとめて実行したら下ろす。
 	let resync_pending = false
+	// Undo transaction の所有者 (= UndoSystem instance) と initEdit の戻り値
+	// (= transaction を識別する save object) を gesture ごとに保持する
+	// (= Round 7 MUST-1)。 BB の global Undo は「現在選択中 project の
+	// UndoSystem」を返す getter (= api.ts:373-375、 各 project は自身の
+	// UndoSystem を持つ = io/project.ts:124) で、 gesture 中に project が
+	// 切り替わると別 instance を返す。 閉じる側で global Undo を再評価すると
+	// 新 project 側へ finishEdit / cancelEdit を発行してしまうため、 initEdit
+	// 時点の owner と save を保持し、 閉じるのもその owner 経由で行う。
+	let edit_owner: any = null
+	let edit_save: any = null
 
 	// form 再同期の唯一の入口 (= Round 6 MUST-1)。 gesture 中 (= gesture_context が
 	// 生きている間) に同期契機が来てもその場で form を書き換えない : 書き換えると
@@ -317,28 +339,61 @@ export function registerSpringPanel(deps: {
 		pushValuesFromSelectedGroup(form, isSpringCapableGroup, readOverrides)
 	}
 
-	// 開いている Undo transaction を閉じる (= onAfter / 次 gesture 冒頭の残骸回収 /
-	// cleanup の 3 経路で共有)。 書き込みが 1 度も成立していない gesture
+	// 開いている Undo transaction を閉じる (= onAfter / collectStaleGesture 経由の
+	// 残骸回収の 2 経路から呼ばれる)。 書き込みが 1 度も成立していない gesture
 	// (= ctx が無い / wrote === false) は cancelEdit で空 entry を積まずに閉じる
 	// (= 契約 7 : no-op 操作で Undo entry を作らない)。 cancelEdit() は current_save を
 	// 破棄するだけで変更は revert しない (= 書き込み無しなので revert も不要)。
+	// **所有者検証 (= Round 7 MUST-1)** : 保持した owner の current_save が開始時の
+	// save と一致する場合にだけ finishEdit / cancelEdit を呼ぶ。 gesture 中に
+	// project が切り替わった場合、 global Undo は新 project の UndoSystem を返し、
+	// owner 側の current_save も別 transaction に差し替わり得るため、 一致確認なしに
+	// 呼ぶと他 project の transaction を誤って閉じる。 不一致の場合は何もせず
+	// context だけ破棄する (= 元 project 側に current_save が残っても、 BB 側の
+	// 次の initEdit が上書きするため放置でよい)。
 	const closeGestureEdit = (ctx: SliderGestureContext | null): void => {
 		if (!edit_started) return
+		const owner = edit_owner
+		const save = edit_save
 		try {
-			if (ctx !== null && ctx.wrote) {
-				Undo?.finishEdit?.('Change spring config')
-			} else if (typeof Undo?.cancelEdit === 'function') {
-				Undo.cancelEdit()
-			} else {
-				// cancelEdit が無い環境では空 entry が積まれるが、 transaction を
-				// 閉じること (= 後続の Undo を壊さない) を優先する
-				Undo?.finishEdit?.('Change spring config')
+			if (owner !== null && save !== null && owner.current_save === save) {
+				if (ctx !== null && ctx.wrote) {
+					owner.finishEdit?.('Change spring config')
+				} else if (typeof owner.cancelEdit === 'function') {
+					owner.cancelEdit()
+				} else {
+					// cancelEdit が無い環境では空 entry が積まれるが、 transaction を
+					// 閉じること (= 後続の Undo を壊さない) を優先する
+					owner.finishEdit?.('Change spring config')
+				}
 			}
+			// save が取れていない (= initEdit 自体が無い環境) か current_save が
+			// 不一致 (= project 切替 / 別 transaction 開始) の場合は閉じない。
+			// 検証できない transaction を他 project 側で誤って閉じるより、 閉じない
+			// 側に倒す。
 		} catch (e) {
 			console.warn('[spring_bone] close gesture edit failed', e)
 		} finally {
 			edit_started = false
+			edit_owner = null
+			edit_save = null
 		}
+	}
+
+	// 残留 gesture の回収 (= Round 6 WANT-1 / Round 7 MUST-2)。 onAfter が来ない
+	// 中断経路 (= window blur / touchcancel / Panel 破棄) で残った context と
+	// 開いた Undo transaction を閉じる。 slider の次 gesture 冒頭 / 非 slider 操作
+	// (= checkbox / selector) / cleanup の 3 箇所から呼ぶ。 戻り値 = 回収したか
+	// (= true の場合、 呼び出し側は表示が stale になり得るため form を実データから
+	// 再同期する)。 なお window blur / touchcancel の listener は **足さない** :
+	// drag 中に別 window へ切り替えて戻る操作を誤って中断扱いにするリスクがあるため。
+	const collectStaleGesture = (): boolean => {
+		if (gesture_context === null && !edit_started) return false
+		const stale = gesture_context
+		gesture_context = null
+		closeGestureEdit(stale)
+		resync_pending = false
+		return true
 	}
 	for (const meta of PANEL_INPUTS) {
 		const element = (form as any).form_data?.[meta.key]
@@ -346,17 +401,10 @@ export function registerSpringPanel(deps: {
 		if (slider) {
 			slider.onBefore = () => {
 				// 前 gesture の残骸回収 (= Round 6 WANT-1) : onAfter が来ない中断経路
-				// (= window blur / touchcancel 等で BB の mouseup / touchend が届かない)
 				// で context や開いた Undo transaction が残ったまま次の gesture が
 				// 始まった場合、 先に閉じてから新しい context を作る。 Undo.current_save
-				// を開いたまま後続操作へ持ち越さないための保証。 なお window blur /
-				// touchcancel の listener は **足さない** : drag 中に別 window へ
-				// 切り替えて戻る操作を誤って中断扱いにするリスクがあるため。
-				if (gesture_context !== null || edit_started) {
-					const stale = gesture_context
-					gesture_context = null
-					closeGestureEdit(stale)
-					resync_pending = false
+				// を開いたまま後続操作へ持ち越さないための保証。
+				if (collectStaleGesture()) {
 					// 中断した gesture で widget の表示値だけが動いている可能性が
 					// あるため、 新しい gesture を始める前に実データへ張り直す
 					pushValuesFromSelectedGroup(form, isSpringCapableGroup, readOverrides)
@@ -393,13 +441,21 @@ export function registerSpringPanel(deps: {
 					// gesture 中に状態が変わっても aspects と書き込み先はともに
 					// 開始時点で固定される (= before / after が別対象を指すのを防ぐ)。
 					const aspects = kind === 'animation' ? { animations: [anim] } : { groups: [g] }
-					Undo?.initEdit?.(aspects)
+					// owner (= UndoSystem instance) と save (= initEdit の戻り値) を
+					// 保持する (= Round 7 MUST-1)。 global Undo は現在 project の
+					// UndoSystem を返す getter のため、 gesture 中の project 切替で
+					// 別 instance に変わる。 閉じる側 (= closeGestureEdit) はこの
+					// owner / save で所有を検証してから transaction を閉じる。
+					edit_owner = Undo ?? null
+					edit_save = edit_owner?.initEdit?.(aspects) ?? null
 					edit_started = true
 				} catch (e) {
 					console.warn('[spring_bone] slider onBefore failed', e)
 					// initEdit に失敗した gesture は Undo 捕捉なしの書き込みになる
 					// ため、 context ごと破棄して input 側でも何も書かないようにする
 					gesture_context = null
+					edit_owner = null
+					edit_save = null
 				}
 			}
 			slider.onAfter = () => {
@@ -503,73 +559,96 @@ export function registerSpringPanel(deps: {
 		// ここで 1 操作分完結させる。 slider の move event と混ざらないよう changed_keys で分岐する。
 		const stateChanged = changed_keys.includes('spring_state')
 		const overridesChanged = changed_keys.includes('overrides')
-		if ((stateChanged || overridesChanged) && canWriteOverride && canWriteOverrides(anim)) {
-			try {
-				let map = readOverrides(anim)
-				// 実際に値が変わる操作があったか。 no-op 操作 (= 現在値の再クリック等)
-				// では Undo entry 自体を作らない (= Round 5 NITS-1 : no-op のたびに
-				// animation 全体の Undo entry を作り project を dirty 化するのを防ぐ)。
-				let changed = false
-				if (stateChanged) {
-					const state = result.spring_state
-					const desired = state === 'on' ? true : state === 'off' ? false : undefined
-					// 現在の override 値と意味的に同一なら書き込みごと省略する
-					if (map[boneUuid]?.enabled !== desired) {
-						if (desired === undefined) {
-							// 'inherit' (= または未知値) = enabled override を外す
-							map = clearOverrideField(map, boneUuid, 'enabled')
-						} else {
-							map = setOverrideField(map, boneUuid, 'enabled', desired)
+		if (stateChanged || overridesChanged) {
+			// 残留 gesture の回収 (= Round 7 MUST-2) : touchcancel 等で前 gesture の
+			// context / edit_started が残ったまま checkbox / selector を操作すると、
+			// 後段の initEdit が既存の Undo.current_save を無条件に置換し、 成立済みの
+			// slider 書き込みが Undo 対象から脱落する。 先に回収してから処理する。
+			if (collectStaleGesture()) {
+				// 回収した場合、 last_override_checks を含む表示状態は中断 gesture
+				// 起点の stale 状態の可能性がある。 stale な last_override_checks との
+				// diff 起点のこの操作は破棄し、 form を実データから再同期した状態から
+				// やり直させる。
+				pushValuesFromSelectedGroup(form, isSpringCapableGroup, readOverrides)
+			} else if (canWriteOverride && canWriteOverrides(anim)) {
+				try {
+					let map = readOverrides(anim)
+					// 実際に値が変わる操作があったか。 no-op 操作 (= 現在値の再クリック等)
+					// では Undo entry 自体を作らない (= Round 5 NITS-1 : no-op のたびに
+					// animation 全体の Undo entry を作り project を dirty 化するのを防ぐ)。
+					let changed = false
+					if (stateChanged) {
+						const state = result.spring_state
+						const desired = state === 'on' ? true : state === 'off' ? false : undefined
+						// 現在の override 値と意味的に同一なら書き込みごと省略する
+						if (map[boneUuid]?.enabled !== desired) {
+							if (desired === undefined) {
+								// 'inherit' (= または未知値) = enabled override を外す
+								map = clearOverrideField(map, boneUuid, 'enabled')
+							} else {
+								map = setOverrideField(map, boneUuid, 'enabled', desired)
+							}
+							changed = true
 						}
-						changed = true
 					}
-				}
-				if (overridesChanged) {
-					// changed_keys には 'overrides' しか載らないため、 直前同期時点
-					// (= last_override_checks) との diff で toggle された項目を特定する。
-					const inherited = resolveEffective(
-						readGroupBase(g),
-						toSpringBoneState(g?.spring_bone_enabled),
-						undefined,
-						PANEL_DEFAULTS,
-					)
-					for (const meta of PANEL_INPUTS) {
-						const now = result.overrides?.[meta.key] === true
-						const was = last_override_checks[meta.key] === true
-						if (now === was) continue
-						if (now) {
-							// OFF → ON : その時点の継承値を override 値として格納する
-							// (= 見た目の値を変えずに「上書き中」 へ移行する)
-							map = setOverrideField(map, boneUuid, meta.key, inherited[meta.key])
-						} else {
-							// ON → OFF : override を除去 (= slider 表示は後段の再同期で継承値に戻る)
-							map = clearOverrideField(map, boneUuid, meta.key)
+					if (overridesChanged) {
+						// changed_keys には 'overrides' しか載らないため、 直前同期時点
+						// (= last_override_checks) との diff で toggle された項目を特定する。
+						const inherited = resolveEffective(
+							readGroupBase(g),
+							toSpringBoneState(g?.spring_bone_enabled),
+							undefined,
+							PANEL_DEFAULTS,
+						)
+						for (const meta of PANEL_INPUTS) {
+							const now = result.overrides?.[meta.key] === true
+							const was = last_override_checks[meta.key] === true
+							if (now === was) continue
+							if (now) {
+								// OFF → ON : その時点の継承値を override 値として格納する
+								// (= 見た目の値を変えずに「上書き中」 へ移行する)
+								map = setOverrideField(map, boneUuid, meta.key, inherited[meta.key])
+							} else {
+								// ON → OFF : override を除去 (= slider 表示は後段の再同期で継承値に戻る)
+								map = clearOverrideField(map, boneUuid, meta.key)
+							}
+							changed = true
 						}
-						changed = true
 					}
+					if (changed) {
+						// map の書き換えは必ず setOverrideField / clearOverrideField の戻り値を
+						// 代入する形で行う。 in-place 変更は readOverrides の memo (= raw の
+						// object identity 比較) が検出できず、 Undo の差分捕捉も参照 identity
+						// 前提のため両方を壊す。
+						// initEdit は map 計算後・代入前に行う (= setOverrideField 系は
+						// 入力を変異させないため、 代入の瞬間までは animation の状態が
+						// 変わらず before-copy が正しく取れる)。
+						// この transaction は handler 内で init → 書き込み → finish が
+						// 同期的に完結する (= project 切替が挟まり得ない) ため、 owner の
+						// 保持は不要で global Undo をそのまま使う。
+						Undo?.initEdit?.({ animations: [anim] })
+						anim[ANIM_OVERRIDES_KEY] = map
+						Undo?.finishEdit?.('Change spring animation override')
+					}
+				} catch (e) {
+					console.warn('[spring_bone] panel override handler failed', e)
 				}
-				if (changed) {
-					// map の書き換えは必ず setOverrideField / clearOverrideField の戻り値を
-					// 代入する形で行う。 in-place 変更は readOverrides の memo (= raw の
-					// object identity 比較) が検出できず、 Undo の差分捕捉も参照 identity
-					// 前提のため両方を壊す。
-					// initEdit は map 計算後・代入前に行う (= setOverrideField 系は
-					// 入力を変異させないため、 代入の瞬間までは animation の状態が
-					// 変わらず before-copy が正しく取れる)。
-					Undo?.initEdit?.({ animations: [anim] })
-					anim[ANIM_OVERRIDES_KEY] = map
-					Undo?.finishEdit?.('Change spring animation override')
-				}
-			} catch (e) {
-				console.warn('[spring_bone] panel override handler failed', e)
+				// 書き込み後の再同期 (= ON → OFF で slider を継承値へ戻し、
+				// last_override_checks を新しい map の truth に張り直す)。
+				// setValues は 'input' を再発火しない (= cause: 'update_value') ため再帰しない。
+				// この時点で gesture_context は必ず null (= 直上の collectStaleGesture が
+				// false = 残留なし、 かつ handler は同期的で新 gesture も始まらない) ため
+				// requestSync は即時同期になる。
+				requestSync()
+			} else {
+				// 書き込み対象が無効な stale override 行の操作 (= Round 7 WANT-1) :
+				// AnimationController.select() 後等で override 行が表示残留している
+				// 状態で操作すると、 guard が偽で保存データは守られるがクリック済みの
+				// selector / checkbox の表示がそのまま残る。 再同期して行を非表示にし、
+				// 表示とデータの不一致を解消する。 この時点で gesture_context は必ず
+				// null なので requestSync は即時同期になる。
+				requestSync()
 			}
-			// 書き込み後の再同期 (= ON → OFF で slider を継承値へ戻し、
-			// last_override_checks を新しい map の truth に張り直す)。
-			// setValues は 'input' を再発火しない (= cause: 'update_value') ため再帰しない。
-			// requestSync 経由にするのは deferral の一貫性のため (= checkbox 操作は通常
-			// gesture 外なので即時同期になるが、 万一 gesture 中に来ても表示を
-			// 書き換えず onAfter に延期する = Round 6 MUST-1)。
-			requestSync()
 		}
 		// registry sync + fingerprint invalidate (= 次 tick で 0 replay、 preview 即反映)
 		try {
@@ -605,14 +684,11 @@ export function registerSpringPanel(deps: {
 
 	return () => {
 		try {
-			// gesture 中断経路の回収 (= Round 6 WANT-1) : onAfter が来ない中断
-			// (= gesture 中の Panel 破棄 / plugin unload 等) で context や開いた
-			// Undo transaction が残っていたら必ず閉じる。 Undo.current_save を
+			// gesture 中断経路の回収 (= Round 6 WANT-1 / Round 7 MUST-2) : onAfter が
+			// 来ない中断 (= gesture 中の Panel 破棄 / plugin unload 等) で context や
+			// 開いた Undo transaction が残っていたら必ず閉じる。 Undo.current_save を
 			// 開いたまま unload すると後続の Undo 操作が壊れる。
-			const stale = gesture_context
-			gesture_context = null
-			closeGestureEdit(stale)
-			resync_pending = false
+			collectStaleGesture()
 			for (const { event, fn } of sync_listeners) {
 				Blockbench.removeListener?.(event, fn)
 			}
