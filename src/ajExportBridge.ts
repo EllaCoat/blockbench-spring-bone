@@ -87,6 +87,12 @@ export function createExportDriver<C>(host: ExportDriverHost<C>): ExportDriver {
 	// runtime の animation session が張られているかどうか。 onBeginAnimation が
 	// 失敗した場合は false のままで、 以降の onPose は no-op になる。
 	let animationActive = false
+	// 現 session の対象 animation。 onPose の context.animation と照合して、 別 animation の
+	// frame が紛れ込んだら評価しない (= 旧 animation の evaluator と物理 state で別 animation の
+	// scene を上書きしないため)。
+	let sessionAnimation: unknown = null
+	// animation 不一致の警告は session ごとに 1 回だけ (= frame ごとに出すと log が溢れる)。
+	let warnedAnimationMismatch = false
 
 	// export session の後始末 (= onEndRendering の本体)。 **冪等** : 非 active なら no-op。
 	// onEndRendering と、 契約違反の二重 onBeginRendering の両方から呼ぶ。
@@ -98,6 +104,7 @@ export function createExportDriver<C>(host: ExportDriverHost<C>): ExportDriver {
 		if (!renderingActive) return
 		renderingActive = false
 		animationActive = false
+		sessionAnimation = null
 		let pendingError: unknown = null
 		let hasPendingError = false
 		const runCleanup = (label: string, cleanup: () => void): void => {
@@ -149,6 +156,8 @@ export function createExportDriver<C>(host: ExportDriverHost<C>): ExportDriver {
 			if (!renderingActive) return
 			// beginAnimation が失敗した場合に「開始済み」 が残らないよう先に倒す
 			animationActive = false
+			sessionAnimation = context.animation
+			warnedAnimationMismatch = false
 			const exportContext = host.makeExportContext(context.animation, context.excludedNodeUuids)
 			// AJ 側の evaluateBasePose は (timeSeconds) => void、 runtime が要求するのは
 			// (timeSeconds, context) => void なので wrapper で包む。 context 引数は使わない
@@ -161,6 +170,18 @@ export function createExportDriver<C>(host: ExportDriverHost<C>): ExportDriver {
 
 		onPose(context: RenderHookContextLike): void {
 			if (!renderingActive || !animationActive) return
+			// 現 session と別の animation の frame は評価しない。 runtime が持っているのは
+			// onBeginAnimation で受けた animation の evaluator と物理 state なので、 これで
+			// 評価すると **別 animation の scene を旧 animation の state で上書きする**。
+			// 契約違反は throw せず静かに見送る (= AJ が契約を守らなくても runtime と preview を
+			// 壊さない、 という driver の設計方針)。 警告は session ごとに 1 回だけ出す。
+			if (context.animation !== sessionAnimation) {
+				if (!warnedAnimationMismatch) {
+					warnedAnimationMismatch = true
+					console.warn('[spring_bone] export driver: onPose received a different animation than onBeginAnimation, skipping')
+				}
+				return
+			}
 			// runtime の評価中に届いた onPose は再入 (= 想定外)。 runtime の state を
 			// 壊さないため何もしない。
 			if (host.isEvaluating) return
@@ -182,6 +203,7 @@ export function createExportDriver<C>(host: ExportDriverHost<C>): ExportDriver {
 			if (!renderingActive) return
 			// endAnimation が失敗しても「開始済み」 が残らないよう先に倒す
 			animationActive = false
+			sessionAnimation = null
 			host.endAnimation()
 		},
 

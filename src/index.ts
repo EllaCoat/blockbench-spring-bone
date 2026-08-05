@@ -211,6 +211,24 @@ function canWriteOverrides(animation: any): boolean {
 	return version === null || version <= SPRING_SCHEMA_VERSION
 }
 
+// `Animator.preview()` を呼ぶ唯一の口。 呼び出し条件と失敗時の扱いをここへ集約する。
+// - **export 中は呼ばない** : Animator.preview は scene に base pose を当て直すため、 AJ が
+//   確定させた pose を上書きしてしまう。 listener 側の guard では間に合わない
+//   (= preview が同期的に scene を書き換えた後の display_animation_frame でしか気付けない)
+// - **animate モード限定** : edit モードで呼ぶと Animator.preview 内の stackAnimations が
+//   playing=true の Animation を edit viewport に適用して pose を壊す (= animation.js:230 で
+//   Animation.select が playing=true を設定、 mode 切替後も flag を保持するため)
+// - 失敗は warn に落とす (= preview refresh の失敗で呼び出し元の処理を巻き込まない)
+function requestAnimatorPreview(reason: string): void {
+	if (exportActive) return
+	if (!Modes?.animate) return
+	try {
+		Animator?.preview?.()
+	} catch (e) {
+		console.warn(`[${PLUGIN_ID}] Animator.preview failed (${reason})`, e)
+	}
+}
+
 // Property 変更時の同期 hook。 element_panel input の onChange から呼ばれる。
 // - 全 registered spring group の Property 値を entry.base (= Group 既定値) に反映
 //   (= effective への合成は次 tick の beginAnimation → resolveConfigs が行う)
@@ -219,6 +237,13 @@ function canWriteOverrides(animation: any): boolean {
 //   自然発火しないため、 fingerprint invalidate だけでは scrub まで値が反映されない。
 //   `Animator.preview()` を明示的に呼ぶことで停止中の即時反映を確保する (= 受け入れ条件 (c))。
 function onSpringPropertyChange(): void {
+	// **export 中は entry.base を書き換えない** : 進行中の export が読む物理パラを frame の
+	// 途中で差し替えてしまう。 Property の値自体は BB 側 (= Group Property) に入っているので、
+	// export 後の rescan (= 同じ resolveConfig の読み直し) で必ず追いつく。
+	if (exportActive) {
+		pendingRescanAfterExport = true
+		return
+	}
 	for (const entry of registry.values()) {
 		Object.assign(entry.base, resolveConfig(entry, null))
 	}
@@ -226,19 +251,10 @@ function onSpringPropertyChange(): void {
 	// (= 次 tick の rescanRegistry で fp !== lastGraphFingerprint 判定が真になる)。
 	lastGraphFingerprint = ''
 	invalidatePreviewSession()
-	// **animate モード限定で** Animator.preview を呼ぶ (= Round 2 review MUST-1 regression fix)。
-	// element_panel の onChange 経路は modes: ['edit'] で edit 専用、 その場合 Animator.preview は
-	// (a) tick() が !Modes?.animate で early-return するため意味がない、 加えて
-	// (b) Animator.preview 内の stackAnimations が playing=true の Animation を edit viewport に
-	//     適用してしまい pose 破壊 (= animation.js:230 で Animation.select が playing=true を設定、
-	//     mode 切替後も flag 保持)。 animate モードのみで呼ぶことで両方回避。
-	if (Modes?.animate) {
-		try {
-			Animator?.preview?.()
-		} catch (e) {
-			console.warn(`[${PLUGIN_ID}] Animator.preview failed`, e)
-		}
-	}
+	// playback 停止中は display_animation_frame が自然発火しないため、 明示 preview で
+	// 即時反映を確保する (= 受け入れ条件 (c))。 animate モード限定 / export 中 skip /
+	// 失敗時の warn は requestAnimatorPreview に集約。
+	requestAnimatorPreview('property change')
 }
 
 // 数値 Property 3 つ (= spring_drag / spring_stiffness / spring_gravity) の condition 判定。
@@ -594,13 +610,7 @@ function registerContextMenuActions(): void {
 				console.warn(`[${PLUGIN_ID}] updateSelection failed after springify`, e)
 			}
 			// animate モード時は preview 明示 refresh、 mesh.rotation を最新 rig state に追従させる。
-			if (Modes?.animate) {
-				try {
-					Animator?.preview?.()
-				} catch (e) {
-					console.warn(`[${PLUGIN_ID}] preview refresh failed after springify`, e)
-				}
-			}
+			requestAnimatorPreview('springify')
 		},
 	})
 
@@ -648,13 +658,7 @@ function registerContextMenuActions(): void {
 			// 「アニメーションが完全停止」 に見える (= 症状 3 凍結の真因)。 Animator.preview を明示発火し
 			// 現在 Timeline.time の pose を apply して mesh.rotation を上書きすることで、
 			// 解除された bone の visual が最新 animation state に追従する。
-			if (Modes?.animate) {
-				try {
-					Animator?.preview?.()
-				} catch (e) {
-					console.warn(`[${PLUGIN_ID}] preview refresh failed after unspringify`, e)
-				}
-			}
+			requestAnimatorPreview('unspringify')
 		},
 	})
 
@@ -702,13 +706,7 @@ function registerContextMenuActions(): void {
 			} catch (e) {
 				console.warn(`[${PLUGIN_ID}] updateSelection failed after springify_recursive`, e)
 			}
-			if (Modes?.animate) {
-				try {
-					Animator?.preview?.()
-				} catch (e) {
-					console.warn(`[${PLUGIN_ID}] preview refresh failed after springify_recursive`, e)
-				}
-			}
+			requestAnimatorPreview('springify_recursive')
 		},
 	})
 
@@ -755,13 +753,7 @@ function registerContextMenuActions(): void {
 			} catch (e) {
 				console.warn(`[${PLUGIN_ID}] updateSelection failed after unspringify_recursive`, e)
 			}
-			if (Modes?.animate) {
-				try {
-					Animator?.preview?.()
-				} catch (e) {
-					console.warn(`[${PLUGIN_ID}] preview refresh failed after unspringify_recursive`, e)
-				}
-			}
+			requestAnimatorPreview('unspringify_recursive')
 		},
 	})
 
@@ -971,6 +963,11 @@ let inhibitTick = false   // applyPoseAt 由来の再描画で tick が再入す
 // **counter ではなく boolean 代入にする** : AJ 側が onEndRendering を届けられなかった後に
 // onBeginRendering が来ると suspend が二重に呼ばれ得るため、 counter だと解除されなくなる。
 let exportActive = false
+// export 中に skip した registry 更新の取り戻し予約。 rescanRegistry / onSpringPropertyChange が
+// export 中に呼ばれたら立て、 export 終了時 (= host.resumeTick) に 1 回だけ rescan する。
+// 「export 中に rig を編集する」 自体が非現実的なので凝った仕組みは作らず、 **状態が古いまま
+// 残らないこと** だけを保証する。
+let pendingRescanAfterExport = false
 // project 切替 (= select_project / load_project) 受信から rAF コールバックでの rescan 完了
 // までの間だけ立つ flag。 遅延中は旧 project の registry / session が生きたまま残るため、
 // parse 完了後に同期的に走る Animation.select() → Animator.preview() が旧 entry を評価
@@ -1260,6 +1257,15 @@ function computeSessionFingerprint(context: PreviewAnimationContext): string {
 // (= update_selection event 経由のボーンクリックで物理状態が初期化される問題の真因)。
 // rescan の末尾で parentUuid を最新の group.parent から refresh し、 topoOrder を再構築する。
 function rescanRegistry(): void {
+	// **export 中は registry を作り直さない** (= 全経路の入口で 1 箇所止め)。 registry /
+	// topoOrder / entry.base をその場で差し替えると、 進行中の export が参照している entry
+	// 集合が frame の途中で入れ替わる。 listener 側で経路を列挙する形は漏れる (= project 切替の
+	// rAF / undo / redo / context menu action / Property 変更 すべてがここへ来る)。
+	// skip した分は export 終了時に取り戻す (= pendingRescanAfterExport)。
+	if (exportActive) {
+		pendingRescanAfterExport = true
+		return
+	}
 	const groups = (Project as { groups?: unknown[] } | null)?.groups
 	if (!Array.isArray(groups)) {
 		registry.clear()
@@ -1804,10 +1810,12 @@ function tick(): void {
 let cleanups: Array<() => void> = []
 
 function installTickLoop(): () => void {
-	// **rescanRegistry / invalidatePreviewSession より前に倒す** : invalidatePreviewSession は
-	// exportActive 中 no-op になるため、 後に倒すと install 時の session 破棄が空振りする
+	// **rescanRegistry / invalidatePreviewSession より前に倒す** : どちらも exportActive 中は
+	// no-op になるため、 後に倒すと install 時の rescan / session 破棄が空振りする
 	// (= export 中に plugin reload が挟まった場合に「止まったまま」 で復帰しない)。
 	exportActive = false
+	// 直後の rescanRegistry が最新状態を作るので、 持ち越しの予約は捨てる
+	pendingRescanAfterExport = false
 	rescanRegistry()
 	invalidatePreviewSession()
 	inhibitTick = false
@@ -1843,12 +1851,7 @@ function installTickLoop(): () => void {
 	const invalidateAnimationCache = (): void => {
 		wasKeyframeEditActive = false
 		invalidatePreviewSession()
-		if (!Modes?.animate) return
-		try {
-			Animator?.preview?.()
-		} catch (e) {
-			console.warn(`[${PLUGIN_ID}] animation cache refresh failed`, e)
-		}
+		requestAnimatorPreview('animation cache refresh')
 	}
 
 	// wasKeyframeEditActive = 前 tick 時点で編集 transaction 中だったかの状態 (= 遷移検知用)。
@@ -1945,16 +1948,9 @@ function installTickLoop(): () => void {
 			// rescan 完了をその場で preview に反映する。 paused 中は display_animation_frame が
 			// 自然発火しないため、 明示 preview 無しだと parse 中に先行した preview (= 空 or 旧
 			// registry で評価済み) のまま、 次のユーザー操作まで新 project の spring physics が
-			// 表示されない。 **animate モード限定** にする理由は onSpringPropertyChange と同じ
-			// (= edit モードで呼ぶと Animator.preview 内の stackAnimations が playing=true の
-			// Animation を edit viewport に適用して pose 破壊)。
-			if (Modes?.animate) {
-				try {
-					Animator?.preview?.()
-				} catch (e) {
-					console.warn(`[${PLUGIN_ID}] Animator.preview failed after project switch`, e)
-				}
-			}
+			// 表示されない。 **export 中は rescan ごと skip される** (= rescanRegistry の guard)
+			// ため、 preview も requestAnimatorPreview 側の guard で自動的に見送られる。
+			requestAnimatorPreview('project switch')
 		})
 	}
 	const onUpdateSelection = (): void => {
@@ -1992,11 +1988,14 @@ function installTickLoop(): () => void {
 	// (= Codex Round 2 MUST-1 / Fable Round 2 WANT-1)。 unconditional preview 呼びで最新
 	// state を強制反映、 config undo 時の 2 replay 代償は個人スコープで許容 (dirty-flag による
 	// conditional skip は overkill 判定)。
+	// export 中は rescanRegistry / invalidatePreviewSession / requestAnimatorPreview の
+	// いずれも自前の guard で no-op になる (= undo 自体は BB 側で成立し、 我々の同期は
+	// export 終了後の rescan に持ち越される)。
 	const onUndoRedo = (): void => {
 		try {
 			rescanRegistry()
 			invalidatePreviewSession()
-			if (Modes?.animate) Animator?.preview?.()
+			requestAnimatorPreview('undo/redo')
 		} catch (e) {
 			console.warn(`[${PLUGIN_ID}] undo/redo refresh failed`, e)
 		}
@@ -2024,6 +2023,7 @@ function installTickLoop(): () => void {
 		// export 中に unload されても flag を残さない (= 次の install / reload で preview が
 		// 止まったままになるのを防ぐ)。
 		exportActive = false
+		pendingRescanAfterExport = false
 		Blockbench.removeListener?.('display_animation_frame', onAnimFrame)
 		Blockbench.removeListener?.('select_project', onProjectSwitch)
 		Blockbench.removeListener?.('load_project', onProjectSwitch)
@@ -2062,7 +2062,19 @@ const exportDriverHost: ExportDriverHost<PreviewAnimationContext> = {
 	get currentStepIndex(): number | null { return runtime.currentStepIndex },
 	get isEvaluating(): boolean { return runtime.isEvaluating },
 	suspendTick: () => { exportActive = true },
-	resumeTick: () => { exportActive = false },
+	resumeTick: () => {
+		exportActive = false
+		// export 中に skip した registry 更新をここで取り戻す (= 古い registry が残らない)。
+		// driver はこの直後に invalidatePreview() を呼ぶため、 session は必ず張り直される。
+		// 失敗しても後続の後始末を止めない (= driver 側の cleanup runner に例外を渡さない)。
+		if (!pendingRescanAfterExport) return
+		pendingRescanAfterExport = false
+		try {
+			rescanRegistry()
+		} catch (e) {
+			console.warn(`[${PLUGIN_ID}] rescanRegistry failed after export`, e)
+		}
+	},
 	invalidatePreview: () => { invalidatePreviewSession() },
 	makeExportContext: (animation, excludedNodeUuids) => makeExportAnimationContext(animation, excludedNodeUuids),
 	// capable な bone が 1 つも無い project では export に一切介入しない : 介入すると
@@ -2080,11 +2092,11 @@ function installAjExportDriver(): () => void {
 	// window.AnimatedJava.renderHooks が新しい object に差し替わり、 内部の登録 Map ごと
 	// 作り直される** ため、 旧 registry に居る driver は以後無言で呼ばれなくなる。 参照比較なら
 	// 「後から load された」 と「reload された」 を同じ経路で拾える。
-	// registeredApi = 実際に登録できた registry (= cleanup の unregister 先)。
-	// attemptedApi = 成否によらず register を試した registry (= 同じ相手への再試行を避ける。
-	// 失敗は id 重複が主因で、 再試行しても同じ結果になり warn だけが溜まる)。
+	// registeredApi = 実際に登録できた registry (= cleanup の unregister 先 + 再登録要否の判定基準)。
+	// **失敗時は更新しない** : 旧 driver の unregister 遅れ等で一時的に id が衝突していた場合、
+	// 更新してしまうと衝突が解消しても plugin reload まで登録し直せない。 再試行の頻度は
+	// loaded_plugin の発火回数に限られるので、 warn の重複は許容する。
 	let registeredApi: AjRenderHooksApi | null = null
-	let attemptedApi: AjRenderHooksApi | null = null
 	let retryListener: ((...args: unknown[]) => void) | null = null
 
 	const detachRetry = (): void => {
@@ -2097,8 +2109,7 @@ function installAjExportDriver(): () => void {
 	const syncRegistration = (): void => {
 		const api = window?.AnimatedJava?.renderHooks
 		if (!api || api.version !== 1 || typeof api.register !== 'function') return
-		if (api === attemptedApi) return
-		attemptedApi = api
+		if (api === registeredApi) return
 		try {
 			api.register(PLUGIN_ID, driver)
 			registeredApi = api
@@ -2132,7 +2143,6 @@ function installAjExportDriver(): () => void {
 		} catch (e) {
 			console.warn(`[${PLUGIN_ID}] AnimatedJava export driver shutdown failed`, e)
 		}
-		attemptedApi = null
 		const api = registeredApi
 		if (api === null) return
 		registeredApi = null
