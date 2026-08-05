@@ -46,6 +46,23 @@ type IsSpringCapableGroup = (group: unknown) => boolean
 // 直接呼ぶと version gate を迂回するため、 read は必ずこの経路を通す。
 type ReadOverrides = (animation: any) => SpringOverrideMap
 
+// 「この animation の override を書いてよいか」の判定型。 index.ts の
+// canWriteOverrides (= 未知の上位 schema version への書き込み禁止判定) を注入する。
+// Panel の全書き込み経路 (= slider gesture / checkbox / selector) は書き込み前に
+// この判定を通す (= Round 5 MUST-4)。
+type CanWriteOverrides = (animation: any) => boolean
+
+// animation が project にまだ存在するか (= 削除済みでないか) の判定。
+// Animation.all = Project.animations (= BB animation.js:653-660)。
+// animation 削除時の `remove_animation` event は `Animation.selected = null` より
+// **前** に発火する (= animation.js:428 → 429) ため、 event 契機の同期だけでは
+// 削除済み animation を selected として読み続ける窓が残る。 表示同期と書き込み
+// 検証の両方でこの判定を通してその窓を塞ぐ (= Round 5 MUST-2)。
+function isAnimationAlive(anim: any): boolean {
+	const all = Animation?.all
+	return Array.isArray(all) && all.includes(anim)
+}
+
 // Property 3 パラの UI メタ情報 (= registerProperties と 1:1 対応、 range / step も同値)。
 const PANEL_INPUTS = [
 	{ key: 'drag', label: 'Drag', min: 0, max: 1, step: 0.01, defaultValue: 0.05 },
@@ -106,7 +123,11 @@ function pushValuesFromSelectedGroup(
 	const g = Group.first_selected
 	const base = readGroupBase(g)
 	const groupState = toSpringBoneState(g?.spring_bone_enabled)
-	const anim = Animation?.selected ?? null
+	const animSelected = Animation?.selected ?? null
+	// 削除済み animation が selected に残っているケース (= remove_animation が
+	// selected=null より先に発火する) は「未選択」として扱う (= Round 5 MUST-2)。
+	// これが無いと削除直後の同期で削除済み animation の override を表示に張り直す。
+	const anim = animSelected !== null && isAnimationAlive(animSelected) ? animSelected : null
 	const boneUuid = typeof g?.uuid === 'string' ? g.uuid : null
 	const override = anim !== null && boneUuid !== null ? readOverrides(anim)[boneUuid] : undefined
 	const inherited = resolveEffective(base, groupState, undefined, PANEL_DEFAULTS)
@@ -130,14 +151,19 @@ function pushValuesFromSelectedGroup(
 }
 
 // Panel + form + event listener を register して cleanup 関数を返す。
-// onChange = index.ts の onSpringPropertyChange (= registry sync + invalidatePreviewSession() による session 破棄)。
-// isSpringCapableGroup = index.ts の isSpringGroup (= Property ベースの capable 判定) を注入。
-// readOverrides = index.ts の readOverrides (= schema version gate + memo 付きの唯一の read 経路) を注入。
-export function registerSpringPanel(
-	onChange: () => void,
-	isSpringCapableGroup: IsSpringCapableGroup,
-	readOverrides: ReadOverrides,
-): () => void {
+// 注入 deps (= Round 5 MUST-4 で object 引数化、 呼び出し元は index.ts onload の 1 箇所) :
+// - onChange = index.ts の onSpringPropertyChange (= registry sync + invalidatePreviewSession() による session 破棄)
+// - isSpringCapableGroup = index.ts の isSpringGroup (= Property ベースの capable 判定)
+// - readOverrides = index.ts の readOverrides (= schema version gate + memo 付きの唯一の read 経路)
+// - canWriteOverrides = index.ts の canWriteOverrides (= 上位 schema version への
+//   書き込み禁止判定。 全書き込み経路で書き込み前に確認する)
+export function registerSpringPanel(deps: {
+	onChange: () => void
+	isSpringCapableGroup: IsSpringCapableGroup
+	readOverrides: ReadOverrides
+	canWriteOverrides: CanWriteOverrides
+}): () => void {
+	const { onChange, isSpringCapableGroup, readOverrides, canWriteOverrides } = deps
 	if (typeof Panel !== 'function' || typeof InputForm !== 'function') {
 		console.warn('[spring_bone] Panel or InputForm not available, skipping panel registration')
 		return () => {}
@@ -167,16 +193,28 @@ export function registerSpringPanel(
 	// updateElementForm() と同 pattern (= form_config オブジェクト直接書き換え + buildForm)。
 	const form_config = form.form_config
 
-	// 選択中 animation 限定の override 行 2 つ。 condition は Animation.selected の有無
-	// (= animation 未選択でも Panel 自体と Group 既定値 slider は従来どおり使える)。
+	// 選択中 animation 限定の override 行 2 つ。 表示条件 :
+	//   - animation が選択されている (= animation 未選択でも Panel 自体と Group
+	//     既定値 slider は従来どおり使える)
+	//   - 削除済み animation でない (= remove_animation は selected=null より先に
+	//     発火するため、 event 契機の同期だけでは削除直後に stale 表示が残る)
+	//   - 書き込み可能な schema version である (= Round 5 MUST-4 : 未知の上位
+	//     version では readOverrides が空 map を返すため、 その空 map 起点の編集
+	//     結果を代入すると未知 schema の raw が消える。 行ごと隠して操作自体を
+	//     不可能にする)
 	// condition は form.update() が form_result を context に評価する
 	// (= form.ts:223-232) ので、 値同期のたびに表示 / 非表示が追従する。
+	const isOverrideRowVisible = (): boolean => {
+		const anim = Animation?.selected
+		if (!anim || !isAnimationAlive(anim)) return false
+		return canWriteOverrides(anim)
+	}
 	form_config.spring_state = {
 		label: 'In this animation',
 		type: 'inline_select',
 		options: { inherit: '継承', on: '有効', off: '無効' },
 		value: 'inherit',
-		condition: () => !!Animation?.selected,
+		condition: isOverrideRowVisible,
 	}
 	form_config.overrides = {
 		label: 'Override',
@@ -186,7 +224,7 @@ export function registerSpringPanel(
 		// setValue が「this.value に存在する key しか更新しない」 実装 (= form.ts:781-789)
 		// のため以降の同期が一切反映されない。 全 key を false で初期化しておく。
 		value: { drag: false, stiffness: false, gravity: false },
-		condition: () => !!Animation?.selected,
+		condition: isOverrideRowVisible,
 	}
 
 	// NumSlider 3 個 = Group Property (= 全 animation 共通の既定値) の編集。
@@ -209,13 +247,6 @@ export function registerSpringPanel(
 		console.warn('[spring_bone] form.buildForm failed', e)
 	}
 
-	// その項目が override 書き込み対象か (= overrides 行の checkbox ON かつ animation
-	// 選択中) の判定。 slider の onBefore (= drag 開始時の aspects 決定) と input
-	// handler (= 書き込み先の分岐) の 2 箇所から使う。 form element の生値ではなく
-	// last_override_checks (= override map と同期済みの truth) を見る。
-	const isOverrideTarget = (key: PanelSliderKey): boolean =>
-		!!Animation?.selected && last_override_checks[key] === true
-
 	// 症状 1 (Undo 粒度爆発) の primary fix : NumSlider の onBefore/onAfter に
 	// initEdit/finishEdit を寄せて per-gesture 1 Undo entry に集約する。 BB core の
 	// NumSlider (= actions.ts:1179/1210) は drag 開始 → onBefore、 drag 終了 → onAfter を
@@ -223,39 +254,89 @@ export function registerSpringPanel(
 	// これで form.on('input') が per-move-event で発火しても Undo entry は 1 gesture 1 個で済む。
 	// form.buildForm() 後に form.form_data[key].slider が生きているタイミングで差し替える。
 	//
+	// **gesture context (= Round 5 MUST-1)** : onBefore で「書き込み先を確定した context」
+	// を作り、 gesture 中の form.on('input') はその context だけを見る。 旧実装は
+	// Undo の aspects は onBefore で固定されるのに実際の書き込み先 (= 選択中 animation /
+	// Group / checkbox 状態) は input のたびに再計算していたため、 drag 中に選択や
+	// checkbox 状態が変わると Undo が捕捉していない animation / Group へ変更が入り、
+	// Undo / Redo で復元できなかった。 onAfter で context を破棄する。
+	//
 	// edit_started フラグは onBefore で initEdit を実際に発火できたかを追跡する。
 	// drag 中に selection が非 spring group へ切り替わっても、 edit_started なら onAfter は
 	// 必ず finishEdit を呼んで Undo transaction を閉じる (= Codex Round 3 IMO-1 対策、
 	// 未対応だと initEdit が開きっぱなしになり後続の Undo 操作が壊れる)。
+	interface SliderGestureContext {
+		// 書き込み種別 (= onBefore 時点の checkbox 状態で決まる)
+		kind: 'group' | 'animation'
+		// 対象 Group の参照と uuid (= Undo aspects と同じ参照)
+		group: any
+		boneUuid: string
+		// kind === 'animation' の対象 animation (= 同様に aspects と同じ参照)
+		animation: any | null
+		// 書き込み直前検証 (= Round 5 MUST-2) で中止したら true。 以降の input は
+		// 何も書かず、 onAfter の finishEdit で transaction だけ閉じる
+		aborted: boolean
+	}
 	let edit_started = false
+	let gesture_context: SliderGestureContext | null = null
 	for (const meta of PANEL_INPUTS) {
 		const element = (form as any).form_data?.[meta.key]
 		const slider = element?.slider
 		if (slider) {
 			slider.onBefore = () => {
 				if (!isSpringSelectionCapable(isSpringCapableGroup)) return
+				const g = Group.first_selected
+				const boneUuid = typeof g?.uuid === 'string' ? g.uuid : null
+				if (boneUuid === null) return
+				const wantsOverride = last_override_checks[meta.key] === true
+				const anim = Animation?.selected ?? null
+				if (wantsOverride && (anim === null || !isAnimationAlive(anim))) {
+					// 表示上は override 編集中だが animation が既に無い (= 削除 /
+					// AnimationController 選択は select_animation を発火しないため
+					// 表示が stale になり得る、 Round 5 MUST-2)。 このまま Group 既定値へ
+					// フォールスルーして書き換えるのを防ぐため gesture を開始せず、
+					// form を再同期して stale 表示を解消する。
+					pushValuesFromSelectedGroup(form, isSpringCapableGroup, readOverrides)
+					return
+				}
+				const kind: 'group' | 'animation' = wantsOverride && anim !== null ? 'animation' : 'group'
+				if (kind === 'animation' && !canWriteOverrides(anim)) {
+					// 未知の上位 schema version の animation には書かない (= Round 5
+					// MUST-4)。 空 map 起点の編集で未知 schema の raw を消さないよう
+					// gesture 自体を開始しない。 通常は行が非表示なのでここには来ない
+					// (= 防御的二重化)。
+					pushValuesFromSelectedGroup(form, isSpringCapableGroup, readOverrides)
+					return
+				}
+				gesture_context = { kind, group: g, boneUuid, animation: kind === 'animation' ? anim : null, aborted: false }
 				try {
-					// aspects は drag 開始時点の checkbox 状態で切り替える : checkbox ON =
-					// 選択中 animation の override を書くため { animations }、 OFF = Group
-					// 既定値を書くため { groups }。 drag 中に状態が変わっても aspects は
-					// 開始時点で固定する (= before / after が別対象を指すのを防ぐ)。
-					const aspects = isOverrideTarget(meta.key)
-						? { animations: [Animation.selected] }
-						: { groups: [Group.first_selected] }
+					// aspects は drag 開始時点で確定した context から取る : kind が
+					// 'animation' なら選択中 animation の override を書くため
+					// { animations }、 'group' なら Group 既定値を書くため { groups }。
+					// gesture 中に状態が変わっても aspects と書き込み先はともに
+					// 開始時点で固定される (= before / after が別対象を指すのを防ぐ)。
+					const aspects = kind === 'animation' ? { animations: [anim] } : { groups: [g] }
 					Undo?.initEdit?.(aspects)
 					edit_started = true
 				} catch (e) {
 					console.warn('[spring_bone] slider onBefore failed', e)
+					// initEdit に失敗した gesture は Undo 捕捉なしの書き込みになる
+					// ため、 context ごと破棄して input 側でも何も書かないようにする
+					gesture_context = null
 				}
 			}
 			slider.onAfter = () => {
-				if (!edit_started) return
 				try {
-					Undo?.finishEdit?.('Change spring config')
+					if (edit_started) {
+						Undo?.finishEdit?.('Change spring config')
+					}
 				} catch (e) {
 					console.warn('[spring_bone] slider onAfter failed', e)
 				} finally {
 					edit_started = false
+					// gesture context を破棄 (= Round 5 MUST-1)。 次の gesture は
+					// 必ず onBefore で新しい context を張り直す
+					gesture_context = null
 				}
 			}
 		}
@@ -271,27 +352,48 @@ export function registerSpringPanel(
 		try {
 			// slider (= 数値項目) の書き込み。 Undo wrap は onBefore/onAfter に寄せた
 			// (= per-gesture 集約) ため、 ここでは書き込みと registry sync だけ担う。
-			// **書き込み先はその項目の override checkbox の状態で分岐する** :
-			//   ON  → 選択中 animation の override map (= setOverrideField の戻り値を代入)
-			//   OFF → 従来どおり Group 既定値
-			// checkbox OFF でも slider を readonly にはしない : animate モードで Group
-			// 既定値を編集できる唯一の手段が本 Panel の slider であり、 readonly にすると
-			// その機能が失われるため。
+			// **書き込み先は gesture context に固定されている** (= Round 5 MUST-1) :
+			//   kind 'animation' → onBefore で確定した animation の override map
+			//   kind 'group'     → onBefore で確定した Group の既定値
+			// gesture 中に選択や checkbox 状態が変わっても書き込み先は動かない。
+			// checkbox OFF (= kind 'group') でも slider を readonly にはしない :
+			// animate モードで Group 既定値を編集できる唯一の手段が本 Panel の
+			// slider であり、 readonly にするとその機能が失われるため。
+			// slider の値変更はすべて onBefore/onAfter の gesture に包まれている
+			// (= BB NumSlider は drag / arrow key / text 確定のいずれでも onBefore を
+			// 発火する) ため、 gesture context が無い入力は書き込まない (= context
+			// 無しの書き込みは Undo 捕捉なしの変更 = 復元不能になる)。
 			// NumSlider text 入力の Molang 分岐 (= BB actions.ts:1421-1435) は NaN を返し得るため、
 			// 書き込み前に finite check (= 潜在バグ Fable #2)。 非 finite は silent drop。
 			for (const key of changed_keys) {
 				if (!PANEL_INPUTS.some((meta) => meta.key === key)) continue
 				const v = result[key]
 				if (typeof v !== 'number' || !Number.isFinite(v)) continue
-				if (canWriteOverride && result.overrides?.[key] === true) {
-					anim[ANIM_OVERRIDES_KEY] = setOverrideField(
-						readOverrides(anim),
-						boneUuid,
+				const ctx = gesture_context
+				if (!ctx || ctx.aborted) continue
+				if (ctx.kind === 'animation') {
+					// 書き込み直前の検証 (= Round 5 MUST-2) : gesture 中に対象
+					// animation が差し替わった / 削除された / 書き込み不可になった
+					// 場合は書き込みを中止して form を再同期する。 stale な checkbox
+					// 表示のまま Group 既定値を巻き添えに書き換えるのを防ぐ。
+					const target = ctx.animation
+					if (
+						target !== (Animation?.selected ?? null) ||
+						!isAnimationAlive(target) ||
+						!canWriteOverrides(target)
+					) {
+						ctx.aborted = true
+						pushValuesFromSelectedGroup(form, isSpringCapableGroup, readOverrides)
+						continue
+					}
+					target[ANIM_OVERRIDES_KEY] = setOverrideField(
+						readOverrides(target),
+						ctx.boneUuid,
 						key as PanelSliderKey,
 						v,
 					)
 				} else {
-					g[`spring_${key}`] = v
+					ctx.group[`spring_${key}`] = v
 				}
 			}
 		} catch (e) {
@@ -302,17 +404,25 @@ export function registerSpringPanel(
 		// ここで 1 操作分完結させる。 slider の move event と混ざらないよう changed_keys で分岐する。
 		const stateChanged = changed_keys.includes('spring_state')
 		const overridesChanged = changed_keys.includes('overrides')
-		if ((stateChanged || overridesChanged) && canWriteOverride) {
+		if ((stateChanged || overridesChanged) && canWriteOverride && canWriteOverrides(anim)) {
 			try {
-				Undo?.initEdit?.({ animations: [anim] })
 				let map = readOverrides(anim)
+				// 実際に値が変わる操作があったか。 no-op 操作 (= 現在値の再クリック等)
+				// では Undo entry 自体を作らない (= Round 5 NITS-1 : no-op のたびに
+				// animation 全体の Undo entry を作り project を dirty 化するのを防ぐ)。
+				let changed = false
 				if (stateChanged) {
 					const state = result.spring_state
-					if (state === 'on' || state === 'off') {
-						map = setOverrideField(map, boneUuid, 'enabled', state === 'on')
-					} else {
-						// 'inherit' (= または未知値) = enabled override を外す
-						map = clearOverrideField(map, boneUuid, 'enabled')
+					const desired = state === 'on' ? true : state === 'off' ? false : undefined
+					// 現在の override 値と意味的に同一なら書き込みごと省略する
+					if (map[boneUuid]?.enabled !== desired) {
+						if (desired === undefined) {
+							// 'inherit' (= または未知値) = enabled override を外す
+							map = clearOverrideField(map, boneUuid, 'enabled')
+						} else {
+							map = setOverrideField(map, boneUuid, 'enabled', desired)
+						}
+						changed = true
 					}
 				}
 				if (overridesChanged) {
@@ -336,14 +446,21 @@ export function registerSpringPanel(
 							// ON → OFF : override を除去 (= slider 表示は後段の再同期で継承値に戻る)
 							map = clearOverrideField(map, boneUuid, meta.key)
 						}
+						changed = true
 					}
 				}
-				// map の書き換えは必ず setOverrideField / clearOverrideField の戻り値を
-				// 代入する形で行う。 in-place 変更は readOverrides の memo (= raw の
-				// object identity 比較) が検出できず、 Undo の差分捕捉も参照 identity
-				// 前提のため両方を壊す。
-				anim[ANIM_OVERRIDES_KEY] = map
-				Undo?.finishEdit?.('Change spring animation override')
+				if (changed) {
+					// map の書き換えは必ず setOverrideField / clearOverrideField の戻り値を
+					// 代入する形で行う。 in-place 変更は readOverrides の memo (= raw の
+					// object identity 比較) が検出できず、 Undo の差分捕捉も参照 identity
+					// 前提のため両方を壊す。
+					// initEdit は map 計算後・代入前に行う (= setOverrideField 系は
+					// 入力を変異させないため、 代入の瞬間までは animation の状態が
+					// 変わらず before-copy が正しく取れる)。
+					Undo?.initEdit?.({ animations: [anim] })
+					anim[ANIM_OVERRIDES_KEY] = map
+					Undo?.finishEdit?.('Change spring animation override')
+				}
 			} catch (e) {
 				console.warn('[spring_bone] panel override handler failed', e)
 			}
@@ -364,9 +481,16 @@ export function registerSpringPanel(
 	// animation 切替 / undo / redo / project 切替 でも override 表示値が変わり得るため
 	// 全てで同期する。 登録・解除の形は index.ts installTickLoop の
 	// Blockbench.on / removeListener に合わせる。
+	// **remove_animation も listener に含める** (= Round 5 MUST-2) : animation の削除は
+	// select_animation を発火しない (= animation.js:428 で専用 event が飛ぶ) ため、
+	// これが無いと削除後も override 行が旧状態のまま残る。 なお AnimationController の
+	// 選択 (= Animation.selected が null になるもう 1 つの経路、
+	// animation_controllers.js:1066) には対応する event が存在しないため、 そちらは
+	// 書き込み直前検証 (= slider gesture context) と isAnimationAlive による
+	// 表示 / 書き込み両面の防御でカバーする。
 	sync_listeners = []
 	const sync = (): void => pushValuesFromSelectedGroup(form, isSpringCapableGroup, readOverrides)
-	for (const event of ['update_selection', 'select_animation', 'undo', 'redo', 'select_project', 'load_project']) {
+	for (const event of ['update_selection', 'select_animation', 'remove_animation', 'undo', 'redo', 'select_project', 'load_project']) {
 		Blockbench.on(event, sync)
 		sync_listeners.push({ event, fn: sync })
 	}

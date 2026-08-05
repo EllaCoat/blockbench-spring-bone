@@ -134,7 +134,17 @@ function resolveConfig(
 // 「raw の object identity が同一」 なら前回結果を再利用できる (= BB の Undo / merge 経路も
 // structuredClone / normalize で必ず新しい object を入れるため、 値が変われば identity も
 // 変わる)。 project 切替 / cleanup でクリアする (= 旧 project の instance 参照を握り続けない)。
-let overridesMemo: { animation: any; raw: unknown; map: SpringOverrideMap } | null = null
+// **memo key には正規化済みの schema version も含める** (= Round 5 WANT-1) :
+// animation.extend({ spring_bone_schema_version: ... }) のような部分 merge では raw の
+// object identity が変わらないため、 version を key に入れないと version を上げても
+// 旧 map を返し続け、 下げても空 map のままになる。
+let overridesMemo: { animation: any; raw: unknown; version: number | null; map: SpringOverrideMap } | null = null
+
+// schema version の正規化 (= 有限の数値以外は null)。 readOverrides の gate /
+// canWriteOverrides / memo key の 3 箇所で同じ判定を共有するため 1 箇所に集約する。
+function normalizeSchemaVersion(raw: unknown): number | null {
+	return typeof raw === 'number' && Number.isFinite(raw) ? raw : null
+}
 
 // schema version が新しすぎて override を無視した旨を警告済みの animation uuid。
 // readOverrides は毎 tick 呼ばれるため、 同一 animation への警告は 1 回だけに絞る。
@@ -148,14 +158,17 @@ const warnedNewerSchemaUuids = new Set<string>()
 //   raw データ自体は書き換えない。 警告は animation ごとに 1 回だけ
 function readOverrides(animation: any): SpringOverrideMap {
 	const raw = animation?.[ANIM_OVERRIDES_KEY]
-	if (overridesMemo && overridesMemo.animation === animation && overridesMemo.raw === raw) {
+	const version = normalizeSchemaVersion(animation?.[ANIM_SCHEMA_VERSION_KEY])
+	if (
+		overridesMemo && overridesMemo.animation === animation &&
+		overridesMemo.raw === raw && overridesMemo.version === version
+	) {
 		return overridesMemo.map
 	}
 	let map: SpringOverrideMap
-	const version = animation?.[ANIM_SCHEMA_VERSION_KEY]
 	if (
 		animation && typeof animation === 'object' &&
-		typeof version === 'number' && Number.isFinite(version) && version > SPRING_SCHEMA_VERSION
+		version !== null && version > SPRING_SCHEMA_VERSION
 	) {
 		const uuid = typeof animation.uuid === 'string' ? animation.uuid : null
 		if (uuid === null || !warnedNewerSchemaUuids.has(uuid)) {
@@ -168,8 +181,20 @@ function readOverrides(animation: any): SpringOverrideMap {
 	} else {
 		map = normalizeOverrides(raw)
 	}
-	overridesMemo = { animation, raw, map }
+	overridesMemo = { animation, raw, version, map }
 	return map
+}
+
+// 「この animation の override を書いてよいか」の判定 (= Round 5 MUST-4)。
+// schema version が SPRING_SCHEMA_VERSION より新しい animation には書かない :
+// readOverrides は未知の上位 version に空 map を返すため、 その空 map 起点の
+// 編集結果を代入すると未知 schema の raw が消え、 かつ version は新しいままなので
+// 直後の読み取りで自分の編集すら無視される。 Panel の全書き込み経路
+// (= slider gesture / checkbox / selector) は書き込み前にこの判定を通す。
+function canWriteOverrides(animation: any): boolean {
+	if (!animation || typeof animation !== 'object') return false
+	const version = normalizeSchemaVersion((animation as Record<string, unknown>)[ANIM_SCHEMA_VERSION_KEY])
+	return version === null || version <= SPRING_SCHEMA_VERSION
 }
 
 // Property 変更時の同期 hook。 element_panel input の onChange から呼ばれる。
@@ -284,10 +309,21 @@ function registerProperties(): void {
 	// だけで中身を検証しないため、 こちらでは normalizeOverrides を通して既知項目の妥当性を
 	// 検証する (= 壊れた項目だけを drop し、 未知 key は前方互換のため保持)。
 	// data[key] === undefined は skip (= 部分更新の extend で override が巻き戻らないようにする)。
+	// **未知の上位 schema version の data は normalize せず raw をそのまま保持する**
+	// (= Round 5 MUST-3) : 新しい version の blueprint を開いて保存するだけで未知構造や
+	// field が脱落して raw が壊れるのを防ぐ。 version は instance 側ではなく **data 側**
+	// を見る (= merge は Property ごとに独立して走るため、 overrides と version の
+	// merge 順に依存しない)。 本 patch は ANIM_OVERRIDES_KEY 専用で、 version key も
+	// Animation 側のものを直接参照する。
 	const patchMergeObject = (prop: any, key: string): void => {
 		prop.merge = function (instance: any, data: any) {
 			if (data?.[key] === undefined) return
-			instance[key] = normalizeOverrides(data[key])
+			const version = normalizeSchemaVersion(data?.[ANIM_SCHEMA_VERSION_KEY])
+			if (version !== null && version > SPRING_SCHEMA_VERSION) {
+				instance[key] = structuredClone(data[key])
+			} else {
+				instance[key] = normalizeOverrides(data[key])
+			}
 		}
 	}
 
@@ -1912,8 +1948,14 @@ Plugin.register(PLUGIN_ID, {
 		// 値変更時は onSpringPropertyChange 経由で registry sync + fingerprint invalidate される。
 		// spring 化判定の述語 (= isSpringGroup、 Property ベースの **capable** 判定) と
 		// override map の読み取り口 (= readOverrides、 schema version gate + memo 付きの
-		// 唯一の read 経路) はこちらから注入し、 判定元 / 読み取り元を本 module に一元化する。
-		cleanups.push(registerSpringPanel(onSpringPropertyChange, isSpringGroup, readOverrides))
+		// 唯一の read 経路)、 書き込み可否判定 (= canWriteOverrides、 上位 schema version
+		// への書き込み禁止) はこちらから注入し、 判定元 / 読み取り元を本 module に一元化する。
+		cleanups.push(registerSpringPanel({
+			onChange: onSpringPropertyChange,
+			isSpringCapableGroup: isSpringGroup,
+			readOverrides,
+			canWriteOverrides,
+		}))
 		// Group 右クリ context menu に「Spring 化 / 解除」 の Property toggle action を追加。
 		// gesture (= 唯一の truth) は Group Property `spring_bone_enabled` の書き換えで、
 		// 名前は一切変更しない。
