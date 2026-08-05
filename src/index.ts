@@ -17,6 +17,7 @@
 import { createState, resetState, step, type SpringConfig, type SpringState } from './springSim'
 import { SpringRuntime, type SpringRuntimeOps, type AnimationContext } from './springRuntime'
 import { makeExportAnimationContext, type PreviewAnimationContext } from './animationContext'
+import { createExportGate } from './exportGate'
 import { isCapable, resolveEffective, resolveEnabled, shouldMigrate, toSpringBoneState, type SpringBoneState } from './springConfig'
 import {
 	ANIM_OVERRIDES_KEY,
@@ -221,7 +222,7 @@ function canWriteOverrides(animation: any): boolean {
 //   Animation.select が playing=true を設定、 mode 切替後も flag を保持するため)
 // - 失敗は warn に落とす (= preview refresh の失敗で呼び出し元の処理を巻き込まない)
 function requestAnimatorPreview(reason: string): void {
-	if (exportActive) return
+	if (exportGate.isExportActive) return
 	if (!Modes?.animate) return
 	try {
 		Animator?.preview?.()
@@ -241,10 +242,7 @@ function onSpringPropertyChange(): void {
 	// **export 中は entry.base を書き換えない** : 進行中の export が読む物理パラを frame の
 	// 途中で差し替えてしまう。 Property の値自体は BB 側 (= Group Property) に入っているので、
 	// export 後の rescan (= 同じ resolveConfig の読み直し) で必ず追いつく。
-	if (exportActive) {
-		pendingRescanAfterExport = true
-		return
-	}
+	if (exportGate.deferRescanIfActive()) return
 	for (const entry of registry.values()) {
 		Object.assign(entry.base, resolveConfig(entry, null))
 	}
@@ -956,19 +954,9 @@ let lastGraphFingerprint = ''
 // installTickLoop の初期化と cleanup で '' に戻す。
 let lastSessionFingerprint = ''
 let inhibitTick = false   // applyPoseAt 由来の再描画で tick が再入するのを防ぐ
-// AnimatedJava の datapack export 中だけ立つ flag。 export 中は AJ が pose の主導権を持ち、
-// runtime は export driver (= ajExportBridge) 側が駆動するため、 preview 側の tick /
-// invalidate 経路を全部止めて runtime を明け渡す。
-// **inhibitTick を流用してはいけない** : applyPoseAt が finally で inhibitTick = false に
-// 戻すため、 export 中に base pose 評価が走るたび抑制が解けてしまう。
-// **counter ではなく boolean 代入にする** : AJ 側が onEndRendering を届けられなかった後に
-// onBeginRendering が来ると suspend が二重に呼ばれ得るため、 counter だと解除されなくなる。
-let exportActive = false
-// export 中に skip した registry 更新の取り戻し予約。 rescanRegistry / onSpringPropertyChange が
-// export 中に呼ばれたら立て、 export 終了時 (= host.resumeTick) に 1 回だけ rescan する。
-// 「export 中に rig を編集する」 自体が非現実的なので凝った仕組みは作らず、 **状態が古いまま
-// 残らないこと** だけを保証する。
-let pendingRescanAfterExport = false
+// export 中の抑制 state (= exportActive / rescan 予約) と遷移は exportGate.ts に集約する。
+// rescanRegistry は function 宣言で hoist されるため、 ここで参照して問題ない。
+const exportGate = createExportGate({ rescan: () => rescanRegistry() })
 // project 切替 (= select_project / load_project) 受信から rAF コールバックでの rescan 完了
 // までの間だけ立つ flag。 遅延中は旧 project の registry / session が生きたまま残るため、
 // parse 完了後に同期的に走る Animation.select() → Animator.preview() が旧 entry を評価
@@ -1262,11 +1250,8 @@ function rescanRegistry(): void {
 	// topoOrder / entry.base をその場で差し替えると、 進行中の export が参照している entry
 	// 集合が frame の途中で入れ替わる。 listener 側で経路を列挙する形は漏れる (= project 切替の
 	// rAF / undo / redo / context menu action / Property 変更 すべてがここへ来る)。
-	// skip した分は export 終了時に取り戻す (= pendingRescanAfterExport)。
-	if (exportActive) {
-		pendingRescanAfterExport = true
-		return
-	}
+	// skip した分は export 終了時に取り戻す (= exportGate の rescan 予約)。
+	if (exportGate.deferRescanIfActive()) return
 	const groups = (Project as { groups?: unknown[] } | null)?.groups
 	if (!Array.isArray(groups)) {
 		registry.clear()
@@ -1751,7 +1736,7 @@ function ensurePreviewSession(context: PreviewAnimationContext): void {
 // invalidatePreview() を必ず呼ぶ (= その時点では既に resumeTick 済みで exportActive は
 // false なので、 この guard には引っかからない)。
 function invalidatePreviewSession(): void {
-	if (exportActive) return
+	if (exportGate.isExportActive) return
 	previewSessionStack = null
 	previewSessionAnimation = null
 	runtime.endAnimation()
@@ -1761,7 +1746,7 @@ function tick(): void {
 	// exportActive 中は preview session を張らない : 張ると runtime.evaluateSample が走り、
 	// AJ が確定させた scene pose を preview 側の評価結果で上書きしてしまう
 	// (= runtime は preview / export で共用する module singleton)。
-	if (exportActive || inhibitTick || projectSwitchPending || runtime.isEvaluating) return
+	if (exportGate.isExportActive || inhibitTick || projectSwitchPending || runtime.isEvaluating) return
 	// context 生成は Animation.selected 参照 + playing filter だけで軽いため先に作る。
 	// hasActiveSpringEntry が override 解決の入力として必要とするため順序は固定。
 	const context = makePreviewAnimationContext()
@@ -1791,9 +1776,9 @@ function installTickLoop(): () => void {
 	// **rescanRegistry / invalidatePreviewSession より前に倒す** : どちらも exportActive 中は
 	// no-op になるため、 後に倒すと install 時の rescan / session 破棄が空振りする
 	// (= export 中に plugin reload が挟まった場合に「止まったまま」 で復帰しない)。
-	exportActive = false
-	// 直後の rescanRegistry が最新状態を作るので、 持ち越しの予約は捨てる
-	pendingRescanAfterExport = false
+	// 直後の rescanRegistry が最新状態を作るので、 持ち越しの予約は捨てる (= reset は
+	// 予約された rescan を実行せずに落とす)。
+	exportGate.reset()
 	rescanRegistry()
 	invalidatePreviewSession()
 	inhibitTick = false
@@ -1858,7 +1843,7 @@ function installTickLoop(): () => void {
 		// event を発火しない。 session 破棄は invalidatePreviewSession 側の guard で止まるが、
 		// それだけだと invalidateAnimationCache() が Animator.preview() を呼び返し、 AJ の
 		// frame ループへ再入する経路が残る。
-		if (exportActive) return
+		if (exportGate.isExportActive) return
 		try {
 			// keyframe edit transaction 中は値が preview ごとに変わり得るため、各 frame を 0 replay。
 			// 個人スコープでは長 timeline + 多 chain rig で drag スタッター可能性あるが、
@@ -1886,7 +1871,7 @@ function installTickLoop(): () => void {
 		// Animator.preview() を呼び、 export の最中に BB 側の preview が割り込む。
 		// なお onAnimFrame 側の guard も別途必要 : Animator.preview() は select_animation の
 		// dispatch **より前** に Animation.select() 内から呼ばれる (= animation.js:246)。
-		if (exportActive) return
+		if (exportGate.isExportActive) return
 		invalidateAnimationCache()
 	}
 	// **rAF 遅延が必要な理由** : `select_project` は ModelProject.select() 内で発火し
@@ -2002,8 +1987,7 @@ function installTickLoop(): () => void {
 		projectSwitchPending = false
 		// export 中に unload されても flag を残さない (= 次の install / reload で preview が
 		// 止まったままになるのを防ぐ)。
-		exportActive = false
-		pendingRescanAfterExport = false
+		exportGate.reset()
 		Blockbench.removeListener?.('display_animation_frame', onAnimFrame)
 		Blockbench.removeListener?.('select_project', onProjectSwitch)
 		Blockbench.removeListener?.('load_project', onProjectSwitch)
@@ -2041,20 +2025,8 @@ const exportDriverHost: ExportDriverHost<PreviewAnimationContext> = {
 	endAnimation: () => { runtime.endAnimation() },
 	get currentStepIndex(): number | null { return runtime.currentStepIndex },
 	get isEvaluating(): boolean { return runtime.isEvaluating },
-	suspendTick: () => { exportActive = true },
-	resumeTick: () => {
-		exportActive = false
-		// export 中に skip した registry 更新をここで取り戻す (= 古い registry が残らない)。
-		// driver はこの直後に invalidatePreview() を呼ぶため、 session は必ず張り直される。
-		// 失敗しても後続の後始末を止めない (= driver 側の cleanup runner に例外を渡さない)。
-		if (!pendingRescanAfterExport) return
-		pendingRescanAfterExport = false
-		try {
-			rescanRegistry()
-		} catch (e) {
-			console.warn(`[${PLUGIN_ID}] rescanRegistry failed after export`, e)
-		}
-	},
+	suspendTick: () => { exportGate.suspend() },
+	resumeTick: () => { exportGate.resume() },
 	invalidatePreview: () => { invalidatePreviewSession() },
 	makeExportContext: (animation, excludedNodeUuids) => makeExportAnimationContext(animation, excludedNodeUuids),
 	// capable な bone が 1 つも無い project では export に一切介入しない : 介入すると
