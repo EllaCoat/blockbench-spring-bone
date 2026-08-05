@@ -797,27 +797,30 @@ const OUTLINER_MARKER_CLASS = 'spring-bone-marker'
 const OUTLINER_MARKER_STYLE_ID = 'spring-bone-outliner-marker-style'
 
 function scanOutlinerMarkers(): void {
-	// capable な group の uuid 集合を作る。 Project 未取得 (= 起動直後等) は空集合 =
-	// 全マーカー剥がしで安全側に倒す。
-	const capableUuids = new Set<string>()
+	// **'enabled' の group だけ**の uuid 集合を作る。 Project 未取得 (= 起動直後等) は
+	// 空集合 = 全マーカー剥がしで安全側に倒す。
+	// registry の加入条件 (= isSpringGroup / isCapable) とは **別基準**にしている :
+	// registry は 'disabled' も保持する (= animation 単位 override で再有効化できるように
+	// するため) が、 marker は「今この bone に spring が効くか」 を示すものなので、
+	// Spring 解除した bone に色が残ると「解除できていない」 ように見える。
+	const enabledUuids = new Set<string>()
 	const groups = (Project as { groups?: unknown[] } | null)?.groups
 	if (Array.isArray(groups)) {
 		for (const g of groups) {
-			if (!isSpringGroup(g)) continue
+			if (getSpringBoneState(g) !== 'enabled') continue
 			const uuid = (g as { uuid?: unknown }).uuid
-			if (typeof uuid === 'string') capableUuids.add(uuid)
+			if (typeof uuid === 'string') enabledUuids.add(uuid)
 		}
 	}
 	// li.outliner_node を走査し、 id (= uuid) が集合に含まれる行の内側 .outliner_object に
-	// class を toggle。 集合に無い行 (= cube 等の非 group node や 'unset' の行) は剥がす側に
-	// 回るため、 stale マーカーの掃除も同じ走査で済む。 解除済み (= 'disabled') の行は
-	// capable 集合に含まれるため、 marker は維持される。
+	// class を toggle。 集合に無い行 (= cube 等の非 group node、 'unset' の行、 解除済みの
+	// 'disabled' の行) は剥がす側に回るため、 stale マーカーの掃除も同じ走査で済む。
 	const nodes = document.querySelectorAll('li.outliner_node')
 	for (let i = 0; i < nodes.length; i++) {
 		const li = nodes[i] as HTMLElement
 		const obj = li.querySelector(':scope > .outliner_object') as HTMLElement | null
 		if (!obj) continue
-		if (capableUuids.has(li.id)) {
+		if (enabledUuids.has(li.id)) {
 			obj.classList.add(OUTLINER_MARKER_CLASS)
 		} else {
 			obj.classList.remove(OUTLINER_MARKER_CLASS)
