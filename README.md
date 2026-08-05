@@ -21,6 +21,14 @@ Personal-use plugin. Not distributed publicly. Issues / PRs may not be triaged.
   - `gravity` — force coefficient in world -Y
   - `restLength` — distance from anchor to virtual tip. Auto-computed from the first
     child group's origin; not directly editable at the moment
+- Per-animation overrides: each animation can override `enabled` / `drag` / `stiffness` /
+  `gravity` per bone. Resolution order is animation override → Group property default →
+  plugin default, per field. Overrides are stored on the animation as
+  `spring_bone_overrides` (= a record keyed by bone UUID) and travel with the `.bbmodel`
+  file. In animate mode, the Spring Bone panel edits the shared Group defaults; while an
+  animation is selected, an "In this animation" selector (継承 / 有効 / 無効) and per-field
+  override checkboxes appear, and dragging a slider with its override checkbox on writes
+  to the selected animation instead of the Group default
 - AnimatedJava integration: bake simulated transforms into the export pipeline so the
   motion is reproducible in-game
 

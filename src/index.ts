@@ -17,7 +17,14 @@
 import { createState, resetState, step, type SpringConfig, type SpringState } from './springSim'
 import { SpringRuntime, type SpringRuntimeOps, type AnimationContext } from './springRuntime'
 import { isCapable, resolveEffective, resolveEnabled, shouldMigrate, toSpringBoneState, type SpringBoneState } from './springConfig'
-import { normalizeOverrides, overridesFingerprint, type SpringOverrideMap } from './animOverrides'
+import {
+	ANIM_OVERRIDES_KEY,
+	ANIM_SCHEMA_VERSION_KEY,
+	SPRING_SCHEMA_VERSION,
+	normalizeOverrides,
+	overridesFingerprint,
+	type SpringOverrideMap,
+} from './animOverrides'
 import { registerSpringPanel } from './ui'
 
 declare const Plugin: { register(id: string, opts: Record<string, unknown>): void }
@@ -54,7 +61,7 @@ declare const Undo: any
 declare function updateSelection(): void
 
 const PLUGIN_ID = 'spring_bone'
-const PLUGIN_VERSION = '0.0.11'
+const PLUGIN_VERSION = '0.0.12'
 
 // name prefix `spring_` = **旧方式** (= v0.0.10 まで) の spring 化 truth。 現在の truth は
 // Group Property `spring_bone_enabled` (= enum 3 値) に移行済みで、 prefix は
@@ -80,14 +87,9 @@ type SpringPropertyKey = (typeof PROPERTY_KEYS)[number]
 const SPRING_ENABLED_KEY = 'spring_bone_enabled'
 const SPRING_ENABLED_VALUES = ['unset', 'enabled', 'disabled'] as const
 
-// animation 単位 override の schema version。 override map の構造を変える時に上げる。
-// 読み込み側 (= readOverrides) は自分より新しい version の override を解釈できないため
-// 無視して Group 既定値へ fallback する (= raw データ自体は保持し、 新しい version の
-// plugin で開き直せば復活する)。
-const SPRING_SCHEMA_VERSION = 1
-// Animation に登録する Property key。 register / unregister / backfill / read で共有する。
-const ANIM_OVERRIDES_KEY = 'spring_bone_overrides'
-const ANIM_SCHEMA_VERSION_KEY = 'spring_bone_schema_version'
+// Animation 側の Property key (= ANIM_OVERRIDES_KEY / ANIM_SCHEMA_VERSION_KEY) と
+// schema version (= SPRING_SCHEMA_VERSION) は animOverrides.ts に集約。 ui.ts の
+// override 書き込み側とも同じ定数を共有するため、 定義箇所は 1 つに保つ。
 
 // Group instance に自動で生える Property 値を読む helper。 Property が未定義
 // or 未 register or NaN の場合は fallback を返す (= DEFAULT_CONFIG 値)。
@@ -1908,9 +1910,10 @@ Plugin.register(PLUGIN_ID, {
 		cleanups.push(installTickLoop())
 		// animate モード用の専用 Panel を register (= edit モードは element_panel input に任せる)。
 		// 値変更時は onSpringPropertyChange 経由で registry sync + fingerprint invalidate される。
-		// spring 化判定の述語 (= isSpringGroup、 Property ベースの **capable** 判定) は
-		// こちらから注入し、 判定元を本 module に一元化する。
-		cleanups.push(registerSpringPanel(onSpringPropertyChange, isSpringGroup))
+		// spring 化判定の述語 (= isSpringGroup、 Property ベースの **capable** 判定) と
+		// override map の読み取り口 (= readOverrides、 schema version gate + memo 付きの
+		// 唯一の read 経路) はこちらから注入し、 判定元 / 読み取り元を本 module に一元化する。
+		cleanups.push(registerSpringPanel(onSpringPropertyChange, isSpringGroup, readOverrides))
 		// Group 右クリ context menu に「Spring 化 / 解除」 の Property toggle action を追加。
 		// gesture (= 唯一の truth) は Group Property `spring_bone_enabled` の書き換えで、
 		// 名前は一切変更しない。
