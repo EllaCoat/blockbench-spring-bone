@@ -7,8 +7,9 @@
 // fake にするのは **SpringRuntime と rescanRegistry の 2 つだけ**。 gate / session / driver /
 // export context factory はすべて本物を import して繋ぐ。
 //
-// **この配線は src/index.ts の previewSession 生成 (= 現 :1700-1714) と exportDriverHost
-// (= 現 :1989-2007) を写したもの。 index.ts 側の配線が変わったらここも追従すること。**
+// **この配線は src/index.ts の `createPreviewSession(...)` 呼び出しと `exportDriverHost`
+// の定義を写したもの。 index.ts 側の配線が変わったらここも追従すること。**
+// (= 行番号は commit ごとにずれるため識別子で指す)
 // 写経である以上 drift のリスクはあるが、 繋ぎ方の退行を検出する価値の方が大きいと判断して
 // 受容している (= 追従先を上に明示しておくのがその対価)。
 import test from 'node:test'

@@ -19,6 +19,7 @@ import { SpringRuntime, type SpringRuntimeOps, type AnimationContext } from './s
 import { makeExportAnimationContext, type PreviewAnimationContext } from './animationContext'
 import { createExportGate } from './exportGate'
 import { createPreviewSession } from './previewSession'
+import { installAjRegistrar, type AjRenderHooksApi } from './ajRegistrar'
 import { isCapable, resolveEffective, resolveEnabled, shouldMigrate, toSpringBoneState, type SpringBoneState } from './springConfig'
 import {
 	ANIM_OVERRIDES_KEY,
@@ -63,15 +64,8 @@ declare const Undo: any
 // Panel の display_condition、 outliner ハイライト等が再評価される)。 spring 化 / 解除の
 // name 変更後や undo/redo 後に手動で叩いて UI 状態と rig state のズレを解消する。
 declare function updateSelection(): void
-// AnimatedJava が公開する render hook registry。 AJ は module 評価時 (= plugin 読み込み時)
-// に window.AnimatedJava を代入するため、 我々の onload より後に生えることがある
-// (= installAjExportDriver の loaded_plugin 再試行経路)。 AJ 不在 / 旧 version / 将来の
-// 契約変更いずれでも壊れないよう、 全て optional で受けて呼ぶ前に形を確認する。
-interface AjRenderHooksApi {
-	version?: number
-	register?(id: string, hooks: unknown): void
-	unregister?(id: string): void
-}
+// AnimatedJava が公開する render hook registry を持つ global。 registry の形 (=
+// AjRenderHooksApi) と optional で受ける理由は ajRegistrar.ts 側に集約する。
 declare const window: { AnimatedJava?: { renderHooks?: AjRenderHooksApi } } | undefined
 
 const PLUGIN_ID = 'spring_bone'
@@ -2011,70 +2005,17 @@ const exportDriverHost: ExportDriverHost<PreviewAnimationContext> = {
 function installAjExportDriver(): () => void {
 	if (!ENABLE_AJ_EXPORT) return (): void => {}
 	const driver = createExportDriver(exportDriverHost)
-	// 登録先 registry の identity を保持する。 **AJ を単独 reload すると
-	// window.AnimatedJava.renderHooks が新しい object に差し替わり、 内部の登録 Map ごと
-	// 作り直される** ため、 旧 registry に居る driver は以後無言で呼ばれなくなる。 参照比較なら
-	// 「後から load された」 と「reload された」 を同じ経路で拾える。
-	// registeredApi = 実際に登録できた registry (= cleanup の unregister 先 + 再登録要否の判定基準)。
-	// **失敗時は更新しない** : 旧 driver の unregister 遅れ等で一時的に id が衝突していた場合、
-	// 更新してしまうと衝突が解消しても plugin reload まで登録し直せない。 再試行の頻度は
-	// loaded_plugin の発火回数に限られるので、 warn の重複は許容する。
-	let registeredApi: AjRenderHooksApi | null = null
-	let retryListener: ((...args: unknown[]) => void) | null = null
-
-	const detachRetry = (): void => {
-		if (retryListener === null) return
-		Blockbench.removeListener?.('loaded_plugin', retryListener)
-		retryListener = null
-	}
-
-	// 現在の API を見て、 未登録 or 別 object に差し替わっていたら登録し直す。
-	const syncRegistration = (): void => {
-		const api = window?.AnimatedJava?.renderHooks
-		if (!api || api.version !== 1 || typeof api.register !== 'function') return
-		if (api === registeredApi) return
-		try {
-			api.register(PLUGIN_ID, driver)
-			registeredApi = api
-			console.log(`[${PLUGIN_ID}] AnimatedJava export driver registered`)
-		} catch (e) {
-			console.warn(`[${PLUGIN_ID}] AnimatedJava export driver registration failed`, e)
-		}
-	}
-
-	// AJ は module 評価時に window.AnimatedJava を代入し (= AJ src/index.ts)、 loaded_plugin は
-	// plugin register 後に発火する (= plugin_loader.ts:391、 reload 経路も
-	// loadFromFile → Plugin.register → runOnLoad で同じ event を通る)。 我々が先に load された
-	// 場合も AJ が reload された場合も、 この listener が identity 比較で拾い直す。
-	// **listener は unload まで外さない** : 外すと reload 検知ができなくなる。 dispatch 中に
-	// 自分を remove しない形になるので、 BB の dispatchEvent が listener 配列を for...of で
-	// 走査する件 (= js/util/event_system.ts:15) にも触れない。
-	syncRegistration()
-	retryListener = (): void => { syncRegistration() }
-	Blockbench.on('loaded_plugin', retryListener)
-
-	return (): void => {
-		detachRetry()
-		// **unregister より先に driver を畳む** : AJ は beginRenderingSession の時点で
-		// participant を snapshot するため、 export 進行中に unregister しても残りの hook は
-		// 旧 driver へ届き続ける。 一方 cleanups の実行順 (= tick loop → panel → marker →
-		// driver) の都合で、 この時点では registry.clear() が済んでいる。 driver を非 active に
-		// しておかないと、 残りの onPose が壊れた state の上で走る。
-		// onEndRendering は冪等なので、 export 中でなければ no-op。
-		try {
-			driver.onEndRendering()
-		} catch (e) {
-			console.warn(`[${PLUGIN_ID}] AnimatedJava export driver shutdown failed`, e)
-		}
-		const api = registeredApi
-		if (api === null) return
-		registeredApi = null
-		try {
-			api.unregister?.(PLUGIN_ID)
-		} catch (e) {
-			console.warn(`[${PLUGIN_ID}] AnimatedJava export driver unregistration failed`, e)
-		}
-	}
+	// 登録先 registry の identity 管理と再試行 listener は ajRegistrar.ts に集約する。
+	// ここには「BB / window 側の口を ops へ繋ぐ」 だけを置く。
+	const registrar = installAjRegistrar({ pluginId: PLUGIN_ID, enabled: ENABLE_AJ_EXPORT, driver }, {
+		getApi: () => window?.AnimatedJava?.renderHooks,
+		onPluginLoaded: (listener) => { Blockbench.on('loaded_plugin', listener) },
+		offPluginLoaded: (listener) => { Blockbench.removeListener?.('loaded_plugin', listener) },
+		shutdownDriver: () => { driver.onEndRendering() },
+		log: (message) => { console.log(message) },
+		warn: (message, e) => { console.warn(message, e) },
+	})
+	return (): void => { registrar.dispose() }
 }
 
 Plugin.register(PLUGIN_ID, {
