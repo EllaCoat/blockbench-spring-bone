@@ -72,7 +72,7 @@ interface AjRenderHooksApi {
 declare const window: { AnimatedJava?: { renderHooks?: AjRenderHooksApi } } | undefined
 
 const PLUGIN_ID = 'spring_bone'
-const PLUGIN_VERSION = '0.0.12'
+const PLUGIN_VERSION = '0.0.13'
 
 // name prefix `spring_` = **旧方式** (= v0.0.10 まで) の spring 化 truth。 現在の truth は
 // Group Property `spring_bone_enabled` (= enum 3 値) に移行済みで、 prefix は
