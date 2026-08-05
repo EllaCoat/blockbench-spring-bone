@@ -63,9 +63,8 @@ test('makeExportAnimationContext: 任意 object の中身に触らない (= 変�
 
 // --- makeExportAnimationContext: 呼び出しごとの独立性 ---
 
-// ensurePreviewSession は animationStack を identity 比較して session の張り直しを
-// 判定する。 stack を使い回すと同一判定になって挙動が変わるため、 呼び出しごとに
-// 新しい配列を返す現行挙動を固定する。
+// 呼び出しごとに独立した context / stack を返す (= 内部で使い回さない)。 呼び出し元が
+// 返り値を保持しても次の呼び出しに影響しない、 という現行挙動の固定。
 test('makeExportAnimationContext: 呼び出しごとに新しい stack 配列を返す', () => {
 	const animation = { name: 'walk' }
 	const excluded = new Set()

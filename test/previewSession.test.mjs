@@ -174,6 +174,43 @@ test('PreviewSession: begin 失敗後の同じ context の ensure は再試行�
 	assert.deepEqual(ops.log, ['end', 'begin'])
 })
 
+// **確定済み session がある状態での begin 失敗** は、 初期状態からの失敗とは残る state が
+// 違う。 現行実装は begin が throw すると新 state を書かないため、 **古い state (= A) が
+// そのまま残る**。 その結果、 直後に A で ensure すると同一判定が成立して no-op になる。
+// begin 失敗時に state を null 化する実装へ変えるとここが end → begin になって落ちるので、
+// 「古い state が残る」 という現行挙動の固定になる。
+test('PreviewSession: 確定済み session がある状態で begin が失敗すると古い state が残る', () => {
+	const ops = makeOps()
+	const session = createPreviewSession(ops)
+	const animA = { name: 'A' }
+	const animB = { name: 'B' }
+	const contextA = makeContext(animA)
+	const contextB = makeContext(animB)
+
+	// 1. context A で session を確定させる
+	session.ensure(contextA)
+	assert.deepEqual(ops.log, ['end', 'begin'])
+	assert.equal(session.isActive, true)
+
+	// 2. context B の begin が失敗する
+	const error = new Error('begin boom')
+	ops.beginAnimation = () => { ops.log.push('begin'); throw error }
+	ops.log.length = 0
+	// 3. 例外は呼び出し元へ伝播する
+	assert.throws(() => session.ensure(contextB), error)
+	assert.deepEqual(ops.log, ['end', 'begin'])
+	// 失敗しても state は落ちない (= A のまま active)
+	assert.equal(session.isActive, true)
+
+	// 4. context A で ensure すると同一判定が成立して no-op = 古い state A が残っている証明
+	ops.log.length = 0
+	session.ensure(contextA)
+	assert.deepEqual(ops.log, [])
+
+	// 一方 context B は state と違うままなので、 再試行の口は残る
+	assert.throws(() => session.ensure(contextB), error)
+})
+
 // --- invalidate ---
 
 test('PreviewSession: invalidate は state を落として endAnimation を呼ぶ', () => {
