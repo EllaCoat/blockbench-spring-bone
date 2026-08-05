@@ -315,14 +315,19 @@ function registerProperties(): void {
 	// data[key] === undefined は skip (= 部分更新の extend で override が巻き戻らないようにする)。
 	// **未知の上位 schema version の data は normalize せず raw をそのまま保持する**
 	// (= Round 5 MUST-3) : 新しい version の blueprint を開いて保存するだけで未知構造や
-	// field が脱落して raw が壊れるのを防ぐ。 version は instance 側ではなく **data 側**
-	// を見る (= merge は Property ごとに独立して走るため、 overrides と version の
-	// merge 順に依存しない)。 本 patch は ANIM_OVERRIDES_KEY 専用で、 version key も
-	// Animation 側のものを直接参照する。
+	// field が脱落して raw が壊れるのを防ぐ。 version は **data 側を優先し、 data に
+	// 無ければ instance 側を fallback にする** : data 側優先は merge 順への非依存のため
+	// (= merge は Property ごとに独立して走る)、 instance fallback は部分更新の
+	// extend (= `animation.extend({ spring_bone_overrides: raw })` のように version を
+	// 含まない data) が instance 側の gate を迂回して上位 schema の raw を normalize
+	// してしまうのを防ぐため (= Round 8 WANT-2)。 本 patch は ANIM_OVERRIDES_KEY 専用で、
+	// version key も Animation 側のものを直接参照する。
 	const patchMergeObject = (prop: any, key: string): void => {
 		prop.merge = function (instance: any, data: any) {
 			if (data?.[key] === undefined) return
-			const version = normalizeSchemaVersion(data?.[ANIM_SCHEMA_VERSION_KEY])
+			const version =
+				normalizeSchemaVersion(data?.[ANIM_SCHEMA_VERSION_KEY]) ??
+				normalizeSchemaVersion(instance?.[ANIM_SCHEMA_VERSION_KEY])
 			if (version !== null && version > SPRING_SCHEMA_VERSION) {
 				// **前提契約 (= Round 7 WANT-2)** : この raw 保持が保存まで機能するには、
 				// `spring_bone_overrides` の top-level が将来の schema version でも

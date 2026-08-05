@@ -351,15 +351,18 @@ export function registerSpringPanel(deps: {
 	// drag 中の書き込みは Undo transaction の外なので、 そのまま残すと復元不能な変更が
 	// `Project.saved === true` のまま実データに残る。 中断された途中値をユーザーが
 	// 意図したとは限らないため、 「操作が無かった」 状態へ戻す方が一貫する。
-	// 書き戻し先が上位 schema version の animation の場合だけ skip する
-	// (= gate を迂回して未知構造の raw を壊さない)。 対象が project から外れていても
+	// 書き戻し先が上位 schema version の animation の場合だけ raw を触らない
+	// (= gate を迂回して未知構造を壊さない)。 対象が project から外れていても
 	// 参照は context が握っているため書き戻し自体は成立する (= 代入は Undo に触れない)。
 	const rollbackGesture = (ctx: SliderGestureContext): void => {
 		try {
-			if (ctx.kind === 'animation' && !canWriteOverrides(ctx.animation)) return
-			writeGestureValue(ctx, ctx.before)
+			if (ctx.kind !== 'animation' || canWriteOverrides(ctx.animation)) {
+				writeGestureValue(ctx, ctx.before)
+			}
 			// preview / registry を巻き戻し後の実データに揃える (= drag 中の onChange で
-			// 途中値が反映されたままになるのを防ぐ)。
+			// 途中値が反映されたままになるのを防ぐ)。 **raw を触らなかった場合も必ず呼ぶ** :
+			// 上位 schema へ変わった経路でも drag 中の書き込みで preview / session は
+			// 途中値へ更新済みなので、 再解決を起動しないと Panel 表示だけが実態と食い違う。
 			onChange()
 		} catch (e) {
 			console.warn('[spring_bone] gesture rollback failed', e)
@@ -434,8 +437,12 @@ export function registerSpringPanel(deps: {
 				// 現在 project の UndoSystem を返す getter なので、 例外処理で再評価すると
 				// 別 project の transaction を掴んで閉じる事故になる。 この同期区間だけの
 				// ローカル追跡で足りる (= module scope の状態は増やさない)。
+				// **initEdit の戻り値では判定しない** : BB は current_save を設定してから
+				// init_edit を同期 dispatch する (= undo.js:24 → :28) ため、 listener が
+				// throw すると代入式自体が完了せず戻り値が取れない。 initEdit 前の
+				// current_save を控えて「変わったか」 で自分の transaction を判定する。
 				let owner: any = null
-				let save: any = null
+				let prev_save: any = null
 				try {
 					// drag 中に書き込まれた最終値を退避する。
 					const after = readGestureValue(ctx)
@@ -451,7 +458,8 @@ export function registerSpringPanel(deps: {
 					const aspects =
 						ctx.kind === 'animation' ? { animations: [ctx.animation] } : { groups: [ctx.group] }
 					owner = Undo ?? null
-					save = owner?.initEdit?.(aspects) ?? null
+					prev_save = owner?.current_save ?? null
+					owner?.initEdit?.(aspects)
 					writeGestureValue(ctx, after)
 					owner?.finishEdit?.('Change spring config')
 					// registry sync + preview invalidate は巻き戻しを挟まない最終状態で 1 回だけ。
@@ -469,19 +477,39 @@ export function registerSpringPanel(deps: {
 					// (a) 値が巻き戻し途中 (b) transaction が開いたまま (c) preview だけ
 					// drag 後、 という 3 重の不整合が残るので個別に始末する。
 					console.warn('[spring_bone] slider onAfter failed', e)
-					// 自分が開いた transaction だけを破棄する (= cancelEdit の既定は
-					// revert しない = current_save を捨てるだけ、 BB undo.js:143-151)。
-					// current_save が別物なら他所の transaction なので触らない。
-					try {
-						if (owner !== null && save !== null && owner.current_save === save) {
+					// **どこで throw したかは current_save の状態で判定する**。
+					// 自分の transaction が開いたまま (= initEdit 前から変わっている) なら
+					// commit は成立していない。 消えているなら finishEdit が履歴へ entry を
+					// 追加した後 (= undo.js:68 以降の dispatch / EditSession 送信) の throw で、
+					// commit は成立している。
+					const current = owner?.current_save ?? null
+					if (current !== null && current !== prev_save) {
+						// commit 未成立。 自分が開いた transaction だけを破棄し
+						// (= cancelEdit の既定は revert しない = current_save を捨てるだけ、
+						// BB undo.js:143-151)、 Undo entry の無い変更を残さないよう rollback する。
+						try {
 							owner.cancelEdit?.()
+						} catch (e2) {
+							console.warn('[spring_bone] slider onAfter cancelEdit failed', e2)
 						}
-					} catch (e2) {
-						console.warn('[spring_bone] slider onAfter cancelEdit failed', e2)
+						rollbackGesture(ctx)
+					} else if (owner !== null) {
+						// commit 成立済み (= 履歴の after は drag 後の値)。 ここで rollback すると
+						// 履歴と実データが逆転して最初の Undo が効かなくなるため **戻さない**。
+						// preview / registry だけ実データに揃える。
+						// initEdit へ到達せず throw した経路 (= startChange 内の失敗) も
+						// current_save が変わらないためここに来るが、 その場合は実データが
+						// 既に巻き戻し済みなので onChange だけで整合する。
+						try {
+							onChange()
+						} catch (e2) {
+							console.warn('[spring_bone] onChange failed', e2)
+						}
+					} else {
+						// initEdit 領域に入る前 (= 退避 / 巻き戻しの時点) で失敗した。
+						// transaction は存在しないので rollback だけで足りる。
+						rollbackGesture(ctx)
 					}
-					// Undo entry を作れなかった変更は残さない (= 中断 gesture と同じ扱い)。
-					// rollback 内で onChange まで済むので preview / registry も揃う。
-					rollbackGesture(ctx)
 				} finally {
 					// 例外経路でも context を残さない (= 次 gesture が古い対象へ書くのを防ぐ)。
 					gesture_context = null
@@ -542,12 +570,18 @@ export function registerSpringPanel(deps: {
 			const g = Group.first_selected
 			const anim = Animation?.selected ?? null
 			const boneUuid = typeof g?.uuid === 'string' ? g.uuid : null
-			const canWriteOverride = anim !== null && boneUuid !== null
+			// slider 経路と同じ生存判定を書き込み前に通す : remove_animation の dispatch が
+			// 別 listener の例外で中断された場合など、 Animation.selected が削除済み instance を
+			// 保持したまま操作されうる。 現在の project に生存していない対象を現 project の
+			// Undo 対象として書き換えると、 別 project / 削除済みデータの履歴を汚染する。
+			const canWriteOverride =
+				anim !== null && boneUuid !== null && isGroupAlive(g) && isAnimationAlive(anim)
 			if (canWriteOverride && canWriteOverrides(anim)) {
-				// slider 経路と同じく、 initEdit を呼ぶ前に UndoSystem を local に確保する
-				// (= 例外時に Undo を再評価して別 project の transaction を閉じないため)。
+				// slider 経路と同じく、 initEdit を呼ぶ前に UndoSystem と その時点の
+				// current_save を local に確保する (= 例外時に Undo を再評価して別 project の
+				// transaction を閉じない / initEdit の戻り値が取れない経路でも検出するため)。
 				let owner: any = null
-				let save: any = null
+				let prev_save: any = null
 				// 例外で transaction を作れなかった場合に書き込みを取り消すための退避。
 				const prevRaw = anim[ANIM_OVERRIDES_KEY]
 				try {
@@ -606,7 +640,8 @@ export function registerSpringPanel(deps: {
 						// 同期的に完結する (= 開いている区間に project 切替や中断が
 						// 割り込めない = slider gesture 側と同じ原則)。
 						owner = Undo ?? null
-						save = owner?.initEdit?.({ animations: [anim] }) ?? null
+						prev_save = owner?.current_save ?? null
+						owner?.initEdit?.({ animations: [anim] })
 						anim[ANIM_OVERRIDES_KEY] = map
 						owner?.finishEdit?.('Change spring animation override')
 					}
@@ -614,22 +649,30 @@ export function registerSpringPanel(deps: {
 					// slider 経路と同じ後始末 : initEdit / finishEdit は同期 event を
 					// dispatch するため listener の例外も伝播し得る。 開いたままの
 					// transaction を残すと後続の Undo が壊れ、 Undo entry 無しの書き込みを
-					// 残すと復元不能な変更になる。
+					// 残すと復元不能な変更になる。 判定は slider 経路と同じく
+					// 「initEdit 前の current_save から変わったか」 で行う。
 					console.warn('[spring_bone] panel override handler failed', e)
-					try {
-						if (owner !== null && save !== null && owner.current_save === save) {
+					const current = owner?.current_save ?? null
+					if (current !== null && current !== prev_save) {
+						// commit 未成立 : transaction を破棄し、 書き込み済みなら退避して
+						// おいた raw へ戻す (= 代入は 1 文なので部分適用は起きず、 戻せば
+						// 「操作が無かった」 状態に一致する)。
+						try {
 							owner.cancelEdit?.()
+						} catch (e2) {
+							console.warn('[spring_bone] panel override cancelEdit failed', e2)
 						}
-					} catch (e2) {
-						console.warn('[spring_bone] panel override cancelEdit failed', e2)
+						try {
+							anim[ANIM_OVERRIDES_KEY] = prevRaw
+						} catch (e2) {
+							console.warn('[spring_bone] panel override rollback failed', e2)
+						}
 					}
-					// 書き込み済みなら退避しておいた raw へ戻す (= 代入は 1 文なので
-					// 部分適用は起きず、 戻せば「操作が無かった」 状態に一致する)。
-					try {
-						anim[ANIM_OVERRIDES_KEY] = prevRaw
-					} catch (e2) {
-						console.warn('[spring_bone] panel override rollback failed', e2)
-					}
+					// current_save が消えている場合は finishEdit が entry を追加した後の
+					// throw = commit 成立なので **raw を戻さない** (= 履歴と実データが
+					// 逆転して最初の Undo が効かなくなる)。 initEdit へ到達せず throw した
+					// 経路もここに来るが、 その場合は代入前なので戻す対象自体が無い。
+					// preview / registry / form は後段の onChange と sync が揃える。
 				}
 				// 書き込み後の再同期 (= ON → OFF で slider を継承値へ戻し、
 				// last_override_checks を新しい map の truth に張り直す)。
