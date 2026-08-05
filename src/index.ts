@@ -16,6 +16,7 @@
 
 import { createState, resetState, step, type SpringConfig, type SpringState } from './springSim'
 import { SpringRuntime, type SpringRuntimeOps, type AnimationContext } from './springRuntime'
+import { makeExportAnimationContext, type PreviewAnimationContext } from './animationContext'
 import { isCapable, resolveEffective, resolveEnabled, shouldMigrate, toSpringBoneState, type SpringBoneState } from './springConfig'
 import {
 	ANIM_OVERRIDES_KEY,
@@ -1654,17 +1655,6 @@ function resetAllToRest(): void {
 // 判断」 だけを置く。 capturePose / restorePose / updateMatrixWorld / applyOnlyOrdered は
 // runtime.evaluateSample 内で順序保証されているため、 tick から直接呼ばない。
 
-// preview 用の context。 animationStack = base pose 適用対象の animation 列。
-// makePreviewAnimationContext で 1 回だけ確定させ、 applyPoseAt からは
-// Animation.selected を再参照させない (= 選択中 animation への暗黙依存の排除)。
-interface PreviewAnimationContext extends AnimationContext<any> {
-	animationStack: readonly any[]
-	// AJ export の excluded_nodes 由来 (= 出力に載らない node の uuid 集合)。
-	// **export 経路だけが詰める** optional。 preview 経路では undefined になり、
-	// resolveConfigs の除外判定が常に false = 従来と完全に同一挙動になる。
-	excludedNodeUuids?: ReadonlySet<string>
-}
-
 // 選択中 animation (= selected があればそれだけ、 無ければ playing 群) を解決して
 // animationStack に確定させる。 stack の解決はこの関数 1 箇所だけ。
 function makePreviewAnimationContext(): PreviewAnimationContext {
@@ -1681,18 +1671,6 @@ function makePreviewAnimationContext(): PreviewAnimationContext {
 		? [animSelected]
 		: all.filter((a: any) => a?.playing)
 	return { animation: animSelected, animationStack }
-}
-
-// AJ export 用の context。 animation は AJ が渡してきたものをそのまま使い、
-// **Animation.selected は参照しない** (= export 対象は選択中 animation とは限らず、
-// AJ は全 animation を順に回すため)。 animationStack は型の要求を満たすためだけに
-// [animation] を入れる : export 経路の base pose 評価は AJ 側の evaluateBasePose が
-// 担い、 applyPoseAt を通らないので実際には読まれない。
-function makeExportAnimationContext(
-	animation: unknown,
-	excludedNodeUuids: ReadonlySet<string>,
-): PreviewAnimationContext {
-	return { animation, animationStack: [animation], excludedNodeUuids }
 }
 
 // timeToStepIndex は非 finite で RangeError を throw するため、 preview 側で 0 へ正規化する
