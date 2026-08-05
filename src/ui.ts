@@ -263,8 +263,22 @@ export function registerSpringPanel(deps: {
 	//
 	// edit_started フラグは onBefore で initEdit を実際に発火できたかを追跡する。
 	// drag 中に selection が非 spring group へ切り替わっても、 edit_started なら onAfter は
-	// 必ず finishEdit を呼んで Undo transaction を閉じる (= Codex Round 3 IMO-1 対策、
-	// 未対応だと initEdit が開きっぱなしになり後続の Undo 操作が壊れる)。
+	// 必ず transaction を閉じる (= Codex Round 3 IMO-1 対策、 未対応だと initEdit が
+	// 開きっぱなしになり後続の Undo 操作が壊れる)。
+	// Round 6 での追加保証 :
+	//   - gesture 中の form 再同期は requestSync 経由で延期し、 onAfter で 1 回だけ
+	//     実行する (= Round 6 MUST-1 : gesture 中に選択が変わっても表示を開始時の
+	//     Group のまま保ち、 新しい表示値を元の対象へ書き込む事故を防ぐ)
+	//   - onAfter は context の有無や abort 状態に関わらず必ず最後まで走り、
+	//     書き込みが 1 度も成立しなかった gesture では form を実データから再同期する
+	//     (= Round 6 MUST-2 : onBefore の早期 return は BB の NumSlider 操作自体を
+	//     キャンセルしないため、 表示値だけが動いたまま残るのを防ぐ)
+	//   - onAfter が来ない中断経路 (= window blur / touchcancel / Panel 破棄) で残った
+	//     context / Undo transaction は「次の onBefore 冒頭」 と「cleanup」 で回収する
+	//     (= Round 6 WANT-1)
+	//   - 書き込みが成立しなかった gesture の transaction は cancelEdit で閉じる
+	//     (= BB の finishEdit は空 edit でも entry を push して Project.saved = false
+	//     にするため、 no-op で Undo entry を作らない契約を守れない)
 	interface SliderGestureContext {
 		// 書き込み種別 (= onBefore 時点の checkbox 状態で決まる)
 		kind: 'group' | 'animation'
@@ -273,17 +287,80 @@ export function registerSpringPanel(deps: {
 		boneUuid: string
 		// kind === 'animation' の対象 animation (= 同様に aspects と同じ参照)
 		animation: any | null
-		// 書き込み直前検証 (= Round 5 MUST-2) で中止したら true。 以降の input は
-		// 何も書かず、 onAfter の finishEdit で transaction だけ閉じる
+		// 書き込み直前検証 (= Round 5 MUST-2 / Round 6 MUST-1) で中止したら true。
+		// 以降の input は何も書かず、 onAfter で transaction を閉じて form を
+		// 実データから再同期する
 		aborted: boolean
+		// 1 度でも書き込みが成立したら true (= Round 6 MUST-2)。 false のまま
+		// 終了した gesture は widget の表示値だけが動いているため、 onAfter で
+		// form を実データから再同期する。 transaction の閉じ方の分岐
+		// (= finishEdit / cancelEdit) にも使う
+		wrote: boolean
 	}
 	let edit_started = false
 	let gesture_context: SliderGestureContext | null = null
+	// gesture 中に延期された form 再同期の flag (= Round 6 MUST-1)。 onAfter で
+	// 1 回だけまとめて実行したら下ろす。
+	let resync_pending = false
+
+	// form 再同期の唯一の入口 (= Round 6 MUST-1)。 gesture 中 (= gesture_context が
+	// 生きている間) に同期契機が来てもその場で form を書き換えない : 書き換えると
+	// 表示が gesture 開始時の Group から新しい選択へ切り替わり、 以降の input が
+	// 「新しい表示値」 を context に記録した元の Group / animation へ書き込む事故に
+	// なる。 gesture 中は flag を立てて延期し、 onAfter でまとめて再同期する。
+	// gesture 外 (= context が無い) からの呼び出しは従来どおり即時同期する。
+	const requestSync = (): void => {
+		if (gesture_context !== null) {
+			resync_pending = true
+			return
+		}
+		pushValuesFromSelectedGroup(form, isSpringCapableGroup, readOverrides)
+	}
+
+	// 開いている Undo transaction を閉じる (= onAfter / 次 gesture 冒頭の残骸回収 /
+	// cleanup の 3 経路で共有)。 書き込みが 1 度も成立していない gesture
+	// (= ctx が無い / wrote === false) は cancelEdit で空 entry を積まずに閉じる
+	// (= 契約 7 : no-op 操作で Undo entry を作らない)。 cancelEdit() は current_save を
+	// 破棄するだけで変更は revert しない (= 書き込み無しなので revert も不要)。
+	const closeGestureEdit = (ctx: SliderGestureContext | null): void => {
+		if (!edit_started) return
+		try {
+			if (ctx !== null && ctx.wrote) {
+				Undo?.finishEdit?.('Change spring config')
+			} else if (typeof Undo?.cancelEdit === 'function') {
+				Undo.cancelEdit()
+			} else {
+				// cancelEdit が無い環境では空 entry が積まれるが、 transaction を
+				// 閉じること (= 後続の Undo を壊さない) を優先する
+				Undo?.finishEdit?.('Change spring config')
+			}
+		} catch (e) {
+			console.warn('[spring_bone] close gesture edit failed', e)
+		} finally {
+			edit_started = false
+		}
+	}
 	for (const meta of PANEL_INPUTS) {
 		const element = (form as any).form_data?.[meta.key]
 		const slider = element?.slider
 		if (slider) {
 			slider.onBefore = () => {
+				// 前 gesture の残骸回収 (= Round 6 WANT-1) : onAfter が来ない中断経路
+				// (= window blur / touchcancel 等で BB の mouseup / touchend が届かない)
+				// で context や開いた Undo transaction が残ったまま次の gesture が
+				// 始まった場合、 先に閉じてから新しい context を作る。 Undo.current_save
+				// を開いたまま後続操作へ持ち越さないための保証。 なお window blur /
+				// touchcancel の listener は **足さない** : drag 中に別 window へ
+				// 切り替えて戻る操作を誤って中断扱いにするリスクがあるため。
+				if (gesture_context !== null || edit_started) {
+					const stale = gesture_context
+					gesture_context = null
+					closeGestureEdit(stale)
+					resync_pending = false
+					// 中断した gesture で widget の表示値だけが動いている可能性が
+					// あるため、 新しい gesture を始める前に実データへ張り直す
+					pushValuesFromSelectedGroup(form, isSpringCapableGroup, readOverrides)
+				}
 				if (!isSpringSelectionCapable(isSpringCapableGroup)) return
 				const g = Group.first_selected
 				const boneUuid = typeof g?.uuid === 'string' ? g.uuid : null
@@ -308,7 +385,7 @@ export function registerSpringPanel(deps: {
 					pushValuesFromSelectedGroup(form, isSpringCapableGroup, readOverrides)
 					return
 				}
-				gesture_context = { kind, group: g, boneUuid, animation: kind === 'animation' ? anim : null, aborted: false }
+				gesture_context = { kind, group: g, boneUuid, animation: kind === 'animation' ? anim : null, aborted: false, wrote: false }
 				try {
 					// aspects は drag 開始時点で確定した context から取る : kind が
 					// 'animation' なら選択中 animation の override を書くため
@@ -326,17 +403,27 @@ export function registerSpringPanel(deps: {
 				}
 			}
 			slider.onAfter = () => {
-				try {
-					if (edit_started) {
-						Undo?.finishEdit?.('Change spring config')
+				// context の有無や abort 状態に関わらず必ず最後まで走る (= Round 6 MUST-2)。
+				// BB の NumSlider は drag / arrow key / wheel / text 確定の全経路で
+				// onAfter を無条件発火する (= actions.ts)。
+				const ctx = gesture_context
+				gesture_context = null
+				closeGestureEdit(ctx)
+				// 「書き込みが 1 度も成立しなかった gesture」 (= onBefore の早期 return で
+				// context が無い / 書き込み直前検証で abort した) でも、 widget 自体の
+				// 表示値は動いている (= onBefore の早期 return は BB の NumSlider 操作を
+				// キャンセルしない)。 そのままだと保存データ / preview と slider の表示値が
+				// 次の同期 event まで食い違うため、 gesture 終了時に実データから再同期する。
+				// gesture 中に延期した同期 (= Round 6 MUST-1 の resync_pending) も
+				// ここで 1 回だけまとめて実行する。
+				const needsResync = resync_pending || ctx === null || ctx.aborted || !ctx.wrote
+				resync_pending = false
+				if (needsResync) {
+					try {
+						pushValuesFromSelectedGroup(form, isSpringCapableGroup, readOverrides)
+					} catch (e) {
+						console.warn('[spring_bone] slider onAfter resync failed', e)
 					}
-				} catch (e) {
-					console.warn('[spring_bone] slider onAfter failed', e)
-				} finally {
-					edit_started = false
-					// gesture context を破棄 (= Round 5 MUST-1)。 次の gesture は
-					// 必ず onBefore で新しい context を張り直す
-					gesture_context = null
 				}
 			}
 		}
@@ -371,11 +458,21 @@ export function registerSpringPanel(deps: {
 				if (typeof v !== 'number' || !Number.isFinite(v)) continue
 				const ctx = gesture_context
 				if (!ctx || ctx.aborted) continue
+				// 書き込み直前の Group 同一性検証 (= Round 6 MUST-1) : gesture 中に
+				// 選択 Group が context の group から変わった場合は書き込みを中止する。
+				// gesture 中の form 再同期は延期している (= requestSync) が、 延期が
+				// 漏れる経路が残っても新しい Group の表示値を元の Group / animation の
+				// override へ書き込む事故を防ぐ保険 (= kind 'group' / 'animation' 共通)。
+				if (ctx.group !== Group.first_selected) {
+					ctx.aborted = true
+					requestSync()
+					continue
+				}
 				if (ctx.kind === 'animation') {
 					// 書き込み直前の検証 (= Round 5 MUST-2) : gesture 中に対象
 					// animation が差し替わった / 削除された / 書き込み不可になった
-					// 場合は書き込みを中止して form を再同期する。 stale な checkbox
-					// 表示のまま Group 既定値を巻き添えに書き換えるのを防ぐ。
+					// 場合は書き込みを中止し、 gesture 終了時に form を再同期する。
+					// stale な checkbox 表示のまま Group 既定値を巻き添えに書き換えるのを防ぐ。
 					const target = ctx.animation
 					if (
 						target !== (Animation?.selected ?? null) ||
@@ -383,7 +480,7 @@ export function registerSpringPanel(deps: {
 						!canWriteOverrides(target)
 					) {
 						ctx.aborted = true
-						pushValuesFromSelectedGroup(form, isSpringCapableGroup, readOverrides)
+						requestSync()
 						continue
 					}
 					target[ANIM_OVERRIDES_KEY] = setOverrideField(
@@ -392,8 +489,10 @@ export function registerSpringPanel(deps: {
 						key as PanelSliderKey,
 						v,
 					)
+					ctx.wrote = true
 				} else {
 					ctx.group[`spring_${key}`] = v
+					ctx.wrote = true
 				}
 			}
 		} catch (e) {
@@ -467,7 +566,10 @@ export function registerSpringPanel(deps: {
 			// 書き込み後の再同期 (= ON → OFF で slider を継承値へ戻し、
 			// last_override_checks を新しい map の truth に張り直す)。
 			// setValues は 'input' を再発火しない (= cause: 'update_value') ため再帰しない。
-			pushValuesFromSelectedGroup(form, isSpringCapableGroup, readOverrides)
+			// requestSync 経由にするのは deferral の一貫性のため (= checkbox 操作は通常
+			// gesture 外なので即時同期になるが、 万一 gesture 中に来ても表示を
+			// 書き換えず onAfter に延期する = Round 6 MUST-1)。
+			requestSync()
 		}
 		// registry sync + fingerprint invalidate (= 次 tick で 0 replay、 preview 即反映)
 		try {
@@ -488,8 +590,11 @@ export function registerSpringPanel(deps: {
 	// animation_controllers.js:1066) には対応する event が存在しないため、 そちらは
 	// 書き込み直前検証 (= slider gesture context) と isAnimationAlive による
 	// 表示 / 書き込み両面の防御でカバーする。
+	// **同期本体は requestSync 経由** (= Round 6 MUST-1) : slider gesture 中にこれらの
+	// event が来てもその場で form を書き換えず、 onAfter で 1 回だけまとめて再同期する
+	// (= gesture 中の表示を開始時の Group のまま保つ)。
 	sync_listeners = []
-	const sync = (): void => pushValuesFromSelectedGroup(form, isSpringCapableGroup, readOverrides)
+	const sync = (): void => requestSync()
 	for (const event of ['update_selection', 'select_animation', 'remove_animation', 'undo', 'redo', 'select_project', 'load_project']) {
 		Blockbench.on(event, sync)
 		sync_listeners.push({ event, fn: sync })
@@ -500,6 +605,14 @@ export function registerSpringPanel(deps: {
 
 	return () => {
 		try {
+			// gesture 中断経路の回収 (= Round 6 WANT-1) : onAfter が来ない中断
+			// (= gesture 中の Panel 破棄 / plugin unload 等) で context や開いた
+			// Undo transaction が残っていたら必ず閉じる。 Undo.current_save を
+			// 開いたまま unload すると後続の Undo 操作が壊れる。
+			const stale = gesture_context
+			gesture_context = null
+			closeGestureEdit(stale)
+			resync_pending = false
 			for (const { event, fn } of sync_listeners) {
 				Blockbench.removeListener?.(event, fn)
 			}
