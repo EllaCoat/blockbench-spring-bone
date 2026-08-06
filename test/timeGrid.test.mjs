@@ -2,7 +2,11 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 
 const { timeToStepIndex, stepIndexToTime, stepIndexFromFrame, SpringRuntime } = await import('../dist-test/springRuntime.mjs')
-const { computeRestWindowWeight, deriveDisplayedFinalFrame } = await import('../dist-test/restWindow.mjs')
+const {
+	computeRestWindowWeight,
+	deriveDisplayedFinalFrame,
+	checkPreviewRestWindowTiming,
+} = await import('../dist-test/restWindow.mjs')
 
 test('timeToStepIndex: バグ再現ケース (2.05 → 123)', () => {
 	// 旧実装 Math.floor(2.05 / (1/60)) は 122.99999999999999 を floor して 122 を返していた
@@ -531,6 +535,33 @@ test('SpringRuntime: rest window が無い context では weight ≡ 1 (= 従来
 
 	assert.deepEqual(stepWeights(calls), [1, 1, 1])
 	assert.deepEqual(applyWeights(calls), [1, 1])
+})
+
+test('SpringRuntime: 契約違反の timing を弾いた preview context では w ≡ 1 に倒れる', () => {
+	// index.ts の makePreviewRestWindow 相当 : 契約違反なら窓ごと省略する
+	// (= preview は止めず、 減衰だけ諦めて従来動作へ倒す)。
+	const makePreviewRestWindow = (timing) =>
+		checkPreviewRestWindowTiming(timing) !== null ? undefined : { timing, requestedFadeFrames: 4 }
+	const brokenTimings = [
+		{ renderSampleCount: Number.NaN, loopMode: 'once', loopDelayFrames: 0 },
+		{ renderSampleCount: -1, loopMode: 'once', loopDelayFrames: 0 },
+		{ renderSampleCount: 20.5, loopMode: 'once', loopDelayFrames: 0 },
+		{ renderSampleCount: 21, loopMode: 'ping_pong', loopDelayFrames: 0 },
+		// preview の N = 0 は length 破損の徴候 (= 実在する極小 animation ではない)
+		{ renderSampleCount: 0, loopMode: 'once', loopDelayFrames: 0 },
+	]
+	for (const timing of brokenTimings) {
+		const calls = []
+		const restWindow = makePreviewRestWindow(timing)
+		assert.equal(restWindow, undefined, JSON.stringify(timing))
+		const { runtime, context, basePose } = makeRuntime(calls, { restWindow })
+		runtime.beginAnimation(context, basePose)
+		runtime.evaluateSample(stepIndexToTime(70))
+		runtime.applyWithoutAdvance()
+		// 物理が消えない (= 全 step で Δ をそのまま載せる)
+		for (const w of stepWeights(calls)) assert.strictEqual(w, 1, JSON.stringify(timing))
+		for (const w of applyWeights(calls)) assert.strictEqual(w, 1, JSON.stringify(timing))
+	}
 })
 
 test('SpringRuntime: sub-step の weight は「これから進む step (= next)」 基準', () => {

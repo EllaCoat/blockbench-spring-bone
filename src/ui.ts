@@ -4,13 +4,15 @@
 // で animate モード非表示のため、 animate 中の値編集を本 Panel が担う。
 //
 // Panel の役割は 3 層 :
-//   - NumSlider 3 個 = Group Property (= 全 animation 共通の既定値) の編集
-//   - animation 選択中のみ出る 2 行 (= inline_select `spring_state` と
+//   - NumSlider 3 個 = Group Property (= 全 animation 共通の既定値) の編集。 spring bone
+//     (= capable) を選択中のみ表示
+//   - animation 選択中 かつ bone 選択中のみ出る 2 行 (= inline_select `spring_state` と
 //     inline_multi_select `overrides`) = 選択中 animation だけの override 編集
-//   - animation 選択中のみ出る rest fade slider = 選択中 animation の終端 rest 整合
+//   - animation 選択中に出る rest fade slider = 選択中 animation の終端 rest 整合
 //     (= 上 2 つと違い **bone に依存しない** Animation Property)
-// animation 未選択でも Panel 自体は出したままにし、 slider による Group 既定値の
-// 編集は従来どおり使えるようにする (= animation 依存の行は form element の condition で隠す)。
+// **Panel 自体は animate モードで常時表示** (= display_condition を持たない) : rest fade は
+// animation 単位の値なので、 bone を選択していなくても編集できる必要がある。 bone / animation
+// への依存は行ごとの condition で表現する。
 //
 // 実装 pattern は BB 5.1.4 の element_panel.ts 実装を踏襲 :
 //   - new InputForm({}) + form_config への input 追加 + buildForm() で dynamic 生成
@@ -174,39 +176,47 @@ function readGroupBase(g: any): SpringBaseConfig {
 // - overrides 行の各 checkbox = その項目の override が map に存在するか
 //   (= normalize 済み map では存在 = 有効値、 が保証されている)
 // - spring_state 行 = override.enabled が true → 'on' / false → 'off' / 未設定 → 'inherit'
-// group が spring bone でない場合は何もしない (= Panel は display_condition で自動非表示)。
+// - rest fade 行 = 選択中 animation の Property 値 (= **bone の選択状態に依存しない**)
+// **per-bone 部分と rest fade を分けて同期する** : spring bone 未選択でも Panel は出たままに
+// なったため、 per-bone 側の早期 return で rest fade の同期まで巻き添えにしない。
 function pushValuesFromSelectedGroup(
 	form: any,
 	isSpringCapableGroup: IsSpringCapableGroup,
 	readOverrides: ReadOverrides,
 ): void {
-	if (!isSpringSelectionCapable(isSpringCapableGroup)) return
-	const g = Group.first_selected
-	const base = readGroupBase(g)
-	const groupState = toSpringBoneState(g?.spring_bone_enabled)
 	const animSelected = Animation?.selected ?? null
 	// 削除済み animation が selected に残っているケース (= remove_animation が
 	// selected=null より先に発火する) は「未選択」として扱う (= Round 5 MUST-2)。
 	// これが無いと削除直後の同期で削除済み animation の override を表示に張り直す。
 	const anim = animSelected !== null && isAnimationAlive(animSelected) ? animSelected : null
-	const boneUuid = typeof g?.uuid === 'string' ? g.uuid : null
-	const override = anim !== null && boneUuid !== null ? readOverrides(anim)[boneUuid] : undefined
-	const inherited = resolveEffective(base, groupState, undefined, PANEL_DEFAULTS)
 	const values: Record<string, unknown> = {}
-	const checks: Record<string, boolean> = {}
-	for (const meta of PANEL_INPUTS) {
-		const ov = override?.[meta.key]
-		values[meta.key] = typeof ov === 'number' && Number.isFinite(ov) ? ov : inherited[meta.key]
-		checks[meta.key] = ov !== undefined
-	}
-	values.overrides = checks
-	values.spring_state =
-		override?.enabled === true ? 'on' : override?.enabled === false ? 'off' : 'inherit'
 	// fade 長は選択中 animation の Property から (= bone には依存しない)。 animation 未選択時は
 	// 行自体が隠れるが、 widget の値は既定値に揃えておく (= 次に animation を選んだ時に
 	// 前の animation の値が残らない)。
 	values[REST_FADE_INPUT.key] = anim !== null ? readRestFade(anim) : REST_FADE_INPUT.defaultValue
-	last_override_checks = checks
+
+	if (isSpringSelectionCapable(isSpringCapableGroup)) {
+		const g = Group.first_selected
+		const base = readGroupBase(g)
+		const groupState = toSpringBoneState(g?.spring_bone_enabled)
+		const boneUuid = typeof g?.uuid === 'string' ? g.uuid : null
+		const override = anim !== null && boneUuid !== null ? readOverrides(anim)[boneUuid] : undefined
+		const inherited = resolveEffective(base, groupState, undefined, PANEL_DEFAULTS)
+		const checks: Record<string, boolean> = {}
+		for (const meta of PANEL_INPUTS) {
+			const ov = override?.[meta.key]
+			values[meta.key] = typeof ov === 'number' && Number.isFinite(ov) ? ov : inherited[meta.key]
+			checks[meta.key] = ov !== undefined
+		}
+		values.overrides = checks
+		values.spring_state =
+			override?.enabled === true ? 'on' : override?.enabled === false ? 'off' : 'inherit'
+		last_override_checks = checks
+	} else {
+		// per-bone 行は隠れているので値は触らない。 checkbox の直前状態だけは空へ戻す
+		// (= 次に bone を選んだ時に前の bone の状態が残らない)。
+		last_override_checks = {}
+	}
 	// gesture 中は form への書き戻しだけ抑止する (= 表示の問題であって Undo とは無関係)。
 	// BB の NumSlider drag は「現在の widget 値 + delta」 で次の値を作る
 	// (= actions.ts slide())ため、 drag 中に setValues で widget 値を差し替えると
@@ -247,9 +257,9 @@ export function registerSpringPanel(deps: {
 		name: 'Spring Bone',
 		// animate モード限定 = edit モードは element_panel input に任せて重複回避。
 		condition: { modes: ['animate'] },
-		// display_condition = spring bone (= capable) group が単独選択されているときのみ Panel 内容表示。
-		// 非選択時は Panel が collapse or 非表示になる (= BB core 側の挙動)。
-		display_condition: () => isSpringSelectionCapable(isSpringCapableGroup),
+		// **display_condition は付けない** : rest fade は animation 単位の値なので、 spring bone を
+		// 選択していなくても編集できる必要がある。 bone 依存の 3 slider + override 2 行だけを
+		// form element の condition で隠し、 Panel 自体は animate モードで常時出す。
 		default_position: {
 			slot: 'right_bar',
 			float_position: [0, 0],
@@ -275,7 +285,13 @@ export function registerSpringPanel(deps: {
 	//     不可能にする)
 	// condition は form.update() が form_result を context に評価する
 	// (= form.ts:223-232) ので、 値同期のたびに表示 / 非表示が追従する。
+	// bone 依存の行 (= 3 slider + override 2 行) の表示条件。 Panel を animate モード常時表示に
+	// したため、 spring bone 未選択のときは書き込み先が無い。 出したままだと「操作できるのに
+	// どこへ書かれるか分からない」 UI になるので、 行ごと隠す。
+	const isBoneRowVisible = (): boolean => isSpringSelectionCapable(isSpringCapableGroup)
+
 	const isOverrideRowVisible = (): boolean => {
+		if (!isBoneRowVisible()) return false
 		const anim = Animation?.selected
 		if (!anim || !isAnimationAlive(anim)) return false
 		return canWriteOverrides(anim)
@@ -319,6 +335,7 @@ export function registerSpringPanel(deps: {
 	// type: 'num_slider' = BB 5.1.4 の NumSlider (= slider 内蔵 + Ctrl/Shift 倍率変更 modifier
 	// 対応)。 UX 要件 (= 数値入力 + スライドバーで直感的に連続調整) を満たす。 'number' 型は
 	// NumericInput (= slider なし) で不適。
+	// **condition で bone 選択に追従させる** (= isBoneRowVisible、 override 2 行と同じ扱い)。
 	for (const meta of PANEL_INPUTS) {
 		form_config[meta.key] = {
 			label: meta.label,
@@ -327,6 +344,7 @@ export function registerSpringPanel(deps: {
 			max: meta.max,
 			step: meta.step,
 			value: meta.defaultValue,
+			condition: isBoneRowVisible,
 		}
 	}
 	try {

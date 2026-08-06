@@ -33,8 +33,10 @@ import { createExportDriver, type ExportDriverHost } from './ajExportBridge'
 import {
 	ANIM_REST_FADE_KEY,
 	DEFAULT_REST_FADE_FRAMES,
+	checkPreviewRestWindowTiming,
+	checkRestWindowTiming,
 	classifyRestWindowWeight,
-	deriveRenderSampleCount,
+	createRenderSampleCountCache,
 	restWindowFingerprint,
 } from './restWindow'
 import { registerSpringPanel } from './ui'
@@ -211,23 +213,51 @@ function readRestFadeFrames(animation: unknown): number {
 	return typeof raw === 'number' && Number.isFinite(raw) ? raw : DEFAULT_REST_FADE_FRAMES
 }
 
+// preview の sample 数 memo (= animation identity + raw length を key に 1 件だけ保持)。
+// project 切替 / install / cleanup で clear する (= 旧 project の instance 参照を握らない)。
+const renderSampleCountCache = createRenderSampleCountCache()
+
+// rest window の timing が契約違反だった旨を警告済みの animation uuid。
+// makePreviewRestWindow は毎 tick 走るため、 同一 animation への警告は 1 回だけに絞る。
+// overridesMemo / warnedNewerSchemaUuids と同じ 3 箇所でリセットする。
+const warnedRestWindowUuids = new Set<string>()
+
+function warnRestWindowOnce(animation: any, reason: string): void {
+	const uuid = typeof animation?.uuid === 'string' ? animation.uuid : null
+	if (uuid !== null && warnedRestWindowUuids.has(uuid)) return
+	if (uuid !== null) warnedRestWindowUuids.add(uuid)
+	console.warn(
+		`[${PLUGIN_ID}] animation "${animation?.name ?? uuid ?? '?'}" has invalid timing for the rest window (${reason}), disabling end-rest fade in preview`,
+	)
+}
+
 // preview 経路の rest window を BB の Animation object から組み立てる。
 // **preview は AJ を通らない** ため renderSampleCount を自前で数える (= AJ の render loop
 // と同じ丸めで数え直す deriveRenderSampleCount)。 loop_delay は BB では string 型
 // (= form 入力) なので、 AJ の renderAnimation と同じ `Number(...) || 0` で数値化して
 // 値が食い違わないようにする。
+//
+// **契約違反の値は窓ごと省略する** (= weight ≡ 1 の従来動作へ倒す) : 0 に正規化して
+// そのまま使うと weight ≡ 0 になり、 preview から物理が黙って消える。 export 経路と違って
+// preview は止めない (= 止めると編集作業そのものが止まる) ので、 警告だけ出して減衰を諦める。
 function makePreviewRestWindow(animation: any): RestWindowContext | undefined {
 	// animation 未選択 (= 複数 animation の同時 stack preview) では終点が 1 つに定まらない
 	// ため rest window を作らない (= weight ≡ 1 で従来動作)。
 	if (!animation) return undefined
-	return {
-		timing: {
-			renderSampleCount: deriveRenderSampleCount(animation.length),
-			loopMode: animation.loop,
-			loopDelayFrames: Number(animation.loop_delay) || 0,
-		},
-		requestedFadeFrames: readRestFadeFrames(animation),
+	const timing = {
+		// length が壊れている (= NaN / 負 / 数値でない) と sample 数が 0 になる。
+		// checkPreviewRestWindowTiming がこれを契約違反として拾う (= 実在する極小
+		// animation の N = 0 と区別する必要があるのは export 側だけ)。
+		renderSampleCount: renderSampleCountCache.get(animation, animation.length),
+		loopMode: animation.loop,
+		loopDelayFrames: Number(animation.loop_delay) || 0,
 	}
+	const violation = checkPreviewRestWindowTiming(timing)
+	if (violation !== null) {
+		warnRestWindowOnce(animation, violation)
+		return undefined
+	}
+	return { timing, requestedFadeFrames: readRestFadeFrames(animation) }
 }
 
 // 「この animation の override を書いてよいか」の判定 (= Round 5 MUST-4)。
@@ -1842,6 +1872,8 @@ function installTickLoop(): () => void {
 	lastSessionFingerprint = ''
 	overridesMemo = null
 	warnedNewerSchemaUuids.clear()
+	renderSampleCountCache.clear()
+	warnedRestWindowUuids.clear()
 
 	// animation pose 由来の cache invalidation は BB event / Undo transaction を境界にする案 A を採用。
 	// 案 B (= keyframe 全値を fingerprint 化) は display frame ごとの走査と BB 内部構造への依存が増え、
@@ -1950,8 +1982,10 @@ function installTickLoop(): () => void {
 		// identity 比較なので残っていても誤ヒットはしないが、 参照保持を避ける)。
 		overridesMemo = null
 		// 上位 schema 警告の抑止も project 単位に戻す (= 同一 blueprint を別 project で
-		// 開いたときに警告が黙るのを防ぐ)。
+		// 開いたときに警告が黙るのを防ぐ)。 rest window 側の警告抑止と sample 数 memo も同じ。
 		warnedNewerSchemaUuids.clear()
+		renderSampleCountCache.clear()
+		warnedRestWindowUuids.clear()
 		if (projectRescanRafId !== null) return
 		projectRescanRafId = requestAnimationFrame(() => {
 			projectRescanRafId = null
@@ -2056,6 +2090,8 @@ function installTickLoop(): () => void {
 		lastSessionFingerprint = ''
 		overridesMemo = null
 		warnedNewerSchemaUuids.clear()
+		renderSampleCountCache.clear()
+		warnedRestWindowUuids.clear()
 		invalidatePreviewSession()
 	}
 }
@@ -2084,15 +2120,28 @@ const exportDriverHost: ExportDriverHost<PreviewAnimationContext> = {
 	// AJ v2 の周期情報をそのまま rest window の入力にする (= export では
 	// renderSampleCount が正本。 preview 側の deriveRenderSampleCount で数え直さない)。
 	// fade 長だけは animation Property から読む。
-	makeExportContext: (animation, excludedNodeUuids, timing) =>
-		makeExportAnimationContext(animation, excludedNodeUuids, {
-			timing: {
-				renderSampleCount: timing.renderSampleCount,
-				loopMode: timing.loopMode,
-				loopDelayFrames: timing.loopDelayFrames,
-			},
+	//
+	// **契約違反の timing は throw して export を止める** : 0 へ正規化して続行すると
+	// weight ≡ 0 = 物理が全く載っていない datapack が黙って出力される。 AJ は hook の例外を
+	// RenderHookError に包んで export エラーへ surface するため、 ここで止めれば気付ける。
+	// preview 側 (= makePreviewRestWindow) は警告 + 窓の省略に留める (= 編集を止めない)。
+	makeExportContext: (animation, excludedNodeUuids, timing) => {
+		const restTiming = {
+			renderSampleCount: timing.renderSampleCount,
+			loopMode: timing.loopMode,
+			loopDelayFrames: timing.loopDelayFrames,
+		}
+		const violation = checkRestWindowTiming(restTiming)
+		if (violation !== null) {
+			throw new Error(
+				`[${PLUGIN_ID}] AnimatedJava render hook supplied invalid animation timing (${violation}); aborting export to avoid baking an animation without spring physics`,
+			)
+		}
+		return makeExportAnimationContext(animation, excludedNodeUuids, {
+			timing: restTiming,
 			requestedFadeFrames: readRestFadeFrames(animation),
-		}),
+		})
+	},
 	// capable な bone が 1 つも無い project では export に一切介入しない : 介入すると
 	// frame ごとに pose の capture / restore と 3 sub-step 分の base pose 再評価が乗り、
 	// 物理を掛ける対象がゼロのまま export だけが重くなる。

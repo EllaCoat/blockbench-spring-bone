@@ -35,6 +35,52 @@ export interface RestWindowTiming {
 	loopDelayFrames: number
 }
 
+// BB Animation の loop 種別。 これ以外の値は「周期を判断できない」 = 契約違反として扱う。
+export const KNOWN_LOOP_MODES = ['once', 'hold', 'loop'] as const
+
+// timing が AJ v2 hook の契約を満たしているかの判定。 満たしていれば null、 破っていれば
+// 理由の文字列を返す (= 呼び出し側が throw / warn のメッセージに使う)。
+//
+// **なぜ正規化と別に判定が要るか** : 正規化 (= toFrameCount) は壊れた値を 0 へ倒すため、
+// 契約違反の renderSampleCount (= NaN / 負 / 非整数) と、 実在する極小 animation
+// (= N が 0 / 1 / 2) がどちらも displayedFinalFrame 0 → weight ≡ 0 に潰れる。 前者は
+// 「気付かないまま物理が消えた壊れた出力」 で、 後者は仕様どおりの縮退なので、
+// 出力する前にこの境界で分ける。
+//
+// 未知の loopMode も契約違反に含める : 既定で once 扱いに倒すと、 実際が loop だった場合に
+// 終点が 1 frame 遅れて表示される最終 frame に Δ が残る (= 対策そのものが効かない)。
+//
+// loopDelayFrames は検査しない : AJ 側が `Number(animation.loop_delay) || 0` で必ず有限値に
+// しており、 かつこの値は「> 0 か否か」 しか見ないため、 負 / 非整数でも解釈が壊れない。
+export function checkRestWindowTiming(timing: RestWindowTiming): string | null {
+	const sampleCount = timing.renderSampleCount
+	if (!Number.isInteger(sampleCount) || sampleCount < 0) {
+		return `renderSampleCount must be a non-negative integer, got ${String(sampleCount)}`
+	}
+	if (!(KNOWN_LOOP_MODES as readonly string[]).includes(timing.loopMode)) {
+		return `unknown loopMode ${JSON.stringify(timing.loopMode)}`
+	}
+	return null
+}
+
+// preview 経路の timing 妥当性判定。 export 用 (= checkRestWindowTiming) との違いは
+// **renderSampleCount 0 の扱い** :
+// - export の N は AJ が実際に生成した frame 数そのもの (= 権威ある値)。 0 なら本当に
+//   frame が無いので、 仕様どおり E = 0 → weight ≡ 0 の縮退に倒す
+// - preview の N は deriveRenderSampleCount が animation.length から数えた値で、 length が
+//   正当 (= 0 以上の有限値) なら必ず 1 以上になる。 したがって 0 は「length が壊れている」
+//   (= NaN / 負 / 数値でない) ことの徴候であり、 契約違反として扱う
+// この区別が無いと、 length 破損と実在する極小 animation がどちらも weight ≡ 0 に潰れ、
+// preview から物理が黙って消える。
+export function checkPreviewRestWindowTiming(timing: RestWindowTiming): string | null {
+	const violation = checkRestWindowTiming(timing)
+	if (violation !== null) return violation
+	if (timing.renderSampleCount < 1) {
+		return 'renderSampleCount is 0 (animation.length is not a finite non-negative number)'
+	}
+	return null
+}
+
 // 外部由来の frame 数を「0 以上の整数」 へ正規化する。 非有限値 (= NaN / Infinity) は
 // 0 へ倒し、 非整数は floor する (= ceil だと存在しない frame を減衰の終点に据えてしまい、
 // 終点に到達しないまま animation が終わる)。
@@ -77,6 +123,38 @@ export function deriveRenderSampleCount(lengthSeconds: number): number {
 		if (count >= MAX_RENDER_SAMPLE_COUNT) break
 	}
 	return count
+}
+
+// deriveRenderSampleCount の 1 件 memo。 preview は表示 frame ごとに sample 数を要求する
+// ため、 毎回 loop を回すと animation の長さに比例して preview のコストが増える。
+//
+// key = animation の identity + raw length。 **length が変われば自動的に再計算される** ので、
+// 呼び出し側が invalidate 条件を別途持つ必要は無い (= keyframe 編集で length が伸び縮み
+// しても次の呼び出しで追従する)。 length の比較は Object.is : NaN の length でも
+// memo hit させて、 壊れた入力で毎回 loop を回さないようにする。
+//
+// factory にしているのは module singleton にしないため (= 呼び出し側が生存期間を持ち、
+// project 切替時に clear して旧 animation instance の参照を手放せる)。
+export interface RenderSampleCountCache {
+	get(animation: unknown, lengthSeconds: number): number
+	clear(): void
+}
+
+export function createRenderSampleCountCache(): RenderSampleCountCache {
+	let memo: { animation: unknown; length: number; count: number } | null = null
+	return {
+		get(animation: unknown, lengthSeconds: number): number {
+			if (memo !== null && memo.animation === animation && Object.is(memo.length, lengthSeconds)) {
+				return memo.count
+			}
+			const count = deriveRenderSampleCount(lengthSeconds)
+			memo = { animation, length: lengthSeconds, count }
+			return count
+		},
+		clear(): void {
+			memo = null
+		},
+	}
 }
 
 // 表示上の最終 frame index を導出する。

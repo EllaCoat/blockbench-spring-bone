@@ -3,6 +3,10 @@ import assert from 'node:assert/strict'
 
 const {
 	SUBSTEPS_PER_EXPORT_FRAME,
+	KNOWN_LOOP_MODES,
+	checkRestWindowTiming,
+	checkPreviewRestWindowTiming,
+	createRenderSampleCountCache,
 	deriveRenderSampleCount,
 	deriveDisplayedFinalFrame,
 	resolveFadeFrames,
@@ -80,6 +84,154 @@ test('deriveRenderSampleCount: 巨大な length でも停止する (= 上限で�
 	// 進行不能な入力でも無限ループにならないことを固定する
 	const result = deriveRenderSampleCount(1e9)
 	assert.ok(Number.isInteger(result) && result > 0 && result <= 100000, `result=${result}`)
+})
+
+// --- checkRestWindowTiming (= export 経路の契約判定) ---
+
+test('checkRestWindowTiming: 正当な timing は null', () => {
+	for (const loopMode of KNOWN_LOOP_MODES) {
+		for (const renderSampleCount of [0, 1, 2, 3, 21, 1000]) {
+			assert.equal(
+				checkRestWindowTiming({ renderSampleCount, loopMode, loopDelayFrames: 0 }),
+				null,
+				`${loopMode} / N=${renderSampleCount}`,
+			)
+		}
+	}
+})
+
+test('checkRestWindowTiming: 正当な N = 0 / 1 / 2 は契約違反にしない (= w ≡ 0 の縮退のまま)', () => {
+	// 実在する極小 animation。 契約違反 (= 下の test) と混同すると、 正しい出力まで止まる
+	for (const renderSampleCount of [0, 1, 2]) {
+		assert.equal(checkRestWindowTiming(timing(renderSampleCount, 'once', 0)), null)
+		assert.equal(checkRestWindowTiming(timing(renderSampleCount, 'loop', 0)), null)
+	}
+	// 中間 sample を持たない組み合わせ (= E = 0) は従来どおり weight ≡ 0 の縮退へ落ちる
+	for (const t of [timing(0, 'once', 0), timing(1, 'once', 0), timing(2, 'loop', 0)]) {
+		const finalFrame = deriveDisplayedFinalFrame(t)
+		assert.equal(finalFrame, 0)
+		for (const step of [0, 1, 10]) {
+			assert.strictEqual(computeRestWindowWeight(step, finalFrame, 4), 0)
+		}
+	}
+	// N = 2 の once は 1 frame ぶんの区間を持つ (= 潰さない)
+	assert.equal(deriveDisplayedFinalFrame(timing(2, 'once', 0)), 1)
+})
+
+test('checkRestWindowTiming: 非有限 / 負 / 非整数の renderSampleCount は契約違反', () => {
+	for (const renderSampleCount of [
+		Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, -1, -0.5, 2.5, '21', null, undefined,
+	]) {
+		const reason = checkRestWindowTiming({ renderSampleCount, loopMode: 'once', loopDelayFrames: 0 })
+		assert.equal(typeof reason, 'string', `N=${String(renderSampleCount)}`)
+		assert.match(reason, /renderSampleCount/)
+	}
+})
+
+test('checkRestWindowTiming: 未知の loopMode は契約違反', () => {
+	// once へ倒すと、 実際が loop だった場合に終点が 1 frame 遅れて Δ が残る
+	for (const loopMode of ['ping_pong', 'LOOP', '', 'Once', null, undefined, 0]) {
+		const reason = checkRestWindowTiming({ renderSampleCount: 21, loopMode, loopDelayFrames: 0 })
+		assert.equal(typeof reason, 'string', `loopMode=${String(loopMode)}`)
+		assert.match(reason, /loopMode/)
+	}
+})
+
+test('checkRestWindowTiming: loopDelayFrames は検査しない (= 「> 0 か否か」 しか見ないため)', () => {
+	for (const loopDelayFrames of [-3, 0.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+		assert.equal(
+			checkRestWindowTiming({ renderSampleCount: 21, loopMode: 'loop', loopDelayFrames }),
+			null,
+			`delay=${loopDelayFrames}`,
+		)
+	}
+})
+
+// --- checkPreviewRestWindowTiming (= preview 経路の契約判定) ---
+
+test('checkPreviewRestWindowTiming: N = 0 は契約違反 (= length 破損の徴候)', () => {
+	// preview の N は length から数えた値で、 正当な length なら必ず 1 以上になる
+	const reason = checkPreviewRestWindowTiming(timing(0, 'once', 0))
+	assert.equal(typeof reason, 'string')
+	assert.match(reason, /renderSampleCount/)
+	// 対して export 側は N = 0 を正当な縮退として通す
+	assert.equal(checkRestWindowTiming(timing(0, 'once', 0)), null)
+})
+
+test('checkPreviewRestWindowTiming: N >= 1 は正当 (= 極小 animation は通す)', () => {
+	for (const renderSampleCount of [1, 2, 3, 21]) {
+		assert.equal(checkPreviewRestWindowTiming(timing(renderSampleCount, 'once', 0)), null)
+	}
+})
+
+test('checkPreviewRestWindowTiming: export 側の判定も引き継ぐ', () => {
+	assert.match(checkPreviewRestWindowTiming(timing(Number.NaN, 'once', 0)), /renderSampleCount/)
+	assert.match(checkPreviewRestWindowTiming(timing(21, 'ping_pong', 0)), /loopMode/)
+})
+
+test('checkPreviewRestWindowTiming: 壊れた length から数えた結果が必ず違反になる', () => {
+	// deriveRenderSampleCount との組み合わせで、 preview 経路の入口から出口まで繋げて固定する
+	for (const length of [Number.NaN, Number.POSITIVE_INFINITY, -1, undefined, '2']) {
+		const t = timing(deriveRenderSampleCount(length), 'once', 0)
+		assert.notEqual(checkPreviewRestWindowTiming(t), null, `length=${String(length)}`)
+	}
+	// 正当な length は必ず通る
+	for (const length of [0, 0.001, 1, 2.5]) {
+		const t = timing(deriveRenderSampleCount(length), 'once', 0)
+		assert.equal(checkPreviewRestWindowTiming(t), null, `length=${length}`)
+	}
+})
+
+// --- createRenderSampleCountCache ---
+
+test('createRenderSampleCountCache: deriveRenderSampleCount と同じ値を返す', () => {
+	const cache = createRenderSampleCountCache()
+	const anim = { name: 'walk' }
+	for (const length of [0, 0.05, 1, 2, 3.35]) {
+		assert.equal(cache.get(anim, length), deriveRenderSampleCount(length), `length=${length}`)
+	}
+})
+
+test('createRenderSampleCountCache: length が変われば再計算する', () => {
+	// key に raw length を含めるため、 keyframe 編集で length が伸び縮みしても
+	// 呼び出し側が invalidate 条件を持つ必要が無い
+	const cache = createRenderSampleCountCache()
+	const anim = { name: 'walk' }
+	assert.equal(cache.get(anim, 1), 21)
+	assert.equal(cache.get(anim, 2), 41)
+	// 戻しても正しい値 (= 古い結果に固着しない)
+	assert.equal(cache.get(anim, 1), 21)
+	assert.equal(cache.get(anim, 0), 1)
+})
+
+test('createRenderSampleCountCache: animation の identity が変われば再計算する', () => {
+	const cache = createRenderSampleCountCache()
+	const a = { name: 'a' }
+	const b = { name: 'b' }
+	assert.equal(cache.get(a, 1), 21)
+	assert.equal(cache.get(b, 2), 41)
+	assert.equal(cache.get(a, 1), 21)
+	// 同じ length でも別 instance で正しい値を返す
+	assert.equal(cache.get(b, 1), 21)
+})
+
+test('createRenderSampleCountCache: clear 後も正しい値を返す', () => {
+	const cache = createRenderSampleCountCache()
+	const anim = { name: 'walk' }
+	assert.equal(cache.get(anim, 1), 21)
+	cache.clear()
+	assert.equal(cache.get(anim, 1), 21)
+	assert.equal(cache.get(anim, 2), 41)
+})
+
+test('createRenderSampleCountCache: 壊れた length も 0 として扱い、 変化に追従する', () => {
+	const cache = createRenderSampleCountCache()
+	const anim = { name: 'walk' }
+	assert.equal(cache.get(anim, Number.NaN), 0)
+	// NaN → NaN は memo hit (= Object.is 比較)、 値は変わらない
+	assert.equal(cache.get(anim, Number.NaN), 0)
+	// 正常値へ戻れば再計算される
+	assert.equal(cache.get(anim, 1), 21)
 })
 
 // --- deriveDisplayedFinalFrame ---
