@@ -2768,8 +2768,7 @@ function runSpringBake(animation: any): void {
 		baked[ANIM_BAKED_SOURCE_HASH_KEY] = sourceHash
 		baked[ANIM_BAKED_VERSION_KEY] = BAKE_VERSION
 		// **BB 標準の複製処理と同じ後始末を通す** (= SharedActions 'duplicate'、 animation.js:846-856) :
-		// - resetUniqueValues = 複製してはいけない Property (= copy_value false、 animation file の
-		//   `path` 等) を既定へ戻す。 これをしないと元 animation と同じ file を指したままになる
+		// - resetUniqueValues = 複製してはいけない Property (= copy_value false) を既定へ戻す
 		// - saved = false = 未保存であることを明示する。 getUndoCopy は `saved` を含まないが、
 		//   Property 経由で複製される値もあるうえ、 Undo の before aspects が `{animations: []}` の
 		//   ため BB の finished_edit listener もこの新規 animation を dirty にしてくれない。
@@ -2781,6 +2780,12 @@ function runSpringBake(animation: any): void {
 		} catch (e) {
 			console.warn(`[${PLUGIN_ID}] Property.resetUniqueValues failed`, e)
 		}
+		// **`path` は resetUniqueValues では消えない** : BB の `Animation.properties.path`
+		// (= animation.js:771) に `copy_value: false` が付いていないため、 resetUniqueValues
+		// (= property.ts:238-245 が `copy_value == false` の Property だけを reset する) の
+		// 対象外になる。 getUndoCopy で複製された元 animation の path が残ると、 外部 animation
+		// file の保存 / 削除で同一 file として扱われるので、 ここで明示的に空へ倒す。
+		baked.path = ''
 		baked.saved = false
 		// add(false) = Animator.animations へ追加 + createUniqueName (= 名前衝突の解決)。
 		// select はしない (= 選択中 animation を勝手に切り替えない)。
