@@ -2408,6 +2408,47 @@ function makeBakeSceneOps(context: PreviewAnimationContext): BakeSceneOps {
 	}
 }
 
+// bake が扱えない「元 animation の非既定な状態」 の検査。 該当したら **bake を拒否する**
+// (= 仮機能スコープなので、 中途半端に写すより止める)。
+//
+// 共通する構造は「stackAnimations の pose 評価には効くが、 派生 animation には正しく写らない
+// 状態」。 焼き込んだ rotation にはその効果が **既に入っている** のに、 複製した data 側にも
+// 同じ状態が残る (= blend_weight) か、 逆に落ちる (= muted) ため、 再生結果が食い違う。
+
+// blend_weight は Molang 文字列 Property (= animation.js:775、 既定 '')。
+// BB は `animation.blend_weight ? parse(...) : 1` で multiplier にする (= animation_mode.js:329)
+// ため、 falsy か定数 1 なら「掛からない」 = 既定と等価。 動的な Molang 式は値が読めないので
+// 一律拒否する。
+function isDefaultBlendWeight(raw: unknown): boolean {
+	if (!raw) return true
+	const text = typeof raw === 'number' ? String(raw) : typeof raw === 'string' ? raw.trim() : null
+	if (text === null) return false
+	if (text.length === 0) return true
+	return /^\+?1(\.0*)?$/.test(text)
+}
+
+// transform channel (= rotation / position / scale) を mute している animator の名前を返す。
+// mute は stackAnimations の pose 評価に効く (= timeline_animators.js:594-596) が、
+// getUndoCopy には含まれないため派生側では全 channel が unmute になる。 親 bone の rotation を
+// mute した状態で bake すると、 収集時は親回転が無い pose なのに派生再生では復活し、
+// 子 spring bone の world pose が変わる。
+const BAKE_TRANSFORM_CHANNELS = ['rotation', 'position', 'scale'] as const
+function findMutedTransformAnimator(animation: any): string | null {
+	const animators = animation?.animators
+	if (!animators || typeof animators !== 'object') return null
+	for (const key of Object.keys(animators)) {
+		const animator = (animators as Record<string, any>)[key]
+		const muted = animator?.muted
+		if (!muted || typeof muted !== 'object') continue
+		for (const channel of BAKE_TRANSFORM_CHANNELS) {
+			if (muted[channel]) {
+				return typeof animator.name === 'string' && animator.name.length > 0 ? animator.name : key
+			}
+		}
+	}
+	return null
+}
+
 // bake 中だけ effect channel (= particle / sound / timeline script) を止める。 戻り値は復元関数。
 //
 // **なぜ必要か** : base pose の評価は Animator.stackAnimations を通り、 その末尾で
@@ -2509,6 +2550,30 @@ function runSpringBake(animation: any): void {
 		showBakeMessage('Spring bake', 'この animation は既に bake 済みの派生 animation です')
 		return
 	}
+	// **blend_weight が既定でない animation は拒否する** : 収集した rotation には
+	// blend_weight が既に掛かっている一方、 複製した data 側にも blend_weight が残るため
+	// 再生時に二重に掛かる (= 20° × 0.5 で焼いた 10° が、 再生では 5° になる)。
+	// 派生側から消すだけでは、 未 bake のまま複製する position / scale の意味が変わる
+	// (= そちらには掛かるべき) ので、 仮機能スコープでは bake ごと止める。
+	if (!isDefaultBlendWeight(animation.blend_weight)) {
+		showBakeMessage(
+			'Spring bake',
+			`blend_weight が既定ではありません ("${String(animation.blend_weight)}")。\n` +
+			'bake した rotation に blend_weight が二重に掛かるため、 この animation は bake できません。',
+		)
+		return
+	}
+	// **transform channel を mute した animator がある animation も拒否する** :
+	// mute は pose 評価に効くが派生側には写らないため、 再生で mute した channel が復活する。
+	const mutedAnimator = findMutedTransformAnimator(animation)
+	if (mutedAnimator !== null) {
+		showBakeMessage(
+			'Spring bake',
+			`animator "${mutedAnimator}" の transform channel が mute されています。\n` +
+			'mute は派生 animation に引き継げないため、 解除してから bake してください。',
+		)
+		return
+	}
 	// 直前の rig 編集 / Property 変更を取り込んでから走らせる (= registry と topoOrder の最新化)。
 	try {
 		rescanRegistry()
@@ -2524,6 +2589,7 @@ function runSpringBake(animation: any): void {
 	const context = makeExportAnimationContext(animation, BAKE_EXCLUDED_NODES, makePreviewRestWindow(animation))
 
 	let result: BakeResult | null = null
+	let paramHash = ''
 	// export driver と同じ順序で preview を明け渡す (= session を畳んでから tick を止める)。
 	invalidatePreviewSession()
 	exportGate.suspend()
@@ -2534,6 +2600,13 @@ function runSpringBake(animation: any): void {
 			frameCount,
 			...makeBakeQuaternionOps(),
 		})
+		// **param hash は finally より前に取る** : entry.config は bake session の
+		// resolveConfigs が解決した値を保持しているが、 finally の requestAnimatorPreview →
+		// Animator.preview() は **同期的に** display_animation_frame を発火し、 その listener
+		// 経由で tick() → beginAnimation → resolveConfigs が走って entry.config を
+		// 「選択中 animation の解決結果」 で上書きする。 右クリック対象と選択中 animation が
+		// 違うと、 finally の後に読んだ値は別 animation のものになる。
+		paramHash = hashFingerprint(collectBakeParamSnapshot(animation))
 	} catch (e) {
 		console.warn(`[${PLUGIN_ID}] bake failed`, e)
 		showBakeMessage('Spring bake', `bake に失敗しました : ${String(e)}`)
@@ -2552,10 +2625,6 @@ function runSpringBake(animation: any): void {
 		showBakeMessage('Spring bake', 'この animation で有効な spring bone がありません')
 		return
 	}
-	// param hash は **bake 直後に取る** : entry.config は bake session の解決結果を保持しており、
-	// 次の tick の resolveConfigs で上書きされる (= 同期実行中に tick は挟まらない)。
-	const paramHash = hashFingerprint(collectBakeParamSnapshot(animation))
-
 	let sourceData: any
 	try {
 		sourceData = animation.getUndoCopy({})
@@ -2616,15 +2685,24 @@ function runSpringBake(animation: any): void {
 		`(最大 ${result.maxKeyframesPerSecond.toFixed(1)} kf/秒)\n` +
 		`姿勢誤差 最大 ${result.maxAngleDeg.toFixed(3)}°`
 	console.log(`[${PLUGIN_ID}] bake done : ${summary.replace(/\n/g, ' / ')}`)
-	// **密度で bake を拒否はしない** : 出来上がった animation はそのまま残し、 手編集に
-	// 向かない密度であることだけを伝える。
+	// **どの警告でも bake は拒否しない** : 出来上がった animation はそのまま残し、
+	// 「そのまま使うと困りうる点」 だけを伝える。 複数該当しても dialog は 1 回にまとめる。
+	const warnings: string[] = []
 	if (result.maxKeyframesPerSecond > BAKE_DENSITY_WARN_KF_PER_SECOND) {
-		showBakeMessage(
-			'Spring bake',
-			`${summary}\n\n` +
+		warnings.push(
 			`keyframe 密度が ${BAKE_DENSITY_WARN_KF_PER_SECOND} kf/秒 を超えています。` +
-			`手編集には向かない密度です (= 揺れが速いほど keyframe が増えます)。`,
+			'手編集には向かない密度です (= 揺れが速いほど keyframe が増えます)。',
 		)
+	}
+	// 分割の打ち切り / 分割不能で要求精度に届かなかった bone (= 密度とは別軸の警告)。
+	if (result.unconvergedBones.length > 0) {
+		warnings.push(
+			`次の bone は目標の姿勢誤差に届きませんでした : ${result.unconvergedBones.join(', ')}\n` +
+			'物理の動きが速すぎて 20fps の keyframe では表現しきれていない可能性があります。',
+		)
+	}
+	if (warnings.length > 0) {
+		showBakeMessage('Spring bake', `${summary}\n\n${warnings.join('\n\n')}`)
 	}
 	try {
 		updateSelection()

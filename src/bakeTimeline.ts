@@ -111,6 +111,9 @@ export interface BakedBoneCurve {
 	// 採用した傾きの求め方 (= true なら一括最小二乗、 false なら中央差分)。
 	// 2 通り試して keyframe が少ない方を採るので、 bone ごとに変わり得る
 	usedLeastSquares: boolean
+	// フィッティングが閾値 (= maxAngleDeg) に届いたか。 false の bone は要求精度を
+	// 満たしていない (= 分割の打ち切り / 分割不能)。 呼び出し側で警告すること
+	converged: boolean
 }
 
 export interface BakeResult {
@@ -122,6 +125,9 @@ export interface BakeResult {
 	maxKeyframesPerSecond: number
 	// 全 bone を通した姿勢誤差の最大値 (= degrees)
 	maxAngleDeg: number
+	// 閾値に届かなかった bone の名前 (= 空なら全 bone が要求精度を満たしている)。
+	// 密度警告とは別軸の警告材料として呼び出し側が使う
+	unconvergedBones: string[]
 }
 
 // 収集中の Euler 系列 (= degrees)
@@ -185,6 +191,7 @@ export function bakeSpringRotations<Q>(scene: BakeSceneOps, options: BakeOptions
 
 	// --- 2. 連続化 + フィッティング ---
 	const bones: BakedBoneCurve[] = []
+	const unconvergedBones: string[] = []
 	let totalKeyframes = 0
 	let maxKeyframesPerSecond = 0
 	let worstAngle = 0
@@ -212,8 +219,13 @@ export function bakeSpringRotations<Q>(scene: BakeSceneOps, options: BakeOptions
 			quaternionFromEuler: options.quaternionFromEuler,
 			quatAngleDeg: options.quatAngleDeg,
 		})
-		const preferCentral = centralDiff.keyframeCount < leastSquares.keyframeCount ||
-			(centralDiff.keyframeCount === leastSquares.keyframeCount && centralDiff.maxAngle < leastSquares.maxAngle)
+		// 片方だけが閾値に届いた場合は **届いた方を優先** する (= keyframe 数の比較は
+		// 「どちらも要求精度を満たしている」 が前提。 未収束の方が少ないのは当然なので、
+		// そこで数だけ見ると精度を捨てて数を取ることになる)。
+		const preferCentral = leastSquares.converged !== centralDiff.converged
+			? centralDiff.converged
+			: centralDiff.keyframeCount < leastSquares.keyframeCount ||
+				(centralDiff.keyframeCount === leastSquares.keyframeCount && centralDiff.maxAngle < leastSquares.maxAngle)
 		const fit = preferCentral ? centralDiff : leastSquares
 		// keyframe 値 = 絶対 Euler − rest。 handle は値の差分なので rest の影響を受けない
 		// (= 曲線全体が値方向に平行移動するだけ)。
@@ -237,6 +249,7 @@ export function bakeSpringRotations<Q>(scene: BakeSceneOps, options: BakeOptions
 		totalKeyframes += keyframes.length
 		if (perSecond > maxKeyframesPerSecond) maxKeyframesPerSecond = perSecond
 		if (fit.maxAngle > worstAngle) worstAngle = fit.maxAngle
+		if (!fit.converged) unconvergedBones.push(target.name)
 		bones.push({
 			uuid: target.uuid,
 			name: target.name,
@@ -245,6 +258,7 @@ export function bakeSpringRotations<Q>(scene: BakeSceneOps, options: BakeOptions
 			avgAngleDeg: fit.avgAngle,
 			keyframesPerSecond: perSecond,
 			usedLeastSquares: !preferCentral,
+			converged: fit.converged,
 		})
 	}
 
@@ -255,6 +269,7 @@ export function bakeSpringRotations<Q>(scene: BakeSceneOps, options: BakeOptions
 		totalKeyframes,
 		maxKeyframesPerSecond,
 		maxAngleDeg: worstAngle,
+		unconvergedBones,
 	}
 }
 

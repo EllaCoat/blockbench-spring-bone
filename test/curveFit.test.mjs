@@ -269,6 +269,25 @@ test('fitSharedKnots: 正弦波 201 点を閾値 0.5° で 70 個以下の keyfr
 	assert.equal(fit.segments.length, fit.keyframeCount - 1)
 })
 
+test('fitSharedKnots: 閾値を満たせば converged、 分割できなければ false', () => {
+	const { times, values } = makeSine()
+	const axes = { x: values, y: zeros(times.length), z: zeros(times.length) }
+
+	const ok = fitSharedKnots(times, axes, 0.5, { fps: 20, ...OPS })
+	assert.equal(ok.converged, true)
+
+	// minGapFrames を系列長に合わせると knot を追加できず、 誤差が残ったまま打ち切られる
+	const short = makeSine({ frames: 21, period: 0.5 })
+	const stuck = fitSharedKnots(short.times, {
+		x: short.values,
+		y: zeros(21),
+		z: zeros(21),
+	}, 0.5, { fps: 20, minGapFrames: 20, ...OPS })
+
+	assert.equal(stuck.converged, false)
+	assert.ok(stuck.maxAngle > 0.5)
+})
+
 test('fitSharedKnots: 中央差分 (useLS = false) でも閾値を満たす', () => {
 	const { times, values } = makeSine()
 	const axes = { x: values, y: zeros(times.length), z: zeros(times.length) }

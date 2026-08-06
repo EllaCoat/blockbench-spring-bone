@@ -275,6 +275,34 @@ test('bakeSpringRotations: 中央差分と一括 LS の両方を試して keyfra
 	assert.ok(result.bones[0].maxAngleDeg <= DEFAULT_BAKE_MAX_ANGLE_DEG)
 })
 
+test('bakeSpringRotations: 閾値に届かない bone は converged=false で報告する', () => {
+	// minGapFrames を系列長と同じにすると knot を増やせない = 分割不能で打ち切られる。
+	// 誤差が閾値を超えたまま返るケースを、 黙って成功扱いにしないことの確認。
+	const scene = makeFakeScene(
+		[target('a', 'bone_a')],
+		(_uuid, frame) => ({ x: 40 * Math.sin(2 * Math.PI * frame / 5), y: 0, z: 0 }),
+	)
+
+	const result = bakeSpringRotations(scene, { frameCount: 21, minGapFrames: 20, ...OPS })
+	const curve = result.bones[0]
+
+	assert.equal(curve.converged, false)
+	assert.ok(curve.maxAngleDeg > DEFAULT_BAKE_MAX_ANGLE_DEG)
+	assert.deepEqual(result.unconvergedBones, ['bone_a'])
+})
+
+test('bakeSpringRotations: 収束した bone は unconvergedBones に載らない', () => {
+	const scene = makeFakeScene(
+		[target('a', 'bone_a')],
+		(_uuid, frame) => ({ x: 10 * Math.sin(2 * Math.PI * frame / 40), y: 0, z: 0 }),
+	)
+
+	const result = bakeSpringRotations(scene, { frameCount: 81, ...OPS })
+
+	assert.equal(result.bones[0].converged, true)
+	assert.deepEqual(result.unconvergedBones, [])
+})
+
 test('bakeSpringRotations: 閾値を上げると keyframe が減る', () => {
 	const pose = (_uuid, frame) => ({ x: 25 * Math.sin(2 * Math.PI * frame / 9), y: 0, z: 0 })
 	const tight = bakeSpringRotations(makeFakeScene([target('a', 'bone_a')], pose), { frameCount: 101, ...OPS })

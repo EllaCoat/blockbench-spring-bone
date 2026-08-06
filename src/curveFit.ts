@@ -291,6 +291,10 @@ export interface SharedKnotFit {
 	// 実測の姿勢誤差 (= degrees)。 max は打ち切り条件と同じ評価器・同じ量
 	maxAngle: number
 	avgAngle: number
+	// **閾値 (= maxAngleDeg) に届いたか**。 分割ループは上限回数 / 分割不能で打ち切られる
+	// ことがあり、 その場合は誤差が閾値を超えたまま返る。 呼び出し側が「この結果は要求精度を
+	// 満たしていない」 と気付けるよう明示する (= 黙って成功扱いにしない)。
+	converged: boolean
 }
 
 function triple(get: (axis: Axis) => number): AxisTriple {
@@ -328,7 +332,7 @@ export function fitSharedKnots<Q>(
 	} = ops
 	const n = times.length
 	if (n === 0) {
-		return { breaks: [], segments: [], keyframes: [], keyframeCount: 0, maxAngle: 0, avgAngle: 0 }
+		return { breaks: [], segments: [], keyframes: [], keyframeCount: 0, maxAngle: 0, avgAngle: 0, converged: true }
 	}
 	const minGap = Math.max(1, minGapFrames)
 
@@ -460,5 +464,9 @@ export function fitSharedKnots<Q>(
 		keyframeCount: breaks.length,
 		maxAngle,
 		avgAngle: segments.length === 0 ? 0 : sumAngle / n,
+		// 打ち切り (= guard 上限 / これ以上割れない) で抜けた場合、 誤差が閾値を超えたまま
+		// 返ることがある。 **実測値で判定する** : loop の抜け方を数えるより、 返す結果が
+		// 実際に要求を満たしているかを直接見る方が取りこぼしが無い。
+		converged: maxAngle <= maxAngleDeg,
 	}
 }
