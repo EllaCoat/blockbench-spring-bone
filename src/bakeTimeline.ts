@@ -6,11 +6,16 @@
 //
 // bake の流れ :
 //   1. 物理 session を張る (= scene.beginSession)
-//   2. 20fps 格子の frame ごとに評価し、 bone ごとの合成後 rotation を **keyframe 値**
-//      (= rest 差分の degrees) で収集する (= scene.evaluateFrame → scene.readRotationDeg)
+//   2. 20fps 格子の frame ごとに評価し、 bone ごとの合成後 rotation を **絶対 Euler**
+//      (= degrees) で収集する (= scene.evaluateFrame → scene.readRotationDeg)
 //   3. continuifyEulerSeries で Euler 表現の飛びを潰す (= 偽の急変で keyframe が増えるのを防ぐ)
 //   4. fitSharedKnots で 3 軸共有 knot の bezier に落とす
-//   5. BB の keyframe data 配列を組み立てる
+//   5. BB の keyframe data 配列を組み立てる。 **rest (= fix_rotation) の減算はここで初めて行う**
+//
+// **収集からフィッティングまでを絶対 Euler で通すのは意図的** : rest を引いた空間では
+// Euler 連続化の双対解の関係式 (= x+180, 180−y, z+180) も、 姿勢の geodesic 誤差も成立しない。
+// bezier は値方向の平行移動に対して不変 (= knot 値を一律にずらすと曲線全体が同じだけ動き
+// handle は変わらない) なので、 最後に rest を引いても曲線の形は完全に保たれる。
 //
 // **元 animation は一切変更しない** : 出来上がった keyframe は派生 animation
 // (= applyBakedCurvesToAnimationData で作る data) 側にだけ載る。 unbake = 派生 animation の削除。

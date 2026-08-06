@@ -382,9 +382,11 @@ function isSpringGroupForProperty(group?: unknown): boolean {
 	return isCapable(getSpringBoneState(group))
 }
 
-// Property 7 個を register (= Group 側 4 個 : 数値 3 + enum `spring_bone_enabled`、
-// Animation 側 3 個 : object `spring_bone_overrides` + number `spring_bone_schema_version`
-// + number `spring_bone_rest_fade_frames`)。
+// Property 11 個を register (= Group 側 4 個 : 数値 3 + enum `spring_bone_enabled`、
+// Animation 側 7 個 : object `spring_bone_overrides` + number `spring_bone_schema_version`
+// + number `spring_bone_rest_fade_frames` + bake metadata 4 個 (= string `spring_bone_baked_from`
+// / string `spring_bone_baked_param_hash` / string `spring_bone_baked_source_hash`
+// / number `spring_bone_baked_version`))。
 // plugin onload で 1 回だけ呼ぶ。 数値 Property の element_panel input は edit モードのみ
 // 表示 (= BB 本体側の element_panel.ts condition)、 animate モードでは自然に消える。
 // animate モード用の値編集は専用 Panel (= ui.ts) で提供。
@@ -2478,6 +2480,13 @@ function findMutedTransformAnimator(animation: any): string | null {
 // 小さいが、 bake は全 frame × sub-step を一気に replay するため桁が違う (= 10 秒の animation で
 // 600 sub-step ぶんの emitter 発火と script 実行が一瞬で走る)。
 //
+// **channel 名はハードコードしない** : AnimatedJava fork は EffectAnimator に `variant`
+// channel を足し、 displayFrame を差し替えて `muted.variant` が false なら
+// `result?.variant?.select()` を実行する (= animated-java/src/mods/customKeyframes.ts:216-249)。
+// 標準 3 channel (= particle / sound / timeline) だけを mute すると、 bake の全 frame で
+// variant 切替が走り、 未選択 animation を bake した場合に選択中 variant が元へ戻らない。
+// `muted` に **実在する key を全部** 立てる形にすれば、 fork が channel を増やしても追随する。
+//
 // **transform だけを評価する経路は BB に無い** : 公開されているのは stackAnimations /
 // Animator.preview だけで、 どちらも effects を含む。 bone loop を自前で書き写す手はあるが
 // (= Animation.sampleIK が部分的にやっている、 animation.js:170-194)、 blend_weight / pre_rotation /
@@ -2492,9 +2501,9 @@ function suppressEffectAnimator(animation: any): () => void {
 	if (!effects || typeof muted !== 'object' || muted === null) return (): void => {}
 	const savedMuted = { ...muted }
 	const savedLastDisplayedTime = effects.last_displayed_time
-	muted.particle = true
-	muted.sound = true
-	muted.timeline = true
+	for (const channel of Object.keys(muted)) {
+		;(muted as Record<string, unknown>)[channel] = true
+	}
 	return (): void => {
 		try {
 			Object.assign(muted, savedMuted)
