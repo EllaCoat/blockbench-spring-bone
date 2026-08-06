@@ -19,6 +19,7 @@ const { createExportGate } = await import('../dist-test/exportGate.mjs')
 const { createPreviewSession } = await import('../dist-test/previewSession.mjs')
 const { createExportDriver } = await import('../dist-test/ajExportBridge.mjs')
 const { makeExportAnimationContext } = await import('../dist-test/animationContext.mjs')
+const { ANIM_REST_FADE_KEY, DEFAULT_REST_FADE_FRAMES } = await import('../dist-test/restWindow.mjs')
 
 // AJ の export 格子 = 20 fps。 driver は秒を見ず frameIndex だけで判定する。
 const EXPORT_FRAME_SECONDS = 1 / 20
@@ -26,6 +27,20 @@ const EXPORT_FRAME_SECONDS = 1 / 20
 const SIDE_SAMPLE_OFFSET = 0.001
 // stepIndexFromFrame の倍率 (= 1 export frame あたりの物理 sub-step 数)。
 const SUBSTEPS_PER_EXPORT_FRAME = 3
+
+// index.ts の readRestFadeFrames 相当 (= 非 finite / 未設定は既定値へ倒す)。
+function readRestFadeFrames(animation) {
+	const raw = animation?.[ANIM_REST_FADE_KEY]
+	return typeof raw === 'number' && Number.isFinite(raw) ? raw : DEFAULT_REST_FADE_FRAMES
+}
+
+// AJ v2 が context に載せる周期情報の既定値 (= 1 秒 / once)。
+const DEFAULT_TIMING = {
+	animationLengthSeconds: 1,
+	renderSampleCount: 21,
+	loopMode: 'once',
+	loopDelayFrames: 0,
+}
 
 // --- fake SpringRuntime ------------------------------------------------------
 
@@ -129,7 +144,17 @@ function makeHarness({ enabled = true, beginError = null, evaluateError = null }
 		suspendTick: () => { exportGate.suspend() },
 		resumeTick: () => { exportGate.resume() },
 		invalidatePreview: () => { previewSession.invalidate() },
-		makeExportContext: (animation, excludedNodeUuids) => makeExportAnimationContext(animation, excludedNodeUuids),
+		// index.ts と同じく AJ v2 の周期情報をそのまま rest window の入力にし、
+		// fade 長だけを animation Property から読む。
+		makeExportContext: (animation, excludedNodeUuids, timing) =>
+			makeExportAnimationContext(animation, excludedNodeUuids, {
+				timing: {
+					renderSampleCount: timing.renderSampleCount,
+					loopMode: timing.loopMode,
+					loopDelayFrames: timing.loopDelayFrames,
+				},
+				requestedFadeFrames: readRestFadeFrames(animation),
+			}),
 		isEnabled: () => isEnabled,
 	}
 	const driver = createExportDriver(exportDriverHost)
@@ -154,8 +179,8 @@ function previewContext(animation) {
 }
 
 // AJ が onBeginAnimation へ渡す context。
-function ajAnimationContext(animation, excludedNodeUuids = new Set()) {
-	return { animation, excludedNodeUuids, evaluateBasePose: () => {} }
+function ajAnimationContext(animation, excludedNodeUuids = new Set(), timing = DEFAULT_TIMING) {
+	return { animation, excludedNodeUuids, ...timing, evaluateBasePose: () => {} }
 }
 
 // AJ が onPose へ渡す context。 side=true で pre-post 判定の side sample を作る。
@@ -164,6 +189,7 @@ function ajPoseContext(animation, frameIndex, { side = false, excludedNodeUuids 
 	return {
 		animation,
 		excludedNodeUuids,
+		...DEFAULT_TIMING,
 		evaluateBasePose: () => {},
 		frameIndex,
 		frameTimeSeconds,
@@ -267,6 +293,36 @@ test('統合 A: AJ の excludedNodeUuids は同一 Set instance のまま runtim
 	assert.equal(context.animation, anim)
 	assert.equal(context.excludedNodeUuids, excluded)
 	assert.deepEqual(context.animationStack, [anim])
+})
+
+test('統合 A: AJ の周期情報と animation の fade 長が rest window として runtime へ届く', () => {
+	// 配線の全長 (= AJ context → driver → makeExportContext → export context) を通して、
+	// weight 算出の入力が欠けずに runtime の session context へ載ることを固定する。
+	const h = makeHarness()
+	const anim = { name: 'walk', [ANIM_REST_FADE_KEY]: 6 }
+	h.driver.onBeginRendering()
+	h.driver.onBeginAnimation(ajAnimationContext(anim, new Set(), {
+		animationLengthSeconds: 3,
+		renderSampleCount: 61,
+		loopMode: 'loop',
+		loopDelayFrames: 0,
+	}))
+	const restWindow = h.runtime.sessionContext.restWindow
+	// timing は AJ の値そのまま (= preview 側の数え直しを export では使わない)
+	assert.deepEqual(restWindow.timing, {
+		renderSampleCount: 61,
+		loopMode: 'loop',
+		loopDelayFrames: 0,
+	})
+	assert.equal(restWindow.requestedFadeFrames, 6)
+})
+
+test('統合 A: fade 長 Property が無い animation は既定値で rest window に載る', () => {
+	const h = makeHarness()
+	const anim = { name: 'walk' }
+	h.driver.onBeginRendering()
+	h.driver.onBeginAnimation(ajAnimationContext(anim))
+	assert.equal(h.runtime.sessionContext.restWindow.requestedFadeFrames, DEFAULT_REST_FADE_FRAMES)
 })
 
 // =============================================================================

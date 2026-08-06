@@ -1,5 +1,5 @@
 // AnimatedJava (= AJ) の datapack export に spring bone 物理を載せるための driver。
-// AJ が公開する render hook (= window.AnimatedJava.renderHooks、 version 1) の
+// AJ が公開する render hook (= window.AnimatedJava.renderHooks、 version 2) の
 // hooks object としてそのまま渡せる形を返す。
 //
 // この module は **Blockbench / THREE / AnimatedJava / window を実行時に一切参照しない**。
@@ -24,8 +24,20 @@ import { stepIndexFromFrame } from './springRuntime'
 
 // --- AJ 側 hook 契約の最小型 (= 構造的互換のみ、 AJ repo からは import しない) ---
 
+// AJ v2 hook が context に載せる animation 単位の周期情報。 renderSampleCount /
+// loopMode / loopDelayFrames は datapack meta の dur / lp / dly と一致する値で、
+// **「表示上の最終 frame がどれか」 の解釈は hook 側の責務** (= AJ は生値を渡すだけ)。
+// driver はこの 4 つを一切解釈せず host の makeExportContext へ素通しする
+// (= 周期の解釈は restWindow.ts に集約する)。
+export interface RenderAnimationTimingLike {
+	animationLengthSeconds: number
+	renderSampleCount: number
+	loopMode: string
+	loopDelayFrames: number
+}
+
 // animation 単位の context。 AJ 本体は rig 等も載せるが、 driver が読むのはここだけ。
-export interface RenderAnimationContextLike {
+export interface RenderAnimationContextLike extends RenderAnimationTimingLike {
 	animation: unknown
 	excludedNodeUuids: ReadonlySet<string>
 	// 指定時刻の keyframe pose を scene へ再評価する (= AJ 側が閉包として詰める)
@@ -59,7 +71,13 @@ export interface ExportDriverHost<C> {
 	resumeTick(): void
 	invalidatePreview(): void
 	// --- context 生成 ---
-	makeExportContext(animation: unknown, excludedNodeUuids: ReadonlySet<string>): C
+	// timing = AJ v2 の周期情報 4 つ。 driver は中身を見ずに渡すだけで、 解釈 (= 表示上の
+	// 最終 frame / fade 長) は host 側の責務。
+	makeExportContext(
+		animation: unknown,
+		excludedNodeUuids: ReadonlySet<string>,
+		timing: RenderAnimationTimingLike,
+	): C
 	// --- 有効判定 (= plugin 設定や rig の状態で export への注入自体を切る口) ---
 	isEnabled(): boolean
 }
@@ -158,7 +176,13 @@ export function createExportDriver<C>(host: ExportDriverHost<C>): ExportDriver {
 			animationActive = false
 			sessionAnimation = context.animation
 			warnedAnimationMismatch = false
-			const exportContext = host.makeExportContext(context.animation, context.excludedNodeUuids)
+			// 周期情報は解釈せずそのまま渡す (= 「N - 2 か N - 1 か」 の判断は host 側)。
+			const exportContext = host.makeExportContext(context.animation, context.excludedNodeUuids, {
+				animationLengthSeconds: context.animationLengthSeconds,
+				renderSampleCount: context.renderSampleCount,
+				loopMode: context.loopMode,
+				loopDelayFrames: context.loopDelayFrames,
+			})
 			// AJ 側の evaluateBasePose は (timeSeconds) => void、 runtime が要求するのは
 			// (timeSeconds, context) => void なので wrapper で包む。 context 引数は使わない
 			// (= 対象 animation は AJ 側の閉包が既に持っている)。

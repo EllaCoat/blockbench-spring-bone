@@ -3,12 +3,14 @@
 // element_panel input が自動で出る)。 element_panel は condition: {modes: ['edit']}
 // で animate モード非表示のため、 animate 中の値編集を本 Panel が担う。
 //
-// Panel の役割は 2 層 :
+// Panel の役割は 3 層 :
 //   - NumSlider 3 個 = Group Property (= 全 animation 共通の既定値) の編集
 //   - animation 選択中のみ出る 2 行 (= inline_select `spring_state` と
 //     inline_multi_select `overrides`) = 選択中 animation だけの override 編集
+//   - animation 選択中のみ出る rest fade slider = 選択中 animation の終端 rest 整合
+//     (= 上 2 つと違い **bone に依存しない** Animation Property)
 // animation 未選択でも Panel 自体は出したままにし、 slider による Group 既定値の
-// 編集は従来どおり使えるようにする (= 2 行は form element の condition で隠す)。
+// 編集は従来どおり使えるようにする (= animation 依存の行は form element の condition で隠す)。
 //
 // 実装 pattern は BB 5.1.4 の element_panel.ts 実装を踏襲 :
 //   - new InputForm({}) + form_config への input 追加 + buildForm() で dynamic 生成
@@ -27,6 +29,7 @@ import {
 	type SpringOverrideMap,
 } from './animOverrides'
 import { resolveEffective, toSpringBoneState, type SpringBaseConfig } from './springConfig'
+import { ANIM_REST_FADE_KEY, DEFAULT_REST_FADE_FRAMES } from './restWindow'
 
 declare const Panel: any
 declare const InputForm: any
@@ -86,6 +89,28 @@ const PANEL_INPUTS = [
 ] as const
 type PanelSliderKey = (typeof PANEL_INPUTS)[number]['key']
 
+// 終端 rest 整合の fade 長 slider。 **PANEL_INPUTS とは別枠** : あちらは選択中 bone の
+// Group Property (= per-bone) だが、 こちらは選択中 **animation** の Animation Property
+// (= per-animation) で、 bone の選択内容に依らず同じ値を出す。
+// min は 1 (= 正整数)。 0 を許しても「最終 frame の 1 つ手前まで Δ 全開 → 終端で 0」 の
+// hard cut になるだけで rest 整合の有無は変わらないため、 段階を選べる範囲に絞る。
+const REST_FADE_INPUT = {
+	key: 'rest_fade_frames',
+	label: 'Rest fade (frames)',
+	min: 1,
+	max: 200,
+	step: 1,
+	defaultValue: DEFAULT_REST_FADE_FRAMES,
+} as const
+type RestFadeKey = typeof REST_FADE_INPUT.key
+
+// animation の fade 長を読む (= index.ts の readRestFadeFrames と同じ規則。 非 finite /
+// 未設定は既定値へ倒す)。
+function readRestFade(anim: any): number {
+	const raw = anim?.[ANIM_REST_FADE_KEY]
+	return typeof raw === 'number' && Number.isFinite(raw) ? raw : REST_FADE_INPUT.defaultValue
+}
+
 // resolveEffective の defaults 引数 (= 継承値計算の最終 fallback)。 PANEL_INPUTS の
 // defaultValue から組み、 既定値の定義箇所を 1 つに保つ。
 const PANEL_DEFAULTS = Object.fromEntries(
@@ -110,13 +135,15 @@ let last_override_checks: Record<string, boolean> = {}
 // 設計のため、 この context が持つのは「どこへ書くか」 と「drag 前の値」 だけ。
 interface SliderGestureContext {
 	// この gesture で書き換える項目 (= slider 1 個 = 1 項目)
-	key: PanelSliderKey
-	// 書き込み種別 (= onBefore 時点の override checkbox 状態で決まる)
-	kind: 'group' | 'animation'
-	// 対象 Group の参照と uuid (= Undo aspects と同じ参照)
+	key: PanelSliderKey | RestFadeKey
+	// 書き込み種別。 'group' / 'animation' は onBefore 時点の override checkbox 状態で
+	// 決まる。 'rest_fade' は bone に依らない Animation Property (= 専用 slider) の編集。
+	kind: 'group' | 'animation' | 'rest_fade'
+	// 対象 Group の参照と uuid (= Undo aspects と同じ参照)。 kind 'rest_fade' では
+	// 書き込みに使わない (= bone 非依存)。
 	group: any
 	boneUuid: string
-	// kind === 'animation' の対象 animation (= 同様に aspects と同じ参照)
+	// kind === 'animation' / 'rest_fade' の対象 animation (= 同様に aspects と同じ参照)
 	animation: any | null
 	// drag 前の実データ値 (= onAfter で正しい before を捕捉するために一度戻す値)。
 	// kind 'group' は Property の生値、 'animation' は override 値 (= 未設定は undefined)
@@ -175,6 +202,10 @@ function pushValuesFromSelectedGroup(
 	values.overrides = checks
 	values.spring_state =
 		override?.enabled === true ? 'on' : override?.enabled === false ? 'off' : 'inherit'
+	// fade 長は選択中 animation の Property から (= bone には依存しない)。 animation 未選択時は
+	// 行自体が隠れるが、 widget の値は既定値に揃えておく (= 次に animation を選んだ時に
+	// 前の animation の値が残らない)。
+	values[REST_FADE_INPUT.key] = anim !== null ? readRestFade(anim) : REST_FADE_INPUT.defaultValue
 	last_override_checks = checks
 	// gesture 中は form への書き戻しだけ抑止する (= 表示の問題であって Undo とは無関係)。
 	// BB の NumSlider drag は「現在の widget 値 + delta」 で次の値を作る
@@ -267,6 +298,23 @@ export function registerSpringPanel(deps: {
 		condition: isOverrideRowVisible,
 	}
 
+	// 終端 rest 整合の fade 長 (= 選択中 animation の Animation Property)。 override 行と
+	// 違って schema version gate は通さない : この Property は override map の schema とは
+	// 独立した additive な field なので、 上位 version の raw を壊す経路が無い。
+	const isRestFadeRowVisible = (): boolean => {
+		const anim = Animation?.selected
+		return !!anim && isAnimationAlive(anim)
+	}
+	form_config[REST_FADE_INPUT.key] = {
+		label: REST_FADE_INPUT.label,
+		type: 'num_slider',
+		min: REST_FADE_INPUT.min,
+		max: REST_FADE_INPUT.max,
+		step: REST_FADE_INPUT.step,
+		value: REST_FADE_INPUT.defaultValue,
+		condition: isRestFadeRowVisible,
+	}
+
 	// NumSlider 3 個 = Group Property (= 全 animation 共通の既定値) の編集。
 	// type: 'num_slider' = BB 5.1.4 の NumSlider (= slider 内蔵 + Ctrl/Shift 倍率変更 modifier
 	// 対応)。 UX 要件 (= 数値入力 + スライドバーで直感的に連続調整) を満たす。 'number' 型は
@@ -316,6 +364,11 @@ export function registerSpringPanel(deps: {
 	// 現在の project から外れた対象へ Undo transaction を張ると、 別 project の Undo 履歴を
 	// 汚染する (= isGroupAlive のコメント参照)。 animation はさらに schema version gate を通す。
 	const isGestureTargetValid = (ctx: SliderGestureContext): boolean => {
+		// rest fade は bone に依存しない (= 書き込み先は animation だけ) ため、 group の
+		// 生存は問わない。 選択中 bone が drag 中に消えても animation への書き込みは成立する。
+		if (ctx.kind === 'rest_fade') {
+			return ctx.animation !== null && isAnimationAlive(ctx.animation)
+		}
 		if (!isGroupAlive(ctx.group)) return false
 		if (ctx.kind !== 'animation') return true
 		const anim = ctx.animation
@@ -324,7 +377,10 @@ export function registerSpringPanel(deps: {
 
 	// gesture 対象の実データ値を読む (= 未設定なら undefined)。
 	const readGestureValue = (ctx: SliderGestureContext): unknown => {
-		if (ctx.kind === 'animation') return readOverrides(ctx.animation)[ctx.boneUuid]?.[ctx.key]
+		if (ctx.kind === 'rest_fade') return ctx.animation?.[ANIM_REST_FADE_KEY]
+		if (ctx.kind === 'animation') {
+			return readOverrides(ctx.animation)[ctx.boneUuid]?.[ctx.key as PanelSliderKey]
+		}
 		return ctx.group[`spring_${ctx.key}`]
 	}
 
@@ -334,12 +390,19 @@ export function registerSpringPanel(deps: {
 	// override map の書き換えは setOverrideField / clearOverrideField の戻り値代入だけで
 	// 行う (= in-place 変更は readOverrides の memo も Undo の差分捕捉も壊す)。
 	const writeGestureValue = (ctx: SliderGestureContext, value: unknown): void => {
+		if (ctx.kind === 'rest_fade') {
+			// 単一 Property の代入。 override map と違い正規化は読み側 (= restWindow.ts) が
+			// 担うため、 ここでは値をそのまま書く (= rollback で undefined を戻す経路も含む)。
+			ctx.animation[ANIM_REST_FADE_KEY] = value
+			return
+		}
 		if (ctx.kind === 'animation') {
 			const map = readOverrides(ctx.animation)
+			const key = ctx.key as PanelSliderKey
 			ctx.animation[ANIM_OVERRIDES_KEY] =
 				typeof value === 'number' && Number.isFinite(value)
-					? setOverrideField(map, ctx.boneUuid, ctx.key, value)
-					: clearOverrideField(map, ctx.boneUuid, ctx.key)
+					? setOverrideField(map, ctx.boneUuid, key, value)
+					: clearOverrideField(map, ctx.boneUuid, key)
 			return
 		}
 		ctx.group[`spring_${ctx.key}`] = value
@@ -368,53 +431,92 @@ export function registerSpringPanel(deps: {
 			console.warn('[spring_bone] gesture rollback failed', e)
 		}
 	}
-	for (const meta of PANEL_INPUTS) {
-		const element = (form as any).form_data?.[meta.key]
+	// gesture の開始手順 (= 全 slider 共通)。 書き込み先の解決だけを makeContext に委ね、
+	// 前 gesture の後始末と context の確定はここで一元化する。
+	// makeContext が null を返した場合は gesture を開始せず form を実データから再同期する
+	// (= 書き込み先が無いのに widget の表示だけが動いた状態を残さない)。
+	const beginSliderGesture = (makeContext: () => SliderGestureContext | null): void => {
+		// 前 gesture が onAfter を受け取らずに終わっていた場合 (= touchcancel /
+		// mouseup 取りこぼし / gesture 中の Panel 破棄) の後始末。 開いた Undo
+		// transaction は無い (= drag 中は開かない) が、 **drag 中に書いた値は
+		// 実データに残っている** ため、 放置すると Undo 不能な変更が
+		// Project.saved === true のまま残る。 drag 前の値へ rollback する。
+		const stale = gesture_context
+		gesture_context = null
+		if (stale !== null) {
+			rollbackGesture(stale)
+			// widget の表示値は中断時点のまま動いているので実データへ張り直す
+			// (= context を null にした後に呼ぶこと、 でないと setValues が抑止される)。
+			sync()
+		}
+		const ctx = makeContext()
+		if (ctx === null) {
+			sync()
+			return
+		}
+		// drag 前の値を控える (= onAfter で before を捕捉するために戻す値)。
+		ctx.before = readGestureValue(ctx)
+		gesture_context = ctx
+	}
+
+	// Group 既定値 / animation override 用 slider (= PANEL_INPUTS) の書き込み先解決。
+	const makePanelSliderContext = (key: PanelSliderKey): SliderGestureContext | null => {
+		if (!isSpringSelectionCapable(isSpringCapableGroup)) return null
+		const g = Group.first_selected
+		const boneUuid = typeof g?.uuid === 'string' ? g.uuid : null
+		if (boneUuid === null) return null
+		const wantsOverride = last_override_checks[key] === true
+		const anim = Animation?.selected ?? null
+		// override 編集の成立条件 : animation が選択中で、 削除済みでなく
+		// (= AnimationController 選択 / 削除では表示が stale になり得る)、
+		// 書き込み可能な schema version であること。
+		const useAnimation =
+			wantsOverride && anim !== null && isAnimationAlive(anim) && canWriteOverrides(anim)
+		// 表示上は override 編集中なのに書き込み先が無効。 このまま Group 既定値へ
+		// フォールスルーすると意図しない対象を書き換えるため gesture を開始しない。
+		if (wantsOverride && !useAnimation) return null
+		return {
+			key,
+			kind: useAnimation ? 'animation' : 'group',
+			group: g,
+			boneUuid,
+			animation: useAnimation ? anim : null,
+			before: undefined,
+		}
+	}
+
+	// rest fade slider の書き込み先解決。 **bone は見ない** : 対象は選択中 animation の
+	// Property で、 どの bone を選んでいても同じ値を編集する。
+	const makeRestFadeContext = (): SliderGestureContext | null => {
+		const anim = Animation?.selected ?? null
+		if (anim === null || !isAnimationAlive(anim)) return null
+		const g = Group.first_selected
+		return {
+			key: REST_FADE_INPUT.key,
+			kind: 'rest_fade',
+			group: g,
+			// Undo aspects にも書き込みにも使わないが、 context の形は共通に保つ。
+			boneUuid: typeof g?.uuid === 'string' ? g.uuid : '',
+			animation: anim,
+			before: undefined,
+		}
+	}
+
+	// gesture を張る slider 一覧 (= per-bone の 3 個 + per-animation の rest fade 1 個)。
+	// onBefore の書き込み先解決だけが違い、 onAfter (= Undo transaction の張り方) は共通。
+	const sliderTargets: Array<{ key: string; makeContext: () => SliderGestureContext | null }> = [
+		...PANEL_INPUTS.map((meta) => ({
+			key: meta.key as string,
+			makeContext: () => makePanelSliderContext(meta.key),
+		})),
+		{ key: REST_FADE_INPUT.key, makeContext: makeRestFadeContext },
+	]
+	for (const target of sliderTargets) {
+		const element = (form as any).form_data?.[target.key]
 		const slider = element?.slider
 		if (slider) {
 			slider.onBefore = () => {
-				// 前 gesture が onAfter を受け取らずに終わっていた場合 (= touchcancel /
-				// mouseup 取りこぼし / gesture 中の Panel 破棄) の後始末。 開いた Undo
-				// transaction は無い (= drag 中は開かない) が、 **drag 中に書いた値は
-				// 実データに残っている** ため、 放置すると Undo 不能な変更が
-				// Project.saved === true のまま残る。 drag 前の値へ rollback する。
-				const stale = gesture_context
-				gesture_context = null
-				if (stale !== null) {
-					rollbackGesture(stale)
-					// widget の表示値は中断時点のまま動いているので実データへ張り直す
-					// (= context を null にした後に呼ぶこと、 でないと setValues が抑止される)。
-					sync()
-				}
-				if (!isSpringSelectionCapable(isSpringCapableGroup)) return
-				const g = Group.first_selected
-				const boneUuid = typeof g?.uuid === 'string' ? g.uuid : null
-				if (boneUuid === null) return
-				const wantsOverride = last_override_checks[meta.key] === true
-				const anim = Animation?.selected ?? null
-				// override 編集の成立条件 : animation が選択中で、 削除済みでなく
-				// (= AnimationController 選択 / 削除では表示が stale になり得る)、
-				// 書き込み可能な schema version であること。
-				const useAnimation =
-					wantsOverride && anim !== null && isAnimationAlive(anim) && canWriteOverrides(anim)
-				if (wantsOverride && !useAnimation) {
-					// 表示上は override 編集中なのに書き込み先が無効。 このまま Group
-					// 既定値へフォールスルーすると意図しない対象を書き換えるため gesture を
-					// 開始せず、 form を実データから再同期して stale 表示を解消する。
-					sync()
-					return
-				}
-				const ctx: SliderGestureContext = {
-					key: meta.key,
-					kind: useAnimation ? 'animation' : 'group',
-					group: g,
-					boneUuid,
-					animation: useAnimation ? anim : null,
-					before: undefined,
-				}
-				// drag 前の値を控える (= onAfter で before を捕捉するために戻す値)。
-				ctx.before = readGestureValue(ctx)
-				gesture_context = ctx
+				beginSliderGesture(target.makeContext)
 			}
 			slider.onAfter = () => {
 				// BB の NumSlider は drag / arrow key / wheel / text 確定の全経路で
@@ -455,8 +557,10 @@ export function registerSpringPanel(deps: {
 					// ここから finishEdit までは同期処理で、 描画も onChange も挟まらない
 					// (= writeGestureValue は値を書くだけで onChange を呼ばない)。
 					writeGestureValue(ctx, ctx.before)
+					// 書き込み先が animation の 2 種 (= override / rest fade) は animation を、
+					// Group 既定値は group を aspects に載せる。
 					const aspects =
-						ctx.kind === 'animation' ? { animations: [ctx.animation] } : { groups: [ctx.group] }
+						ctx.kind === 'group' ? { groups: [ctx.group] } : { animations: [ctx.animation] }
 					owner = Undo ?? null
 					prev_save = owner?.current_save ?? null
 					if (prev_save !== null) {
@@ -470,7 +574,9 @@ export function registerSpringPanel(deps: {
 					}
 					owner?.initEdit?.(aspects)
 					writeGestureValue(ctx, after)
-					owner?.finishEdit?.('Change spring config')
+					owner?.finishEdit?.(
+						ctx.kind === 'rest_fade' ? 'Change spring rest fade' : 'Change spring config',
+					)
 					// registry sync + preview invalidate は巻き戻しを挟まない最終状態で 1 回だけ。
 					// **onChange は独立して catch する** : ここまで来た時点で Undo entry は
 					// 確定済みなので、 onChange の例外で下の rollback を走らせると

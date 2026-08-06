@@ -7,7 +7,8 @@ const PLUGIN_ID = 'spring_bone'
 
 // AJ の registry stub。 version / register / unregister をそれぞれ差し替えられる形にして、
 // 「旧 version」「register が関数でない」「unregister を持たない」 を再現する。
-function makeApi({ version = 1, registerError = null, unregisterError = null, withUnregister = true, register } = {}) {
+// default の version は driver が要求する現行 version (= 2、 周期情報が context に載った版)。
+function makeApi({ version = 2, registerError = null, unregisterError = null, withUnregister = true, register } = {}) {
 	const api = { version }
 	if (register !== undefined) {
 		api.register = register
@@ -132,13 +133,18 @@ test('AjRegistrar: API 不在なら no-op だが retry listener は付く', () =
 	assert.deepEqual(h.log, ['onPluginLoaded'])
 })
 
-test('AjRegistrar: version が 1 以外なら登録しない', () => {
-	const api = makeApi({ version: 2 })
-	const h = makeOps({ api })
-	const registrar = install(h)
-	assert.equal(registrar.registeredApi, null)
-	assert.deepEqual(api.registered, [])
-	assert.equal(registrar.isRetryAttached, true)
+test('AjRegistrar: version が 2 以外なら登録しない', () => {
+	// v1 registry は RenderAnimationContext に周期情報 (= renderSampleCount / loopMode /
+	// loopDelayFrames) を載せないため、 終端 rest 整合の終点を決められない。 登録すると
+	// 周期情報 undefined のまま export に介入してしまうので、 旧 version には繋がない。
+	for (const version of [1, 3, 0, -1]) {
+		const api = makeApi({ version })
+		const h = makeOps({ api })
+		const registrar = install(h)
+		assert.equal(registrar.registeredApi, null, `version=${version}`)
+		assert.deepEqual(api.registered, [], `version=${version}`)
+		assert.equal(registrar.isRetryAttached, true, `version=${version}`)
+	}
 })
 
 test('AjRegistrar: version 未定義なら登録しない', () => {
