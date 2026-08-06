@@ -29,6 +29,11 @@ const EPS = 1e-12
 // 実際のサンプル点数は 201 個 (= k = 0..200)。
 export const BB_BEZIER_DIVISIONS = 200
 
+// 隣接 sample の間で誤差を測る点の数 (= 格子間の overshoot / 逆行を捕まえるため)。
+// 固定数で十分 : 20fps 格子の 1/4 刻みまで見れば、 曲線が視認できるほど暴れているケースは
+// 必ずどれかの点に掛かる。
+export const INTER_SAMPLE_PROBES = 3
+
 // BB の bezier handle 既定値 (= keyframe.js:602-605 の Property default)。
 // 区間を持たない端点 keyframe (= 先頭の left 側 / 末尾の right 側) に使う。
 export const BB_DEFAULT_HANDLE_TIME = 0.1
@@ -393,6 +398,82 @@ export function fitSharedKnots<Q>(
 		return quatAngleDeg(q, truthQ[k])
 	}
 
+	// --- 格子間 (= sample と sample の間) の誤差評価 ---
+	//
+	// **sample 時刻だけで測ると足りない** : 傾きは一括最小二乗で解いており単調性制約も
+	// 正則化も無いため、 sample 上では一致していても格子間で大きく overshoot / 逆行し得る
+	// (= 実測で「単調増加する 0..180° の系列に対し sample 誤差 0° のまま曲線が −35° まで
+	// 逆行する」 ケースあり。 原因は knot 間隔 2 の区間が正規方程式に寄与を持たず
+	// (= h10 / h11 が両端で 0)、 その knot の傾きが劣決定になること)。
+	// datapack export は 20fps で sample するので格子点だけで足りるが、 **timeline bake は
+	// 曲線そのものを再生する** ため、 格子間の暴れがそのまま偽のスパイクとして見える。
+	//
+	// 参照姿勢 = 入力 sample を中央差分 Hermite (= Catmull-Rom 相当) で補間したもの。
+	// **chord (= 直線 / SLERP) を参照にはしない** : chord は滑らかな運動からも O(h²) ずれる
+	// (= 30°/0.9 秒の揺れなら 1 frame あたり 0.46° 程度) ため、 同じ閾値で測ると正常な曲線まで
+	// 違反扱いになり、 分割が無限に誘発される。 中央差分 Hermite なら真の運動との差は
+	// O(h⁴) で、 閾値 (= 0.5° 級) に対して十分小さい。
+	// 中央差分は劣決定にならない (= 各 sample の近傍だけで決まる) ので、 一括 LS の
+	// 病理を参照側が共有することもない。
+	const refSlopes: Record<Axis, Float64Array> = {
+		x: new Float64Array(n),
+		y: new Float64Array(n),
+		z: new Float64Array(n),
+	}
+	for (const ax of AXES) {
+		for (let k = 0; k < n; k++) refSlopes[ax][k] = centralSlope(times, axes[ax], k)
+	}
+
+	// sample k と k+1 の間の位置 s (= 0 < s < 1) における姿勢誤差
+	const interAngleAt = (seg: SharedKnotSegment, k: number, s: number): number => {
+		const t0 = times[k]
+		const gap = times[k + 1] - t0
+		const t = t0 + gap * s
+		const s2 = s * s
+		const s3 = s2 * s
+		const h00 = 2 * s3 - 3 * s2 + 1
+		const h10 = s3 - 2 * s2 + s
+		const h01 = -2 * s3 + 3 * s2
+		const h11 = s3 - s2
+		const ref = (ax: Axis): number =>
+			h00 * axes[ax][k] + h10 * gap * refSlopes[ax][k] +
+			h01 * axes[ax][k + 1] + h11 * gap * refSlopes[ax][k + 1]
+		const fitted = quaternionFromEuler(
+			evalBezierBB(seg.per.x, t) * DEG2RAD,
+			evalBezierBB(seg.per.y, t) * DEG2RAD,
+			evalBezierBB(seg.per.z, t) * DEG2RAD,
+		)
+		const truth = quaternionFromEuler(ref('x') * DEG2RAD, ref('y') * DEG2RAD, ref('z') * DEG2RAD)
+		return quatAngleDeg(fitted, truth)
+	}
+
+	// 区間全体の最悪誤差と、 その位置に対応する分割候補 sample index。
+	// 格子点 (= 参照は sample そのもの) と格子間 (= 参照は中央差分 Hermite) を同じ閾値・
+	// 同じ量 (= geodesic の角度差) で測るので、 分割 loop 側の扱いは 1 本のままで済む。
+	const scanSegment = (seg: SharedKnotSegment): { err: number, idx: number } => {
+		let err = 0
+		let idx = -1
+		for (let k = seg.i; k <= seg.j; k++) {
+			const e = angleAt(seg, k)
+			if (e > err) {
+				err = e
+				idx = k
+			}
+		}
+		for (let k = seg.i; k < seg.j; k++) {
+			for (let p = 1; p <= INTER_SAMPLE_PROBES; p++) {
+				const e = interAngleAt(seg, k, p / (INTER_SAMPLE_PROBES + 1))
+				if (e > err) {
+					err = e
+					// 違反は k と k+1 の間なので、 その区切りを分割候補にする
+					// (= 端に寄りすぎる場合は呼び出し側の minGap clamp が内側へ寄せる)
+					idx = k + 1
+				}
+			}
+		}
+		return { err, idx }
+	}
+
 	let slopes = buildSlopes()
 	let segments = buildSegments(slopes)
 	// 分割は 1 回につき knot が 1 個増えるので理屈上は n 回で止まるが、 数値的な取りこぼしで
@@ -402,17 +483,9 @@ export function fitSharedKnots<Q>(
 		if (++guard > 3000) break
 		let worst: { err: number, idx: number, i: number, j: number } | null = null
 		for (const seg of segments) {
-			let segErr = 0
-			let segIdx = -1
-			for (let k = seg.i; k <= seg.j; k++) {
-				const err = angleAt(seg, k)
-				if (err > segErr) {
-					segErr = err
-					segIdx = k
-				}
-			}
-			if (segErr > maxAngleDeg && (worst === null || segErr > worst.err)) {
-				worst = { err: segErr, idx: segIdx, i: seg.i, j: seg.j }
+			const { err, idx } = scanSegment(seg)
+			if (err > maxAngleDeg && (worst === null || err > worst.err)) {
+				worst = { err, idx, i: seg.i, j: seg.j }
 			}
 		}
 		if (!worst) break
@@ -429,7 +502,9 @@ export function fitSharedKnots<Q>(
 	}
 
 	// 実測の姿勢誤差。 区間の右端は次の区間の左端と同じ sample なので、 最終区間以外は
-	// j を除いて数える (= 平均が knot の二重計上で薄まらないように、 全 sample を 1 回ずつ)
+	// j を除いて数える (= 平均が knot の二重計上で薄まらないように、 全 sample を 1 回ずつ)。
+	// **max は格子間も含む** (= 分割の打ち切り条件と同じ量にする)。 平均は「sample 1 個ずつ」
+	// の意味を保つため格子点のみで取る。
 	let maxAngle = 0
 	let sumAngle = 0
 	for (let b = 0; b < segments.length; b++) {
@@ -439,6 +514,12 @@ export function fitSharedKnots<Q>(
 			const a = angleAt(seg, k)
 			if (a > maxAngle) maxAngle = a
 			sumAngle += a
+		}
+		for (let k = seg.i; k < seg.j; k++) {
+			for (let p = 1; p <= INTER_SAMPLE_PROBES; p++) {
+				const a = interAngleAt(seg, k, p / (INTER_SAMPLE_PROBES + 1))
+				if (a > maxAngle) maxAngle = a
+			}
 		}
 	}
 

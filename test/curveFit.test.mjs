@@ -269,6 +269,62 @@ test('fitSharedKnots: 正弦波 201 点を閾値 0.5° で 70 個以下の keyfr
 	assert.equal(fit.segments.length, fit.keyframeCount - 1)
 })
 
+// 曲線を格子間まで細かく走査して、 x 軸の値域を返す (= 格子間の逸脱を測る)
+function scanCurveRange(fit, times, divisions = 20) {
+	let lo = Infinity
+	let hi = -Infinity
+	for (const seg of fit.segments) {
+		for (let k = seg.i; k < seg.j; k++) {
+			for (let p = 0; p <= divisions; p++) {
+				const t = times[k] + (times[k + 1] - times[k]) * (p / divisions)
+				const value = evalBezierBB(seg.per.x, t)
+				lo = Math.min(lo, value)
+				hi = Math.max(hi, value)
+			}
+		}
+	}
+	return { lo, hi }
+}
+
+test('fitSharedKnots: 単調増加する系列で格子間の逆行を作らない', () => {
+	// **回帰テスト** : 格子点でしか誤差を測っていなかった頃の症例。
+	// 単調増加する 21 点 (= 0 → 180°) に対し knot [0, 2, 20] / maxAngle 0.000 /
+	// converged true を返しながら、 曲線は格子間で −35° まで逆行していた。
+	// 原因 = knot 間隔 2 の区間は正規方程式に寄与を持たず (= Hermite 基底 h10 / h11 が
+	// 両端で 0)、 その knot の傾きが劣決定になって暴れること。
+	const fps = 20
+	const values = [0, 1, 90]
+	for (let i = 0; i < 18; i++) values.push(95 + 85 * i / 17)
+	const times = values.map((_, k) => k / fps)
+	const axes = { x: values, y: zeros(values.length), z: zeros(values.length) }
+
+	const fit = fitSharedKnots(times, axes, 0.5, { fps, ...OPS })
+	const range = scanCurveRange(fit, times)
+
+	// 修正前はここが −34.99 だった
+	assert.ok(range.lo > -10, `格子間で大きく逆行している : ${range.lo}`)
+	assert.ok(range.hi < 190, `格子間で大きく行き過ぎている : ${range.hi}`)
+	// 検出した結果 knot が増えている (= 修正前は 3 個で「収束」 扱いだった)
+	assert.ok(fit.keyframeCount > 3, `分割が起きていない : ${fit.keyframeCount}`)
+	assert.equal(fit.converged, true)
+})
+
+test('fitSharedKnots: 格子間の誤差も maxAngle に含める', () => {
+	// 分割できない状況 (= minGapFrames が系列長と同じ) で、 格子点だけなら誤差 0 なのに
+	// 格子間で暴れるケース。 格子点しか見ない実装では maxAngle 0 / converged true になる。
+	const fps = 20
+	const values = [0, 1, 90]
+	for (let i = 0; i < 18; i++) values.push(95 + 85 * i / 17)
+	const times = values.map((_, k) => k / fps)
+	const axes = { x: values, y: zeros(values.length), z: zeros(values.length) }
+
+	const fit = fitSharedKnots(times, axes, 0.5, { fps, minGapFrames: 20, ...OPS })
+
+	assert.equal(fit.keyframeCount, 2)
+	assert.ok(fit.maxAngle > 0.5, `格子間の誤差が maxAngle に出ていない : ${fit.maxAngle}`)
+	assert.equal(fit.converged, false)
+})
+
 test('fitSharedKnots: 閾値を満たせば converged、 分割できなければ false', () => {
 	const { times, values } = makeSine()
 	const axes = { x: values, y: zeros(times.length), z: zeros(times.length) }
@@ -346,7 +402,9 @@ test('fitSharedKnots: 報告された誤差を全 sample で再現できる', ()
 	}
 
 	assert.ok(worst <= 0.5, `再測定した最大誤差が閾値超え : ${worst}`)
-	assert.ok(Math.abs(worst - fit.maxAngle) < 1e-9, `${worst} vs ${fit.maxAngle}`)
+	// maxAngle は格子間の評価点も含むため、 格子点だけの再測定は必ずそれ以下になる
+	assert.ok(worst <= fit.maxAngle + 1e-9, `${worst} vs ${fit.maxAngle}`)
+	assert.ok(fit.maxAngle <= 0.5, `報告値が閾値超え : ${fit.maxAngle}`)
 })
 
 test('fitSharedKnots: breaks は昇順で両端を含み、 keyframe と対応する', () => {

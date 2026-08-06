@@ -30,6 +30,39 @@ export const ANIM_BAKED_VERSION_KEY = 'spring_bone_baked_version'
 // bake の出力形式 version。 keyframe の作り方 (= handle の意味 / 収集する量) を変えたら上げる。
 export const BAKE_VERSION = 1
 
+// bake が作った派生 animation かどうかの **唯一の判定**。 メタデータを書くのがこの module
+// なので、 読む側もここに置く (= key の解釈が 2 箇所に分裂しないようにする)。
+// 派生 animation の rotation keyframe には「base pose + 物理 Δ」 が既に焼き込まれているため、
+// これを再生する間は物理を止めないと Δ が二重に載る。
+export function isBakedAnimation(animation: unknown): boolean {
+	const from = (animation as Record<string, unknown> | null)?.[ANIM_BAKED_FROM_KEY]
+	return typeof from === 'string' && from.length > 0
+}
+
+// 物理の抑制判定に使う context の最小形 (= PreviewAnimationContext が構造的に満たす)。
+export interface BakedAnimationContextLike {
+	animation: unknown
+	animationStack?: readonly unknown[]
+}
+
+// この context で物理を止めるべきか。 **判定は必ずこの関数を通す** :
+// preview (= tick 入口) と export / bake (= effective の解決) の両方が同じ判定を共有しないと、
+// 片方の経路だけ抜けて Δ が二重に載る。
+//
+// **animation だけでなく animationStack も見る** : animation 未選択のまま複数 animation を
+// 再生している場合 (= makePreviewAnimationContext の playing filter 経路) は context.animation が
+// null のままで、 baked animation は stack 側にしか現れない。 animation だけを見ていると
+// この経路で抑制が丸ごと外れる。
+export function isBakedAnimationContext(context: BakedAnimationContextLike): boolean {
+	if (isBakedAnimation(context.animation)) return true
+	const stack = context.animationStack
+	if (!Array.isArray(stack)) return false
+	for (const entry of stack) {
+		if (isBakedAnimation(entry)) return true
+	}
+	return false
+}
+
 // フィッティングの既定閾値 (= 合成姿勢の角度差、 degrees)。 spike の実測で
 // 「0.5° なら実写と区別が付かず、 keyframe 数も許容範囲」 と確認した値。
 export const DEFAULT_BAKE_MAX_ANGLE_DEG = 0.5

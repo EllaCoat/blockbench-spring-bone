@@ -9,6 +9,8 @@ const {
 	DEFAULT_BAKE_MAX_ANGLE_DEG,
 	BAKE_DENSITY_WARN_KF_PER_SECOND,
 	ANIM_BAKED_FROM_KEY,
+	isBakedAnimation,
+	isBakedAnimationContext,
 } = await import('../dist-test/bakeTimeline.mjs')
 const { evalBezierBB, fitSharedKnots } = await import('../dist-test/curveFit.mjs')
 
@@ -90,6 +92,53 @@ test('bake 定数 : version / 既定閾値 / 密度警告の値', () => {
 	assert.equal(DEFAULT_BAKE_MAX_ANGLE_DEG, 0.5)
 	assert.equal(BAKE_DENSITY_WARN_KF_PER_SECOND, 8)
 	assert.equal(ANIM_BAKED_FROM_KEY, 'spring_bone_baked_from')
+})
+
+// --- bake 由来 animation の判定 (= 物理の二重適用防止) ---
+
+function baked(uuid = 'source-uuid') {
+	return { uuid: 'baked', [ANIM_BAKED_FROM_KEY]: uuid }
+}
+
+function plain(name = 'walk') {
+	return { uuid: 'plain', name, [ANIM_BAKED_FROM_KEY]: '' }
+}
+
+test('isBakedAnimation: baked_from が非空文字なら bake 由来', () => {
+	assert.equal(isBakedAnimation(baked()), true)
+	assert.equal(isBakedAnimation(plain()), false)
+	// Property 未登録 / 別 plugin の animation
+	assert.equal(isBakedAnimation({ uuid: 'x' }), false)
+	assert.equal(isBakedAnimation(null), false)
+	assert.equal(isBakedAnimation(undefined), false)
+	// 文字列以外は印として扱わない
+	assert.equal(isBakedAnimation({ [ANIM_BAKED_FROM_KEY]: 1 }), false)
+})
+
+test('isBakedAnimationContext: 選択中 animation が bake 由来なら抑制', () => {
+	assert.equal(isBakedAnimationContext({ animation: baked(), animationStack: [baked()] }), true)
+	assert.equal(isBakedAnimationContext({ animation: plain(), animationStack: [plain()] }), false)
+})
+
+test('isBakedAnimationContext: 複数 animation 再生 (= animation 未選択) でも stack から検出する', () => {
+	// animation 未選択のまま複数再生している状況 : context.animation は null のままで、
+	// baked animation は animationStack にしか現れない
+	const context = { animation: null, animationStack: [plain('walk'), baked(), plain('idle')] }
+
+	assert.equal(isBakedAnimationContext(context), true)
+})
+
+test('isBakedAnimationContext: stack に bake 由来が無ければ抑制しない', () => {
+	const context = { animation: null, animationStack: [plain('walk'), plain('idle')] }
+
+	assert.equal(isBakedAnimationContext(context), false)
+	assert.equal(isBakedAnimationContext({ animation: null, animationStack: [] }), false)
+})
+
+test('isBakedAnimationContext: animationStack が無い context でも animation で判定する', () => {
+	assert.equal(isBakedAnimationContext({ animation: baked() }), true)
+	assert.equal(isBakedAnimationContext({ animation: plain() }), false)
+	assert.equal(isBakedAnimationContext({ animation: null }), false)
 })
 
 // --- session の契約 ---
@@ -270,9 +319,17 @@ test('bakeSpringRotations: 中央差分と一括 LS の両方を試して keyfra
 	const cd = fitSharedKnots(times, axes, DEFAULT_BAKE_MAX_ANGLE_DEG, { fps: 20, useLS: false, ...OPS })
 
 	assert.notEqual(ls.keyframeCount, cd.keyframeCount, 'この入力は両者が同数 = 比較にならない')
-	assert.equal(result.bones[0].keyframes.length, Math.min(ls.keyframeCount, cd.keyframeCount))
-	assert.equal(result.bones[0].usedLeastSquares, ls.keyframeCount <= cd.keyframeCount)
-	assert.ok(result.bones[0].maxAngleDeg <= DEFAULT_BAKE_MAX_ANGLE_DEG)
+	const curve = result.bones[0]
+	// 採用結果は必ず 2 候補のどちらか (= 両方 fit している証拠)
+	const chosen = curve.usedLeastSquares ? ls : cd
+	assert.equal(curve.keyframes.length, chosen.keyframeCount)
+	// 片方だけが閾値に届いた場合は届いた方を採る
+	if (ls.converged !== cd.converged) {
+		assert.equal(curve.usedLeastSquares, ls.converged)
+	} else {
+		// どちらも同じ収束状態なら keyframe が少ない方
+		assert.equal(curve.keyframes.length, Math.min(ls.keyframeCount, cd.keyframeCount))
+	}
 })
 
 test('bakeSpringRotations: 閾値に届かない bone は converged=false で報告する', () => {

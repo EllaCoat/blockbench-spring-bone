@@ -56,6 +56,8 @@ import {
 	applyBakedCurvesToAnimationData,
 	bakeSpringRotations,
 	hashFingerprint,
+	isBakedAnimation,
+	isBakedAnimationContext,
 	type BakeResult,
 	type BakeSceneOps,
 	type BakeTarget,
@@ -1174,18 +1176,13 @@ function isSpringActive(entry: BoneEntry): boolean {
 	return entry.enabled
 }
 
-// bake (= runSpringBake) が作った派生 animation かどうかの **唯一の判定**。
-// 派生 animation の rotation keyframe には「base pose + 物理 Δ」 が既に焼き込まれているため、
-// これを再生する間は物理を止めないと Δ が二重に載る。
-// **preview と export の両方がこの関数を通ること** :
+// bake 由来の派生 animation の判定 (= isBakedAnimation / isBakedAnimationContext) は
+// bakeTimeline.ts が持つ。 **物理の抑制判定を通す経路は 2 つあり、 どちらも
+// isBakedAnimationContext を使うこと** :
 //   - preview = tick 入口の hasActiveSpringEntry (= session ごと張らない)
-//   - export  = previewOps.resolveConfigs (= 全 entry を disabled に解決する)
+//   - export / bake = previewOps.resolveConfigs (= 全 entry を disabled に解決する)
 // resolveConfigs は preview / export 共用の effective writer なので、 そこに置けば
 // AJ export も同じ判定を通る (= exporter だけ見落として datapack で Δ が二重に乗る事故を防ぐ)。
-function isBakedAnimation(animation: unknown): boolean {
-	const from = (animation as Record<string, unknown> | null)?.[ANIM_BAKED_FROM_KEY]
-	return typeof from === 'string' && from.length > 0
-}
 
 // active (= 実際に物理を掛ける) な entry が 1 つでもあるか。 tick() の
 // early-return 判定用。 registry.size は capable (= 'enabled' + 'disabled') の件数なので、
@@ -1198,9 +1195,10 @@ function isBakedAnimation(animation: unknown): boolean {
 // 残っている)。 生の Group 状態と context の override から resolveEnabled で判定する。
 function hasActiveSpringEntry(context: PreviewAnimationContext): boolean {
 	// bake 由来の派生 animation には物理を **二重に** 掛けない (= keyframe 側に既に
-	// 焼き込まれている)。 判定は isBakedAnimation 1 箇所に集約し、 export 側
-	// (= previewOps.resolveConfigs) も同じ関数を通す。
-	if (isBakedAnimation(context.animation)) return false
+	// 焼き込まれている)。 判定は isBakedAnimationContext に集約し、 export 側
+	// (= previewOps.resolveConfigs) も同じ関数を通す。 animation 未選択で複数 animation を
+	// 再生している場合は stack 側にしか baked animation が現れないため、 context ごと渡す。
+	if (isBakedAnimationContext(context)) return false
 	const overrides = readOverrides(context.animation)
 	for (const [uuid, entry] of registry) {
 		if (resolveEnabled(getSpringBoneState(entry.group), overrides[uuid])) return true
@@ -1913,8 +1911,9 @@ const previewOps: SpringRuntimeOps<PreviewAnimationContext, AnimatorPoseSnapshot
 		const overrides = readOverrides(context.animation)
 		// bake 由来の派生 animation は物理を全面停止する (= 二重適用の防止)。 preview は
 		// tick 入口の hasActiveSpringEntry で既に止まるが、 **export 経路はここだけが
-		// 通り道** なので、 同じ判定関数をこの effective writer にも通す。
-		const suppressed = isBakedAnimation(context.animation)
+		// 通り道** なので、 同じ判定関数をこの effective writer にも通す
+		// (= stack 側だけに baked animation がある複数再生も同じ 1 関数で拾う)。
+		const suppressed = isBakedAnimationContext(context)
 		for (const [uuid, entry] of registry) {
 			// effective (= entry.enabled / entry.config) の唯一の writer。
 			// 合成は resolveEffective に委譲 (= override → base (= Group 既定値) →
@@ -2279,7 +2278,22 @@ const exportDriverHost: ExportDriverHost<PreviewAnimationContext> = {
 	// capable な bone が 1 つも無い project では export に一切介入しない : 介入すると
 	// frame ごとに pose の capture / restore と 3 sub-step 分の base pose 再評価が乗り、
 	// 物理を掛ける対象がゼロのまま export だけが重くなる。
-	isEnabled: () => ENABLE_AJ_EXPORT && registry.size > 0,
+	//
+	// **runtime を他が握っている間の export は throw して止める** : runtime / exportGate は
+	// preview・export・bake で共用する singleton なので、 bake 中 (= stackAnimations 内の同期
+	// event 等から) export が始まると、 export 側が同じ gate を取って runtime.beginAnimation で
+	// bake の session を上書きし、 さらに bake 側の resume が export 中の gate まで解除してしまう。
+	// **false を返して黙って見送らない** : それだと物理の載っていない datapack がそのまま
+	// 出力される (= makeExportContext の契約違反時と同じ方針で、 気付ける形で止める)。
+	isEnabled: () => {
+		if (!ENABLE_AJ_EXPORT || registry.size === 0) return false
+		if (runtimeOwner !== 'none' || exportGate.isExportActive || runtime.isEvaluating) {
+			throw new Error(
+				`[${PLUGIN_ID}] spring runtime is busy (owner=${runtimeOwner}, exportActive=${exportGate.isExportActive}, evaluating=${runtime.isEvaluating}); aborting export instead of producing a datapack without spring physics`,
+			)
+		}
+		return true
+	},
 }
 
 // driver を AJ の render hook registry (= window.AnimatedJava.renderHooks) へ登録する。
@@ -2308,6 +2322,12 @@ function installAjExportDriver(): () => void {
 // unbake = その派生 animation を削除するだけ (= Undo でも消える)。
 
 const RAD2DEG = 180 / Math.PI
+
+// runtime / exportGate (= preview・export・bake で共用する singleton) を今どの処理が
+// 握っているか。 現状は bake だけが明示的に所有権を取る (= export 側は exportGate の
+// isExportActive が実質の所有印)。 export driver の isEnabled がこれを見て、 bake 中に
+// 始まった export を弾く (= 互いの session と gate を上書きし合うのを防ぐ)。
+let runtimeOwner: 'none' | 'bake' = 'none'
 
 // bake の除外 node 集合 (= 常に空)。 AJ export の excluded_nodes 相当の口だが、 bake は
 // editor 上の全 spring bone を対象にするため空集合を渡す。
@@ -2541,9 +2561,9 @@ function runSpringBake(animation: any): void {
 		showBakeMessage('Spring bake', 'animate モードで実行してください')
 		return
 	}
-	// export 中 / 評価中は runtime (= preview と共用の singleton) を横取りしない。
-	if (exportGate.isExportActive || runtime.isEvaluating) {
-		showBakeMessage('Spring bake', 'AnimatedJava の export 実行中は bake できません')
+	// export 中 / 評価中 / 別の bake 実行中は runtime (= 共用の singleton) を横取りしない。
+	if (runtimeOwner !== 'none' || exportGate.isExportActive || runtime.isEvaluating) {
+		showBakeMessage('Spring bake', 'AnimatedJava の export / 別の bake の実行中は bake できません')
 		return
 	}
 	if (isBakedAnimation(animation)) {
@@ -2590,6 +2610,9 @@ function runSpringBake(animation: any): void {
 
 	let result: BakeResult | null = null
 	let paramHash = ''
+	// **所有権を先に取る** : この後 stackAnimations 内の同期 event 等から export が始まっても、
+	// export driver の isEnabled がこれを見て弾く (= 互いの session / gate の上書きを防ぐ)。
+	runtimeOwner = 'bake'
 	// export driver と同じ順序で preview を明け渡す (= session を畳んでから tick を止める)。
 	invalidatePreviewSession()
 	exportGate.suspend()
@@ -2619,6 +2642,9 @@ function runSpringBake(animation: any): void {
 		exportGate.resume()
 		// bake が張った runtime session を畳み、 現在時刻の pose を editor へ描き直す。
 		invalidatePreviewSession()
+		// **所有権は preview を戻す前に解放する** : requestAnimatorPreview は同期的に
+		// tick 経路まで走らせるため、 握ったままだと以降の判定が bake 中扱いのままになる。
+		runtimeOwner = 'none'
 		requestAnimatorPreview('spring bake')
 	}
 	if (result === null || result.bones.length === 0) {
