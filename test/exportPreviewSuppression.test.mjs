@@ -19,6 +19,11 @@ const { createExportGate } = await import('../dist-test/exportGate.mjs')
 const { createPreviewSession } = await import('../dist-test/previewSession.mjs')
 const { createExportDriver } = await import('../dist-test/ajExportBridge.mjs')
 const { makeExportAnimationContext } = await import('../dist-test/animationContext.mjs')
+const {
+	ANIM_REST_FADE_KEY,
+	DEFAULT_REST_FADE_FRAMES,
+	checkRestWindowTiming,
+} = await import('../dist-test/restWindow.mjs')
 
 // AJ の export 格子 = 20 fps。 driver は秒を見ず frameIndex だけで判定する。
 const EXPORT_FRAME_SECONDS = 1 / 20
@@ -26,6 +31,20 @@ const EXPORT_FRAME_SECONDS = 1 / 20
 const SIDE_SAMPLE_OFFSET = 0.001
 // stepIndexFromFrame の倍率 (= 1 export frame あたりの物理 sub-step 数)。
 const SUBSTEPS_PER_EXPORT_FRAME = 3
+
+// index.ts の readRestFadeFrames 相当 (= 非 finite / 未設定は既定値へ倒す)。
+function readRestFadeFrames(animation) {
+	const raw = animation?.[ANIM_REST_FADE_KEY]
+	return typeof raw === 'number' && Number.isFinite(raw) ? raw : DEFAULT_REST_FADE_FRAMES
+}
+
+// AJ v2 が context に載せる周期情報の既定値 (= 1 秒 / once)。
+const DEFAULT_TIMING = {
+	animationLengthSeconds: 1,
+	renderSampleCount: 21,
+	loopMode: 'once',
+	loopDelayFrames: 0,
+}
 
 // --- fake SpringRuntime ------------------------------------------------------
 
@@ -129,7 +148,24 @@ function makeHarness({ enabled = true, beginError = null, evaluateError = null }
 		suspendTick: () => { exportGate.suspend() },
 		resumeTick: () => { exportGate.resume() },
 		invalidatePreview: () => { previewSession.invalidate() },
-		makeExportContext: (animation, excludedNodeUuids) => makeExportAnimationContext(animation, excludedNodeUuids),
+		// index.ts と同じく AJ v2 の周期情報をそのまま rest window の入力にし、
+		// fade 長だけを animation Property から読む。 契約違反の timing は throw して
+		// export を止める (= 物理が載っていない datapack を黙って出さない)。
+		makeExportContext: (animation, excludedNodeUuids, timing) => {
+			const restTiming = {
+				renderSampleCount: timing.renderSampleCount,
+				loopMode: timing.loopMode,
+				loopDelayFrames: timing.loopDelayFrames,
+			}
+			const violation = checkRestWindowTiming(restTiming)
+			if (violation !== null) {
+				throw new Error(`[spring_bone] AnimatedJava render hook supplied invalid animation timing (${violation})`)
+			}
+			return makeExportAnimationContext(animation, excludedNodeUuids, {
+				timing: restTiming,
+				requestedFadeFrames: readRestFadeFrames(animation),
+			})
+		},
 		isEnabled: () => isEnabled,
 	}
 	const driver = createExportDriver(exportDriverHost)
@@ -154,8 +190,8 @@ function previewContext(animation) {
 }
 
 // AJ が onBeginAnimation へ渡す context。
-function ajAnimationContext(animation, excludedNodeUuids = new Set()) {
-	return { animation, excludedNodeUuids, evaluateBasePose: () => {} }
+function ajAnimationContext(animation, excludedNodeUuids = new Set(), timing = DEFAULT_TIMING) {
+	return { animation, excludedNodeUuids, ...timing, evaluateBasePose: () => {} }
 }
 
 // AJ が onPose へ渡す context。 side=true で pre-post 判定の side sample を作る。
@@ -164,6 +200,7 @@ function ajPoseContext(animation, frameIndex, { side = false, excludedNodeUuids 
 	return {
 		animation,
 		excludedNodeUuids,
+		...DEFAULT_TIMING,
 		evaluateBasePose: () => {},
 		frameIndex,
 		frameTimeSeconds,
@@ -267,6 +304,84 @@ test('統合 A: AJ の excludedNodeUuids は同一 Set instance のまま runtim
 	assert.equal(context.animation, anim)
 	assert.equal(context.excludedNodeUuids, excluded)
 	assert.deepEqual(context.animationStack, [anim])
+})
+
+test('統合 A: AJ の周期情報と animation の fade 長が rest window として runtime へ届く', () => {
+	// 配線の全長 (= AJ context → driver → makeExportContext → export context) を通して、
+	// weight 算出の入力が欠けずに runtime の session context へ載ることを固定する。
+	const h = makeHarness()
+	const anim = { name: 'walk', [ANIM_REST_FADE_KEY]: 6 }
+	h.driver.onBeginRendering()
+	h.driver.onBeginAnimation(ajAnimationContext(anim, new Set(), {
+		animationLengthSeconds: 3,
+		renderSampleCount: 61,
+		loopMode: 'loop',
+		loopDelayFrames: 0,
+	}))
+	const restWindow = h.runtime.sessionContext.restWindow
+	// timing は AJ の値そのまま (= preview 側の数え直しを export では使わない)
+	assert.deepEqual(restWindow.timing, {
+		renderSampleCount: 61,
+		loopMode: 'loop',
+		loopDelayFrames: 0,
+	})
+	assert.equal(restWindow.requestedFadeFrames, 6)
+})
+
+test('統合 A: fade 長 Property が無い animation は既定値で rest window に載る', () => {
+	const h = makeHarness()
+	const anim = { name: 'walk' }
+	h.driver.onBeginRendering()
+	h.driver.onBeginAnimation(ajAnimationContext(anim))
+	assert.equal(h.runtime.sessionContext.restWindow.requestedFadeFrames, DEFAULT_REST_FADE_FRAMES)
+})
+
+test('統合 A: 契約違反の timing は export を止める (= throw して session を張らない)', () => {
+	// 0 へ正規化して続行すると weight ≡ 0 = 物理が全く載っていない datapack が黙って出る。
+	// AJ は hook の例外を RenderHookError に包んで export エラーへ surface するため、
+	// ここで throw すればユーザーが気付ける。
+	const brokenTimings = [
+		{ animationLengthSeconds: 1, renderSampleCount: Number.NaN, loopMode: 'once', loopDelayFrames: 0 },
+		{ animationLengthSeconds: 1, renderSampleCount: -1, loopMode: 'once', loopDelayFrames: 0 },
+		{ animationLengthSeconds: 1, renderSampleCount: 20.5, loopMode: 'once', loopDelayFrames: 0 },
+		{ animationLengthSeconds: 1, renderSampleCount: 21, loopMode: 'ping_pong', loopDelayFrames: 0 },
+	]
+	for (const timing of brokenTimings) {
+		const h = makeHarness()
+		const anim = { name: 'walk' }
+		h.driver.onBeginRendering()
+		assert.throws(
+			() => h.driver.onBeginAnimation(ajAnimationContext(anim, new Set(), timing)),
+			/invalid animation timing/,
+			JSON.stringify(timing),
+		)
+		// session は張られない (= 以降の onPose は no-op)
+		assert.equal(h.driver.isAnimationActive, false)
+		assert.equal(h.runtime.sessionContext, null)
+		h.log.length = 0
+		h.driver.onPose(ajPoseContext(anim, 0))
+		assert.deepEqual(h.log, [])
+		// onEndRendering は通常どおり後始末できる (= tick が止まったままにならない)
+		h.driver.onEndRendering()
+		assert.equal(h.exportGate.isExportActive, false)
+	}
+})
+
+test('統合 A: 正当な極小 animation (= N 0 / 1 / 2) は export を止めない', () => {
+	// 契約違反と混同すると、 正しい出力まで export できなくなる
+	for (const renderSampleCount of [0, 1, 2]) {
+		const h = makeHarness()
+		const anim = { name: 'tiny' }
+		h.driver.onBeginRendering()
+		h.driver.onBeginAnimation(ajAnimationContext(anim, new Set(), {
+			animationLengthSeconds: 0,
+			renderSampleCount,
+			loopMode: 'loop',
+			loopDelayFrames: 0,
+		}))
+		assert.equal(h.driver.isAnimationActive, true, `N=${renderSampleCount}`)
+		assert.equal(h.runtime.sessionContext.restWindow.timing.renderSampleCount, renderSampleCount)
+	}
 })
 
 // =============================================================================

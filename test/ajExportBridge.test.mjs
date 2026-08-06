@@ -78,9 +78,9 @@ function makeHost({
 			log.push({ fn: 'invalidatePreview' })
 			if (invalidatePreviewError) throw invalidatePreviewError
 		},
-		makeExportContext(animation, excludedNodeUuids) {
-			const context = { animation, excludedNodeUuids }
-			log.push({ fn: 'makeExportContext', animation, excludedNodeUuids, context })
+		makeExportContext(animation, excludedNodeUuids, timing) {
+			const context = { animation, excludedNodeUuids, timing }
+			log.push({ fn: 'makeExportContext', animation, excludedNodeUuids, timing, context })
 			return context
 		},
 		isEnabled() {
@@ -96,14 +96,23 @@ function makeHost({
 	}
 }
 
+// AJ v2 が context に載せる周期情報。 driver は解釈せず makeExportContext へ素通しする。
+const DEFAULT_TIMING = {
+	animationLengthSeconds: 1,
+	renderSampleCount: 21,
+	loopMode: 'once',
+	loopDelayFrames: 0,
+}
+
 // AJ の RenderAnimationContext 相当。 driver が読むのは animation / excludedNodeUuids /
-// evaluateBasePose の 3 つだけ (= rig 等は載せても無視される)。
-function makeAnimationContext(name, excludedNodeUuids = new Set()) {
+// evaluateBasePose と周期情報 4 つだけ (= rig 等は載せても無視される)。
+function makeAnimationContext(name, excludedNodeUuids = new Set(), timing = DEFAULT_TIMING) {
 	const basePoseTimes = []
 	return {
 		animation: { name },
 		rig: { name },
 		excludedNodeUuids,
+		...timing,
 		evaluateBasePose(timeSeconds) {
 			basePoseTimes.push(timeSeconds)
 		},
@@ -422,6 +431,43 @@ test('ExportDriver: onBeginAnimation の excludedNodeUuids が makeExportContext
 	// host が返した context がそのまま beginAnimation に渡る
 	const begun = log.find((e) => e.fn === 'beginAnimation')
 	assert.equal(begun.context, made.context)
+})
+
+test('ExportDriver: AJ v2 の周期情報 4 つが makeExportContext へ素通しで渡る', () => {
+	// driver 側は「N - 2 か N - 1 か」 の解釈をしない (= 周期の解釈は host / restWindow.ts の責務)。
+	// 値を落とさず、 加工もせずに渡すことだけを固定する。
+	const timing = {
+		animationLengthSeconds: 2.5,
+		renderSampleCount: 51,
+		loopMode: 'loop',
+		loopDelayFrames: 7,
+	}
+	const animationContext = makeAnimationContext('anim', new Set(), timing)
+	const { log } = startSession({}, animationContext)
+	const made = log.find((e) => e.fn === 'makeExportContext')
+	assert.deepEqual(made.timing, timing)
+})
+
+test('ExportDriver: 周期情報は animation ごとに読み直される', () => {
+	// session 中に animation が切り替わったら、 その animation の周期情報が渡ること
+	// (= 最初の animation の値を握り続けない)。
+	const { host, log } = makeHost()
+	const driver = createExportDriver(host)
+	driver.onBeginRendering()
+	const a = makeAnimationContext('a', new Set(), {
+		animationLengthSeconds: 1, renderSampleCount: 21, loopMode: 'once', loopDelayFrames: 0,
+	})
+	const b = makeAnimationContext('b', new Set(), {
+		animationLengthSeconds: 3, renderSampleCount: 61, loopMode: 'loop', loopDelayFrames: 5,
+	})
+	driver.onBeginAnimation(a)
+	driver.onEndAnimation()
+	driver.onBeginAnimation(b)
+	const timings = log.filter((e) => e.fn === 'makeExportContext').map((e) => e.timing)
+	assert.deepEqual(timings, [
+		{ animationLengthSeconds: 1, renderSampleCount: 21, loopMode: 'once', loopDelayFrames: 0 },
+		{ animationLengthSeconds: 3, renderSampleCount: 61, loopMode: 'loop', loopDelayFrames: 5 },
+	])
 })
 
 test('ExportDriver: beginAnimation に渡る wrapper は AJ の evaluateBasePose(timeSeconds) を呼ぶ', () => {

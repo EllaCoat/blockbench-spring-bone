@@ -35,6 +35,38 @@ test('makeExportAnimationContext: 空の excludedNodeUuids も同一 instance �
 	assert.equal(context.excludedNodeUuids.size, 0)
 })
 
+// --- makeExportAnimationContext: restWindow ---
+
+// restWindow は SpringRuntime が weight 算出に読む optional field。 省略時は undefined で、
+// runtime 側が weight ≡ 1 (= 減衰なし = 従来動作) に倒す。
+test('makeExportAnimationContext: restWindow 省略時は undefined', () => {
+	const context = makeExportAnimationContext({}, new Set())
+	assert.equal(context.restWindow, undefined)
+})
+
+test('makeExportAnimationContext: restWindow は同一参照のまま素通しする', () => {
+	// 解釈も正規化もしない (= 導出は restWindow.ts / SpringRuntime 側の責務)
+	const restWindow = {
+		timing: { renderSampleCount: 21, loopMode: 'loop', loopDelayFrames: 0 },
+		requestedFadeFrames: 4,
+	}
+	const context = makeExportAnimationContext({ name: 'walk' }, new Set(), restWindow)
+	assert.equal(context.restWindow, restWindow)
+	assert.equal(context.restWindow.timing, restWindow.timing)
+	assert.deepEqual(context.restWindow.timing, { renderSampleCount: 21, loopMode: 'loop', loopDelayFrames: 0 })
+	assert.equal(context.restWindow.requestedFadeFrames, 4)
+})
+
+test('makeExportAnimationContext: restWindow の中身を検証しない (= 壊れた値もそのまま載る)', () => {
+	// 正規化は読み側 (= restWindow.ts) の責務なので、 factory は素通しに徹する
+	const restWindow = {
+		timing: { renderSampleCount: Number.NaN, loopMode: 'bogus', loopDelayFrames: -1 },
+		requestedFadeFrames: -3,
+	}
+	const context = makeExportAnimationContext({}, new Set(), restWindow)
+	assert.equal(context.restWindow, restWindow)
+})
+
 // --- makeExportAnimationContext: animation の型を問わない ---
 
 // AJ が渡してくる animation の中身は解釈しない (= 判定も正規化もしない) 契約。

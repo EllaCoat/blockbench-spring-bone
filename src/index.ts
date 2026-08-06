@@ -15,7 +15,7 @@
 //   残った場合は Phase 5 のベイク機能で微調整する方針 (= 過剰な loop seamless 機構は入れない)。
 
 import { createState, resetState, step, type SpringConfig, type SpringState } from './springSim'
-import { SpringRuntime, type SpringRuntimeOps, type AnimationContext } from './springRuntime'
+import { SpringRuntime, type SpringRuntimeOps, type AnimationContext, type RestWindowContext } from './springRuntime'
 import { makeExportAnimationContext, type PreviewAnimationContext } from './animationContext'
 import { createExportGate } from './exportGate'
 import { createPreviewSession } from './previewSession'
@@ -30,6 +30,15 @@ import {
 	type SpringOverrideMap,
 } from './animOverrides'
 import { createExportDriver, type ExportDriverHost } from './ajExportBridge'
+import {
+	ANIM_REST_FADE_KEY,
+	DEFAULT_REST_FADE_FRAMES,
+	checkPreviewRestWindowTiming,
+	checkRestWindowTiming,
+	classifyRestWindowWeight,
+	createRenderSampleCountCache,
+	restWindowFingerprint,
+} from './restWindow'
 import { registerSpringPanel } from './ui'
 
 declare const Plugin: { register(id: string, opts: Record<string, unknown>): void }
@@ -69,7 +78,7 @@ declare function updateSelection(): void
 declare const window: { AnimatedJava?: { renderHooks?: AjRenderHooksApi } } | undefined
 
 const PLUGIN_ID = 'spring_bone'
-const PLUGIN_VERSION = '0.0.14'
+const PLUGIN_VERSION = '0.0.15'
 
 // name prefix `spring_` = **旧方式** (= v0.0.10 まで) の spring 化 truth。 現在の truth は
 // Group Property `spring_bone_enabled` (= enum 3 値) に移行済みで、 prefix は
@@ -196,6 +205,76 @@ function readOverrides(animation: any): SpringOverrideMap {
 	return map
 }
 
+// 終端 rest 整合の fade 長 (= frame 単位) を animation から読む唯一の口。 非 finite /
+// 未設定は既定値へ倒す (= readSpringProp と同じ規則)。 0 以上の整数への丸めと
+// animation 長への圧縮は restWindow.ts 側が担うため、 ここでは raw をそのまま返す。
+function readRestFadeFrames(animation: unknown): number {
+	const raw = (animation as Record<string, unknown> | null)?.[ANIM_REST_FADE_KEY]
+	return typeof raw === 'number' && Number.isFinite(raw) ? raw : DEFAULT_REST_FADE_FRAMES
+}
+
+// preview の sample 数 memo (= animation identity + raw length を key に 1 件だけ保持)。
+// project 切替 / install / cleanup で clear する (= 旧 project の instance 参照を握らない)。
+const renderSampleCountCache = createRenderSampleCountCache()
+
+// rest window の timing が契約違反だった旨を警告済みの animation uuid。
+// makePreviewRestWindow は毎 tick 走るため、 同一 animation への警告は 1 回だけに絞る。
+// overridesMemo / warnedNewerSchemaUuids と同じ 3 箇所でリセットする。
+const warnedRestWindowUuids = new Set<string>()
+
+function warnRestWindowOnce(animation: any, reason: string): void {
+	const uuid = typeof animation?.uuid === 'string' ? animation.uuid : null
+	if (uuid !== null && warnedRestWindowUuids.has(uuid)) return
+	if (uuid !== null) warnedRestWindowUuids.add(uuid)
+	console.warn(
+		`[${PLUGIN_ID}] animation "${animation?.name ?? uuid ?? '?'}" has invalid timing for the rest window (${reason}), disabling end-rest fade in preview`,
+	)
+}
+
+// preview 経路の rest window を BB の Animation object から組み立てる。
+// **preview は AJ を通らない** ため renderSampleCount を自前で数える (= AJ の render loop
+// と同じ丸めで数え直す deriveRenderSampleCount)。 loop_delay は BB では string 型
+// (= form 入力) なので、 AJ の renderAnimation と同じ `Number(...) || 0` で数値化して
+// 値が食い違わないようにする。
+//
+// **契約違反の値は窓ごと省略する** (= weight ≡ 1 の従来動作へ倒す) : 0 に正規化して
+// そのまま使うと weight ≡ 0 になり、 preview から物理が黙って消える。 export 経路と違って
+// preview は止めない (= 止めると編集作業そのものが止まる) ので、 警告だけ出して減衰を諦める。
+function makePreviewRestWindow(animation: any): RestWindowContext | undefined {
+	// animation 未選択 (= 複数 animation の同時 stack preview) では終点が 1 つに定まらない
+	// ため rest window を作らない (= weight ≡ 1 で従来動作)。
+	if (!animation) return undefined
+	// null = 数え切れない (= length が +Infinity、 または時刻が進まなくなった)。
+	// **件数を打ち切った近似値では代用しない** : 妥当な整数に見えてしまい、 警告も出ないまま
+	// preview と export の終端が食い違う。
+	const sampleCount = renderSampleCountCache.get(animation, animation.length)
+	if (sampleCount === null) {
+		warnRestWindowOnce(
+			animation,
+			`cannot enumerate render samples for animation.length ${String(animation.length)}`,
+		)
+		return undefined
+	}
+	const timing = {
+		// length が比較不能 (= NaN / 負 / undefined 等) だと sample 数が 0 になる。
+		// checkPreviewRestWindowTiming がこれを契約違反として拾う (= 実在する極小
+		// animation の N = 0 と区別する必要があるのは export 側だけ)。
+		// **数値以外がすべて 0 になるわけではない** : '2' のような数値へ暗黙変換
+		// できる値は AJ の `time <= animation.length` と同じ比較で数え切られる
+		// (= 41 件)。ここを型で弾くと同じ length から AJ と preview で件数が
+		// 食い違い、両端 rest の終点がズレる。
+		renderSampleCount: sampleCount,
+		loopMode: animation.loop,
+		loopDelayFrames: Number(animation.loop_delay) || 0,
+	}
+	const violation = checkPreviewRestWindowTiming(timing)
+	if (violation !== null) {
+		warnRestWindowOnce(animation, violation)
+		return undefined
+	}
+	return { timing, requestedFadeFrames: readRestFadeFrames(animation) }
+}
+
 // 「この animation の override を書いてよいか」の判定 (= Round 5 MUST-4)。
 // schema version が SPRING_SCHEMA_VERSION より新しい animation には書かない :
 // readOverrides は未知の上位 version に空 map を返すため、 その空 map 起点の
@@ -274,8 +353,9 @@ function isSpringGroupForProperty(group?: unknown): boolean {
 	return isCapable(getSpringBoneState(group))
 }
 
-// Property 6 個を register (= Group 側 4 個 : 数値 3 + enum `spring_bone_enabled`、
-// Animation 側 2 個 : object `spring_bone_overrides` + number `spring_bone_schema_version`)。
+// Property 7 個を register (= Group 側 4 個 : 数値 3 + enum `spring_bone_enabled`、
+// Animation 側 3 個 : object `spring_bone_overrides` + number `spring_bone_schema_version`
+// + number `spring_bone_rest_fade_frames`)。
 // plugin onload で 1 回だけ呼ぶ。 数値 Property の element_panel input は edit モードのみ
 // 表示 (= BB 本体側の element_panel.ts condition)、 animate モードでは自然に消える。
 // animate モード用の値編集は専用 Panel (= ui.ts) で提供。
@@ -410,8 +490,16 @@ function registerProperties(): void {
 		const version_prop = new Property(Animation, 'number', ANIM_SCHEMA_VERSION_KEY, {
 			default: SPRING_SCHEMA_VERSION,
 		})
+		// 終端 rest 整合の fade 長 (= frame 単位)。 **schema version は上げない** :
+		// override map とは独立した additive な optional field で、 欠落時は既定値へ
+		// 倒れるだけなので、 この Property を知らない旧 version で開いても壊れない
+		// (= 上位 version 扱いにすると旧 plugin が override を丸ごと無視してしまう)。
+		const rest_fade_prop = new Property(Animation, 'number', ANIM_REST_FADE_KEY, {
+			default: DEFAULT_REST_FADE_FRAMES,
+		})
 		patchMergeObject(overrides_prop, ANIM_OVERRIDES_KEY)
 		patchMerge(version_prop, ANIM_SCHEMA_VERSION_KEY)
+		patchMerge(rest_fade_prop, ANIM_REST_FADE_KEY)
 
 		// **登録前から存在する Animation instance への backfill** (= Group 側と同じ理由 :
 		// Property の default は新規 instance の constructor でしか入らないため、 plugin を
@@ -425,6 +513,7 @@ function registerProperties(): void {
 					if (anim == null) continue
 					if (anim[ANIM_OVERRIDES_KEY] === undefined) anim[ANIM_OVERRIDES_KEY] = {}
 					if (anim[ANIM_SCHEMA_VERSION_KEY] === undefined) anim[ANIM_SCHEMA_VERSION_KEY] = SPRING_SCHEMA_VERSION
+					if (anim[ANIM_REST_FADE_KEY] === undefined) anim[ANIM_REST_FADE_KEY] = DEFAULT_REST_FADE_FRAMES
 				}
 			}
 		} catch (e) {
@@ -473,6 +562,7 @@ function unregisterProperties(): void {
 	if (animProps) {
 		delete animProps[ANIM_OVERRIDES_KEY]
 		delete animProps[ANIM_SCHEMA_VERSION_KEY]
+		delete animProps[ANIM_REST_FADE_KEY]
 	}
 }
 
@@ -1230,10 +1320,19 @@ function computeGraphFingerprint(): string {
 // そのまま畳み込むことで、 registry 層の変化 (= rescan で更新済み) も session 層の
 // 差分として自然に検知される。 override の fingerprint 対象は registry に存在する bone
 // の uuid のみ (= 関係ない bone の override 変更では replay しない)。
+// **rest window も混ぜる** : fade の終点は animation の長さと loop 設定から決まるため、
+// これらを入れないと「length / loop mode / loop_delay / fade 長を変えたのに preview の
+// 減衰カーブが古いまま」 になる (= animation uuid も override map も変わらないので
+// 他の 3 要素では検知できない)。 fingerprint 側は導出値ではなく raw を並べる
+// (= restWindowFingerprint、 導出の bug で invalidate 判定まで壊さないため)。
 function computeSessionFingerprint(context: PreviewAnimationContext): string {
 	const map = readOverrides(context.animation)
 	const animUuid = (context.animation as { uuid?: unknown } | null)?.uuid ?? '-'
-	return `${lastGraphFingerprint}|@${animUuid}|${overridesFingerprint(map, Array.from(registry.keys()))}`
+	const restWindow = context.restWindow
+	const restFp = restWindow
+		? restWindowFingerprint(restWindow.timing, restWindow.requestedFadeFrames)
+		: '-'
+	return `${lastGraphFingerprint}|@${animUuid}|${overridesFingerprint(map, Array.from(registry.keys()))}|${restFp}`
 }
 
 // idempotent rescan : 既存 entry の state は保持、 不在 group のみ削除、 新規 group のみ追加。
@@ -1483,10 +1582,14 @@ function getAnchorWorld(entry: BoneEntry, out: any): boolean {
 // 4 step 化で keyframe rotation を保存しつつ物理揺れ delta を parent-local で prepend する。
 // own-rotation 独立化 (2026-07-10) 以降、 solver 目標 boneAxisWorld と d_animP は q_parentW × r 基準に
 // 統一 (= 自身の q_base を solver 目標 + Δ 合成基準から排除、 親 rotation は q_parentW 経由で反映)。
+// weight = 終端 rest 整合の窓 (= restWindow.ts が算出、 必ず [0, 1])。 Δ の回転量だけを
+// weight 倍する (= 物理 state は呼び出し側で通常どおり進めた上で、 出力に載る量を絞る)。
+// 分岐の判断は classifyRestWindowWeight に寄せてあり、 ここは THREE を触る数行だけを持つ。
 function composeSpringPose(
 	entry: BoneEntry,
 	dt: number,
 	stepSim: boolean,
+	weight: number,
 	scratch: {
 		anchorWorld: any
 		boneAxisWorld: any
@@ -1495,6 +1598,7 @@ function composeSpringPose(
 		parentInv: any
 		qBase: any
 		deltaP: any
+		identityQ: any
 		dAnimP: any
 		dSimP: any
 	},
@@ -1517,6 +1621,18 @@ function composeSpringPose(
 
 	if (!entry.state.initialized) return
 
+	// weight 0 (= 減衰しきった終端) は **premultiply 自体を通さない** : slerp で identity へ
+	// 寄せた Δ は浮動小数では厳密な identity にならず、 前乗算すると純 keyframe pose との差が
+	// 残る。 終端で基底ポーズと厳密一致させるのが本機能の目的なので、 qBase をそのまま残す。
+	// 物理 state は上の step で通常どおり進めてあるため、 逆行 scrub で weight が戻る経路でも
+	// state は連続する。 matrixWorld は **更新する** : 親の Δ が消えた pose を子の
+	// anchor / q_parentW へ伝播させるのは仕様どおりの挙動。
+	const deltaMode = classifyRestWindowWeight(weight)
+	if (deltaMode === 'identity') {
+		mesh.updateMatrixWorld(true)
+		return
+	}
+
 	// d_simW = state.pos - anchorWorld (world 方向)、 lengthSq guard で 0 除算防止
 	scratch.forward.subVectors(entry.state.pos, scratch.anchorWorld)
 	if (scratch.forward.lengthSq() < 1e-8) return
@@ -1533,6 +1649,14 @@ function composeSpringPose(
 	// setFromUnitVectors は twist を生成しない = twist を保存 (Sol 見落としバグ 9、
 	// 180 度反転付近では回転軸が不連続になり得るが hemisphere 選択は今回未対応 = 次段課題)。
 	scratch.deltaP.setFromUnitVectors(scratch.dAnimP, scratch.dSimP)
+
+	// 0 < weight < 1 : ΔP を identity へ向けて slerp する (= 回転量だけを weight 倍する)。
+	// slerp は最短弧を取るため、 setFromUnitVectors が返す swing の向きに依らず
+	// 「Δ を薄める」 方向に効く。
+	if (deltaMode === 'blend') {
+		scratch.identityQ.identity()
+		scratch.deltaP.slerp(scratch.identityQ, 1 - weight)
+	}
 
 	// q_final = ΔP × q_base (parent-local 前乗算 = premultiply)。
 	// mesh.quaternion への直接書き込みで Three.js の Object3D は rotation を自動同期
@@ -1551,6 +1675,7 @@ function makeComposeScratch(): {
 	parentInv: any
 	qBase: any
 	deltaP: any
+	identityQ: any
 	dAnimP: any
 	dSimP: any
 } {
@@ -1562,6 +1687,9 @@ function makeComposeScratch(): {
 		parentInv: new THREE.Quaternion(),
 		qBase: new THREE.Quaternion(),
 		deltaP: new THREE.Quaternion(),
+		// 減衰中 (= 0 < weight < 1) の slerp 目標。 module scope の定数にはしない
+		// (= THREE が未定義の時点で評価されるのを避ける)。
+		identityQ: new THREE.Quaternion(),
 		dAnimP: new THREE.Vector3(),
 		dSimP: new THREE.Vector3(),
 	}
@@ -1573,7 +1701,10 @@ function makeComposeScratch(): {
 // で処理する。 これにより chain 子の anchor は「親 spring の Δ 反映後」 の world pos を読める。
 // updateMatrixWorld(true) は自分 + 子孫の matrixWorld を伝播 (Blockbench 同梱 Three r129
 // の getWorldQuaternion は内部で ancestor 更新するが、 版依存吸収のため明示的に呼ぶ)。
-function stepAndApplyOrdered(dt: number): void {
+// weight は runtime が算出して渡す (= sub-step ごとに「これから進む step」 基準)。
+// **物理 step は weight に関わらず必ず回す** : 減衰は出力段だけの操作で、 state を止めると
+// 減衰の途中で速度が消えてしまう。
+function stepAndApplyOrdered(dt: number, weight: number): void {
 	if (registry.size === 0) return
 	const scratch = makeComposeScratch()
 	for (const uuid of topoOrder) {
@@ -1583,7 +1714,7 @@ function stepAndApplyOrdered(dt: number): void {
 		// 解決済み entry.enabled 参照)。 apply だけ止めて step を回し続けると、
 		// 再有効化した瞬間に「見えなかった期間の慣性」 が噴き出すため両方止める。
 		if (!entry || !isSpringActive(entry)) continue
-		composeSpringPose(entry, dt, true, scratch)
+		composeSpringPose(entry, dt, true, weight, scratch)
 	}
 }
 
@@ -1591,13 +1722,13 @@ function stepAndApplyOrdered(dt: number): void {
 // pose transaction 化以後は毎 tick 末尾で restore 直後に呼ばれる = mesh.quaternion に
 // BB core の「現時刻 keyframe pose」 が乗った状態から Δ を prepend し直す。
 // これで restore で消えた spring 揺れが再描画される + keyframe rotation は保存される。
-function applyOnlyOrdered(): void {
+function applyOnlyOrdered(weight: number): void {
 	if (registry.size === 0) return
 	const scratch = makeComposeScratch()
 	for (const uuid of topoOrder) {
 		const entry = registry.get(uuid)
 		if (!entry || !entry.state.initialized || !isSpringActive(entry)) continue
-		composeSpringPose(entry, 0, false, scratch)
+		composeSpringPose(entry, 0, false, weight, scratch)
 	}
 }
 
@@ -1650,7 +1781,9 @@ function makePreviewAnimationContext(): PreviewAnimationContext {
 	const animationStack: any[] = animSelected
 		? [animSelected]
 		: all.filter((a: any) => a?.playing)
-	return { animation: animSelected, animationStack }
+	// rest window は「選択中 animation が 1 つに定まる」 経路でのみ載せる
+	// (= makePreviewRestWindow が null 選択で undefined を返す)。
+	return { animation: animSelected, animationStack, restWindow: makePreviewRestWindow(animSelected) }
 }
 
 // timeToStepIndex は非 finite で RangeError を throw するため、 preview 側で 0 へ正規化する
@@ -1686,8 +1819,8 @@ const previewOps: SpringRuntimeOps<PreviewAnimationContext, AnimatorPoseSnapshot
 	restorePose: (snapshot) => restoreAnimatorPose(snapshot),
 	updateMatrixWorld: () => { Canvas?.scene?.updateMatrixWorld?.(true) },
 	resetAllToRest: () => resetAllToRest(),
-	stepAndApplyOrdered: (dt) => stepAndApplyOrdered(dt),
-	applyOnlyOrdered: () => applyOnlyOrdered(),
+	stepAndApplyOrdered: (dt, weight) => stepAndApplyOrdered(dt, weight),
+	applyOnlyOrdered: (weight) => applyOnlyOrdered(weight),
 }
 const runtime = new SpringRuntime<PreviewAnimationContext, AnimatorPoseSnapshot>(previewOps)
 
@@ -1754,6 +1887,8 @@ function installTickLoop(): () => void {
 	lastSessionFingerprint = ''
 	overridesMemo = null
 	warnedNewerSchemaUuids.clear()
+	renderSampleCountCache.clear()
+	warnedRestWindowUuids.clear()
 
 	// animation pose 由来の cache invalidation は BB event / Undo transaction を境界にする案 A を採用。
 	// 案 B (= keyframe 全値を fingerprint 化) は display frame ごとの走査と BB 内部構造への依存が増え、
@@ -1862,8 +1997,10 @@ function installTickLoop(): () => void {
 		// identity 比較なので残っていても誤ヒットはしないが、 参照保持を避ける)。
 		overridesMemo = null
 		// 上位 schema 警告の抑止も project 単位に戻す (= 同一 blueprint を別 project で
-		// 開いたときに警告が黙るのを防ぐ)。
+		// 開いたときに警告が黙るのを防ぐ)。 rest window 側の警告抑止と sample 数 memo も同じ。
 		warnedNewerSchemaUuids.clear()
+		renderSampleCountCache.clear()
+		warnedRestWindowUuids.clear()
 		if (projectRescanRafId !== null) return
 		projectRescanRafId = requestAnimationFrame(() => {
 			projectRescanRafId = null
@@ -1968,6 +2105,8 @@ function installTickLoop(): () => void {
 		lastSessionFingerprint = ''
 		overridesMemo = null
 		warnedNewerSchemaUuids.clear()
+		renderSampleCountCache.clear()
+		warnedRestWindowUuids.clear()
 		invalidatePreviewSession()
 	}
 }
@@ -1993,7 +2132,31 @@ const exportDriverHost: ExportDriverHost<PreviewAnimationContext> = {
 	suspendTick: () => { exportGate.suspend() },
 	resumeTick: () => { exportGate.resume() },
 	invalidatePreview: () => { invalidatePreviewSession() },
-	makeExportContext: (animation, excludedNodeUuids) => makeExportAnimationContext(animation, excludedNodeUuids),
+	// AJ v2 の周期情報をそのまま rest window の入力にする (= export では
+	// renderSampleCount が正本。 preview 側の deriveRenderSampleCount で数え直さない)。
+	// fade 長だけは animation Property から読む。
+	//
+	// **契約違反の timing は throw して export を止める** : 0 へ正規化して続行すると
+	// weight ≡ 0 = 物理が全く載っていない datapack が黙って出力される。 AJ は hook の例外を
+	// RenderHookError に包んで export エラーへ surface するため、 ここで止めれば気付ける。
+	// preview 側 (= makePreviewRestWindow) は警告 + 窓の省略に留める (= 編集を止めない)。
+	makeExportContext: (animation, excludedNodeUuids, timing) => {
+		const restTiming = {
+			renderSampleCount: timing.renderSampleCount,
+			loopMode: timing.loopMode,
+			loopDelayFrames: timing.loopDelayFrames,
+		}
+		const violation = checkRestWindowTiming(restTiming)
+		if (violation !== null) {
+			throw new Error(
+				`[${PLUGIN_ID}] AnimatedJava render hook supplied invalid animation timing (${violation}); aborting export to avoid baking an animation without spring physics`,
+			)
+		}
+		return makeExportAnimationContext(animation, excludedNodeUuids, {
+			timing: restTiming,
+			requestedFadeFrames: readRestFadeFrames(animation),
+		})
+	},
 	// capable な bone が 1 つも無い project では export に一切介入しない : 介入すると
 	// frame ごとに pose の capture / restore と 3 sub-step 分の base pose 再評価が乗り、
 	// 物理を掛ける対象がゼロのまま export だけが重くなる。

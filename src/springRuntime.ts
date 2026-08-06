@@ -1,6 +1,8 @@
 // 時刻写像の純粋関数群。 物理シムの時刻の正本を「浮動小数の秒」 から「整数 step 番号」
 // に移行するため、 tick 側は必ず timeToStepIndex で格子化し、 物理 / applyPoseAt に渡す
 // 時刻は stepIndexToTime で逆写像する (= 往路で ULP 丸めした格子点を復路で再現)。
+import { computeRestWindowWeight, deriveDisplayedFinalFrame, type RestWindowTiming } from './restWindow'
+
 export const STEPS_PER_SECOND = 60
 export const FIXED_DT_SECONDS = 1 / STEPS_PER_SECOND
 // 30 step (= 0.5 秒) ちょうどまでは cache advance、 31 step からは 0 replay に流す
@@ -62,10 +64,21 @@ export function stepIndexFromFrame(frameIndex: number): number {
 	return result
 }
 
-// per-animation 解決の口。 今は animation 参照のみ (= 値の解決は呼び出し側の
-// resolveConfigs が行う)。 将来 animation 単位で物理パラを切り替える場合にここへ足す。
+// 終端 rest 整合の窓に必要な入力一式 (= 周期情報 + 要求 fade 長)。 導出 (= 表示上の
+// 最終 frame / 実効 fade 長 / weight) は restWindow.ts が担い、 ここは raw を運ぶだけ。
+export interface RestWindowContext {
+	timing: RestWindowTiming
+	requestedFadeFrames: number
+}
+
+// per-animation 解決の口。 今は animation 参照と rest window のみ (= 物理パラの解決は
+// 呼び出し側の resolveConfigs が行う)。
 export interface AnimationContext<TAnimation = unknown> {
 	animation: TAnimation | null
+	// **省略可**。 詰めなかった場合は weight ≡ 1 = 減衰なし (= 従来動作) になる。
+	// 複数 animation の同時 stack preview のように「単一の終点」 が定義できない経路では
+	// 詰めないこと (= 終点を 1 つ選ぶと他の animation の途中で Δ が消える)。
+	restWindow?: RestWindowContext
 }
 
 // base pose (= keyframe pose) を scene に当てる evaluator。 index.ts の applyPoseAt 相当を
@@ -78,8 +91,11 @@ export interface SpringRuntimeOps<C, P> {
 	restorePose(snapshot: P): void
 	updateMatrixWorld(): void
 	resetAllToRest(context: C): void
-	stepAndApplyOrdered(dtSeconds: number, context: C): void
-	applyOnlyOrdered(context: C): void
+	// weight = 終端 rest 整合の窓 (= Δ に掛ける係数、 必ず [0, 1])。 **runtime が算出して
+	// 渡す** : 呼び出し側が currentStepIndex から自前で出すと、 sub-step の weight が
+	// 「まだ進んでいない step」 基準になり 1 step ぶんズレる。
+	stepAndApplyOrdered(dtSeconds: number, weight: number, context: C): void
+	applyOnlyOrdered(weight: number, context: C): void
 }
 
 export type EvaluationMode = 'replay' | 'advance' | 'same-step'
@@ -113,6 +129,9 @@ export interface EvaluationResult {
 // - endAnimation = context / evaluator / step cache を破棄。 scene pose は変更しない
 // - isEvaluating = 評価 (= evaluateStepIndex / evaluateSample) 実行中のみ true。
 //   export hook からの再入を弾く口
+// - 終端 rest 整合の weight は **この class が算出して ops へ渡す** (= restWindowWeightAt)。
+//   sub-step には「これから進む step (= next)」 の weight、 sub-step ループ後の
+//   applyOnlyOrdered と applyWithoutAdvance には「現在の step」 の weight を渡す
 export class SpringRuntime<C extends AnimationContext, P> {
 	private readonly ops: SpringRuntimeOps<C, P>
 	private context: C | null = null
@@ -130,6 +149,19 @@ export class SpringRuntime<C extends AnimationContext, P> {
 
 	get isEvaluating(): boolean {
 		return this.evaluating
+	}
+
+	// 指定 step の Δ weight。 context に rest window が無い経路 (= 複数 animation の同時
+	// stack preview) は 1 を返し、 従来どおり Δ をそのまま載せる。
+	// 実効 fade 長への圧縮は computeRestWindowWeight が内部で行う (= restWindow.ts)。
+	private restWindowWeightAt(stepIndex: number): number {
+		const restWindow = this.context?.restWindow
+		if (!restWindow) return 1
+		return computeRestWindowWeight(
+			stepIndex,
+			deriveDisplayedFinalFrame(restWindow.timing),
+			restWindow.requestedFadeFrames,
+		)
 	}
 
 	beginAnimation(context: C, evaluateBasePose: BasePoseEvaluator<C>): void {
@@ -192,7 +224,9 @@ export class SpringRuntime<C extends AnimationContext, P> {
 				while (this.stepIndex !== null && this.stepIndex < target) {
 					const next = this.stepIndex + 1
 					evaluateBasePose(stepIndexToTime(next), context)
-					this.ops.stepAndApplyOrdered(FIXED_DT_SECONDS, context)
+					// weight は **これから進む step (= next)** 基準。 this.stepIndex はまだ
+					// 更新されていないため、 現在値で出すと 1 step ぶん手前の weight になる。
+					this.ops.stepAndApplyOrdered(FIXED_DT_SECONDS, this.restWindowWeightAt(next), context)
 					this.stepIndex = next
 					substepCount++
 				}
@@ -232,8 +266,9 @@ export class SpringRuntime<C extends AnimationContext, P> {
 				this.stepIndex = null
 				throw pendingError
 			}
-			this.ops.applyOnlyOrdered(context)
 			const stepIndex = this.stepIndex as number
+			// sub-step ループ後の再適用は「現在の step」 基準 (= 進み終わった位置)。
+			this.ops.applyOnlyOrdered(this.restWindowWeightAt(stepIndex), context)
 			return {
 				stepIndex,
 				timeSeconds: stepIndexToTime(stepIndex),
@@ -253,7 +288,9 @@ export class SpringRuntime<C extends AnimationContext, P> {
 		if (this.context === null || this.stepIndex === null) {
 			throw new Error('SpringRuntime.applyWithoutAdvance: session not started or not evaluated yet')
 		}
-		this.ops.applyOnlyOrdered(this.context)
+		// 同 frame の 2 回目以降 (= export の side sample 等)。 state を進めないので
+		// weight も「現在の step」 のものを再利用する。
+		this.ops.applyOnlyOrdered(this.restWindowWeightAt(this.stepIndex), this.context)
 	}
 
 	endAnimation(): void {

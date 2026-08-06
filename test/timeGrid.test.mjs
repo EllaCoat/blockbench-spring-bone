@@ -2,6 +2,12 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 
 const { timeToStepIndex, stepIndexToTime, stepIndexFromFrame, SpringRuntime } = await import('../dist-test/springRuntime.mjs')
+const {
+	computeRestWindowWeight,
+	deriveDisplayedFinalFrame,
+	deriveRenderSampleCount,
+	checkPreviewRestWindowTiming,
+} = await import('../dist-test/restWindow.mjs')
 
 test('timeToStepIndex: バグ再現ケース (2.05 → 123)', () => {
 	// 旧実装 Math.floor(2.05 / (1/60)) は 122.99999999999999 を floor して 122 を返していた
@@ -99,7 +105,9 @@ test('累積加算した秒は格子に乗らないため export では frame �
 // object を指定可能)、 restoreError / updateError / configError を渡すと
 // restorePose / updateMatrixWorld / resolveConfigs が常にそれを throw する。
 // evaluatingLog には各 call 発生時点の runtime.isEvaluating が記録される。
-function makeRuntime(calls, { throwOnStep = -1, stepError = null, restoreError = null, updateError = null, configError = null } = {}) {
+// restWindow を渡すと context に載る (= 終端 rest 整合の weight が有効になる)。
+// 渡さない場合は従来どおり weight ≡ 1。
+function makeRuntime(calls, { throwOnStep = -1, stepError = null, restoreError = null, updateError = null, configError = null, restWindow = undefined } = {}) {
 	let stepCount = 0
 	let throwArmed = true
 	const evaluatingLog = []
@@ -131,7 +139,7 @@ function makeRuntime(calls, { throwOnStep = -1, stepError = null, restoreError =
 		applyOnlyOrdered: record('applyOnlyOrdered', () => {}),
 	}
 	runtime = new SpringRuntime(ops)
-	const context = { animation: null }
+	const context = { animation: null, restWindow }
 	const basePose = (timeSeconds, ctx) => {
 		calls.push({ fn: 'basePose', args: [timeSeconds, ctx] })
 		evaluatingLog.push(runtime.isEvaluating)
@@ -504,6 +512,192 @@ test('SpringRuntime: resolveConfigs が throw したら session は確定しな�
 	const ok = makeRuntime(calls2)
 	ok.runtime.beginAnimation(ok.context, ok.basePose)
 	assert.equal(ok.runtime.evaluateSample(0.05).mode, 'replay')
+})
+
+// --- 終端 rest 整合の weight ---
+
+// timing = 21 sample (= length 1 秒相当) の once。 displayedFinalFrame = 20、
+// fadeEndStep = 60、 fade 4 frame なので fadeStartStep = 48。
+const REST_TIMING = { renderSampleCount: 21, loopMode: 'once', loopDelayFrames: 0 }
+const REST_WINDOW = { timing: REST_TIMING, requestedFadeFrames: 4 }
+const FINAL_FRAME = deriveDisplayedFinalFrame(REST_TIMING)
+const expectedWeight = (stepIndex) => computeRestWindowWeight(stepIndex, FINAL_FRAME, 4)
+// ops の呼び出し記録から weight 引数だけを抜く (= stepAndApplyOrdered は args[1]、
+// applyOnlyOrdered は args[0])。
+const stepWeights = (calls) => calls.filter((c) => c.fn === 'stepAndApplyOrdered').map((c) => c.args[1])
+const applyWeights = (calls) => calls.filter((c) => c.fn === 'applyOnlyOrdered').map((c) => c.args[0])
+
+test('SpringRuntime: rest window が無い context では weight ≡ 1 (= 従来動作)', () => {
+	const calls = []
+	const { runtime, context, basePose } = makeRuntime(calls)
+	runtime.beginAnimation(context, basePose)
+	runtime.evaluateSample(0.05)
+	runtime.applyWithoutAdvance()
+
+	assert.deepEqual(stepWeights(calls), [1, 1, 1])
+	assert.deepEqual(applyWeights(calls), [1, 1])
+})
+
+// index.ts の makePreviewRestWindow 相当。 数え切れない length と契約違反の timing の
+// どちらでも窓ごと省略する (= preview は止めず、 減衰だけ諦めて従来動作へ倒す)。
+const makePreviewRestWindow = (lengthSeconds, loopMode = 'once', loopDelayFrames = 0) => {
+	const renderSampleCount = deriveRenderSampleCount(lengthSeconds)
+	if (renderSampleCount === null) return undefined
+	const timing = { renderSampleCount, loopMode, loopDelayFrames }
+	return checkPreviewRestWindowTiming(timing) !== null ? undefined : { timing, requestedFadeFrames: 4 }
+}
+
+// restWindow を省略した context で全 step の weight が exact 1 になることを確認する。
+const assertNoDecay = (restWindow, label) => {
+	const calls = []
+	assert.equal(restWindow, undefined, label)
+	const { runtime, context, basePose } = makeRuntime(calls, { restWindow })
+	runtime.beginAnimation(context, basePose)
+	runtime.evaluateSample(stepIndexToTime(70))
+	runtime.applyWithoutAdvance()
+	// 物理が消えない (= 全 step で Δ をそのまま載せる)
+	for (const w of stepWeights(calls)) assert.strictEqual(w, 1, label)
+	for (const w of applyWeights(calls)) assert.strictEqual(w, 1, label)
+}
+
+test('SpringRuntime: 数え切れない length の preview context では w ≡ 1 に倒れる', () => {
+	// +Infinity = 終わらない条件。 「時刻が進まない」 側も deriveRenderSampleCount が同じ
+	// null を返すため、 ここから先の経路は共通 (= 進まない判定自体は restWindow.test.mjs の
+	// nextRenderSampleTime で固定している)。
+	assert.equal(deriveRenderSampleCount(Number.POSITIVE_INFINITY), null)
+	assertNoDecay(makePreviewRestWindow(Number.POSITIVE_INFINITY), 'length=+Infinity')
+})
+
+test('SpringRuntime: 契約違反の timing を弾いた preview context では w ≡ 1 に倒れる', () => {
+	// length 由来 (= 0 件になる) の経路
+	for (const length of [Number.NaN, Number.NEGATIVE_INFINITY, -1]) {
+		assertNoDecay(makePreviewRestWindow(length), `length=${length}`)
+	}
+	// timing 由来 (= 未知 loopMode) の経路
+	assertNoDecay(makePreviewRestWindow(1, 'ping_pong'), 'loopMode=ping_pong')
+
+	// 正当な length / loopMode では窓が作られ、 終端で減衰する (= 上の縮退と対になる確認)
+	const restWindow = makePreviewRestWindow(1, 'once', 0)
+	assert.notEqual(restWindow, undefined)
+	assert.equal(restWindow.timing.renderSampleCount, 21)
+	const calls = []
+	const { runtime, context, basePose } = makeRuntime(calls, { restWindow })
+	runtime.beginAnimation(context, basePose)
+	runtime.evaluateSample(stepIndexToTime(60))
+	assert.deepEqual(applyWeights(calls), [0])
+})
+
+test('SpringRuntime: sub-step の weight は「これから進む step (= next)」 基準', () => {
+	// stepIndex はまだ更新されていないため、 現在値で出すと 1 step ぶん手前の weight になる。
+	// 減衰区間 (= step 48..60) をまたぐ範囲で列を固定する
+	const calls = []
+	const { runtime, context, basePose } = makeRuntime(calls, { restWindow: REST_WINDOW })
+	runtime.beginAnimation(context, basePose)
+	// 初回評価は replay。 ここまでの呼び出しは捨てて、 次の advance だけを見る
+	runtime.evaluateSample(stepIndexToTime(20))
+	calls.length = 0
+	// 20 → 50 step (= 30 step 前進なので advance 経路、 減衰開始 48 をまたぐ)
+	runtime.evaluateSample(stepIndexToTime(50))
+
+	const weights = stepWeights(calls)
+	assert.equal(weights.length, 30)
+	// k 番目の sub-step は step 21..50 に対応する
+	assert.deepEqual(weights, Array.from({ length: 30 }, (_, i) => expectedWeight(21 + i)))
+	// 減衰開始前は 1、 開始後は 1 未満 (= next 基準で 1 step ズレていないことの裏取り)
+	assert.equal(weights[0], 1)                       // step 21
+	assert.equal(weights[27], expectedWeight(48))     // step 48 = fadeStartStep → 1
+	assert.equal(weights[27], 1)
+	assert.ok(weights[28] < 1)                        // step 49 = 減衰区間の内側
+})
+
+test('SpringRuntime: sub-step ループ後の applyOnlyOrdered は現在 step の weight', () => {
+	const calls = []
+	const { runtime, context, basePose } = makeRuntime(calls, { restWindow: REST_WINDOW })
+	runtime.beginAnimation(context, basePose)
+	runtime.evaluateSample(stepIndexToTime(50))
+	// 最後の sub-step (= step 50) と apply の weight が一致する
+	const weights = stepWeights(calls)
+	assert.equal(weights[weights.length - 1], expectedWeight(50))
+	assert.deepEqual(applyWeights(calls), [expectedWeight(50)])
+})
+
+test('SpringRuntime: same-step 評価は現在 step の weight を使う', () => {
+	const calls = []
+	const { runtime, context, basePose } = makeRuntime(calls, { restWindow: REST_WINDOW })
+	runtime.beginAnimation(context, basePose)
+	runtime.evaluateSample(stepIndexToTime(55))
+	calls.length = 0
+
+	const result = runtime.evaluateSample(stepIndexToTime(55))
+	assert.equal(result.mode, 'same-step')
+	assert.deepEqual(stepWeights(calls), [])
+	assert.deepEqual(applyWeights(calls), [expectedWeight(55)])
+})
+
+test('SpringRuntime: applyWithoutAdvance は現在 step の weight を再利用する', () => {
+	const calls = []
+	const { runtime, context, basePose } = makeRuntime(calls, { restWindow: REST_WINDOW })
+	runtime.beginAnimation(context, basePose)
+	runtime.evaluateSample(stepIndexToTime(55))
+	calls.length = 0
+
+	runtime.applyWithoutAdvance()
+	runtime.applyWithoutAdvance()
+	// 何度呼んでも同じ weight (= state を進めないので冪等)
+	assert.deepEqual(applyWeights(calls), [expectedWeight(55), expectedWeight(55)])
+})
+
+test('SpringRuntime: 終点以後の weight は exact 0 で ops へ届く', () => {
+	const calls = []
+	const { runtime, context, basePose } = makeRuntime(calls, { restWindow: REST_WINDOW })
+	runtime.beginAnimation(context, basePose)
+	// fadeEndStep = 60 ちょうど
+	runtime.evaluateSample(stepIndexToTime(60))
+	const weights = stepWeights(calls)
+	assert.strictEqual(weights[weights.length - 1], 0)
+	assert.deepEqual(applyWeights(calls), [0])
+
+	// 終点より後も 0 のまま
+	calls.length = 0
+	runtime.evaluateSample(stepIndexToTime(70))
+	for (const w of stepWeights(calls)) assert.strictEqual(w, 0)
+	assert.deepEqual(applyWeights(calls), [0])
+})
+
+test('SpringRuntime: replay 経路でも weight は step 番号に追従する', () => {
+	// replay は step 0 から数え直すため、 weight 列も step 1..N の順で出る
+	const calls = []
+	const { runtime, context, basePose } = makeRuntime(calls, { restWindow: REST_WINDOW })
+	runtime.beginAnimation(context, basePose)
+	runtime.evaluateSample(stepIndexToTime(60))
+	calls.length = 0
+
+	// 逆行 = replay (= 0 から 50 まで数え直す)
+	const result = runtime.evaluateSample(stepIndexToTime(50))
+	assert.equal(result.mode, 'replay')
+	const weights = stepWeights(calls)
+	assert.equal(weights.length, 50)
+	assert.deepEqual(weights, Array.from({ length: 50 }, (_, i) => expectedWeight(1 + i)))
+})
+
+test('SpringRuntime: weight は ops へ context と一緒に届く (= 引数順の固定)', () => {
+	const calls = []
+	const { runtime, context, basePose } = makeRuntime(calls, { restWindow: REST_WINDOW })
+	runtime.beginAnimation(context, basePose)
+	runtime.evaluateSample(stepIndexToTime(1))
+
+	const step = calls.find((c) => c.fn === 'stepAndApplyOrdered')
+	// stepAndApplyOrdered(dtSeconds, weight, context)
+	assert.equal(step.args.length, 3)
+	assert.equal(step.args[0], 1 / 60)
+	assert.equal(step.args[1], expectedWeight(1))
+	assert.ok(step.args[2] === context)
+
+	const apply = calls.find((c) => c.fn === 'applyOnlyOrdered')
+	// applyOnlyOrdered(weight, context)
+	assert.equal(apply.args.length, 2)
+	assert.equal(apply.args[0], expectedWeight(1))
+	assert.ok(apply.args[1] === context)
 })
 
 test('SpringRuntime: restorePose と updateMatrixWorld が両方 throw → restorePose 由来が伝播', () => {

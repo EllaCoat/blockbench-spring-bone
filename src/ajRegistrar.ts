@@ -19,6 +19,9 @@ export interface AjRenderHooksApi {
 	unregister?(id: string): void
 }
 
+// この driver が要求する registry の version。 AJ 側の RENDER_HOOKS_API.version と対応する。
+export const AJ_RENDER_HOOKS_API_VERSION = 2
+
 export interface AjRegistrarOptions<D> {
 	// registry への登録 id + log の prefix に使う。
 	pluginId: string
@@ -80,7 +83,11 @@ export function installAjRegistrar<D>(options: AjRegistrarOptions<D>, ops: AjReg
 	// 現在の API を見て、 未登録 or 別 object に差し替わっていたら登録し直す。
 	const syncRegistration = (): void => {
 		const api = ops.getApi()
-		if (!api || api.version !== 1 || typeof api.register !== 'function') return
+		// version 2 = RenderAnimationContext に周期情報 (= animationLengthSeconds /
+		// renderSampleCount / loopMode / loopDelayFrames) が載った版。 終端 rest 整合の
+		// 窓はこの周期情報が無いと終点を決められないため、 v1 registry へは登録しない
+		// (= 登録すると周期情報 undefined のまま export に介入してしまう)。
+		if (!api || api.version !== AJ_RENDER_HOOKS_API_VERSION || typeof api.register !== 'function') return
 		if (api === registeredApi) return
 		try {
 			api.register(pluginId, driver)
