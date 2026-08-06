@@ -15,7 +15,14 @@
 //   残った場合は Phase 5 のベイク機能で微調整する方針 (= 過剰な loop seamless 機構は入れない)。
 
 import { createState, resetState, step, type SpringConfig, type SpringState } from './springSim'
-import { SpringRuntime, type SpringRuntimeOps, type AnimationContext, type RestWindowContext } from './springRuntime'
+import {
+	SpringRuntime,
+	stepIndexFromFrame,
+	stepIndexToTime,
+	type SpringRuntimeOps,
+	type AnimationContext,
+	type RestWindowContext,
+} from './springRuntime'
 import { makeExportAnimationContext, type PreviewAnimationContext } from './animationContext'
 import { createExportGate } from './exportGate'
 import { createPreviewSession } from './previewSession'
@@ -39,12 +46,31 @@ import {
 	createRenderSampleCountCache,
 	restWindowFingerprint,
 } from './restWindow'
+import {
+	ANIM_BAKED_FROM_KEY,
+	ANIM_BAKED_PARAM_HASH_KEY,
+	ANIM_BAKED_SOURCE_HASH_KEY,
+	ANIM_BAKED_VERSION_KEY,
+	BAKE_DENSITY_WARN_KF_PER_SECOND,
+	BAKE_VERSION,
+	applyBakedCurvesToAnimationData,
+	bakeSpringRotations,
+	hashFingerprint,
+	isBakedAnimation,
+	isBakedAnimationContext,
+	type BakeResult,
+	type BakeSceneOps,
+	type BakeTarget,
+} from './bakeTimeline'
+import type { AxisTriple, QuaternionOps } from './curveFit'
 import { registerSpringPanel } from './ui'
 
 declare const Plugin: { register(id: string, opts: Record<string, unknown>): void }
 declare const Blockbench: {
 	on(event: string, fn: (...args: unknown[]) => void): void
 	removeListener?(event: string, fn: (...args: unknown[]) => void): void
+	// bake の結果通知 / 密度警告に使う (= js/api.ts:235)。
+	showMessageBox?(options: Record<string, unknown>, callback?: (button: number | string) => void): unknown
 }
 declare const Project: { groups?: unknown[]; elements?: unknown[]; saved?: boolean } | null
 declare const Group: any
@@ -58,7 +84,13 @@ declare const Animator: {
 	preview?(): void
 }
 declare const Animation: { selected?: any; all?: any[] } | undefined
+// BB の Animation Controller。 controller 再生中は playing flag ではなく controller の
+// state が「今再生されている animation」 を決める (= animation_mode.js:357-394)。
+declare const AnimationController: { selected?: any } | undefined
 declare const Modes: { animate?: boolean; edit?: boolean } | undefined
+// BB の現行 format。 bake は `euler_order` (= 全 node の mesh.rotation.order の出所、
+// group.js:627) だけを読む。 未定義時は BB core の既定値 'ZYX' へ倒す (= format.ts:704)。
+declare const Format: { euler_order?: string } | undefined
 declare const THREE: any
 // BB 5.1.4 の Property class (= js/util/property.ts)。 Group.properties[name] に登録され
 // blueprint (.bbmodel) の save/load、 Undo、 multi-select、 削除 cleanup、 Element panel
@@ -78,7 +110,7 @@ declare function updateSelection(): void
 declare const window: { AnimatedJava?: { renderHooks?: AjRenderHooksApi } } | undefined
 
 const PLUGIN_ID = 'spring_bone'
-const PLUGIN_VERSION = '0.0.15'
+const PLUGIN_VERSION = '0.0.16'
 
 // name prefix `spring_` = **旧方式** (= v0.0.10 まで) の spring 化 truth。 現在の truth は
 // Group Property `spring_bone_enabled` (= enum 3 値) に移行済みで、 prefix は
@@ -353,9 +385,11 @@ function isSpringGroupForProperty(group?: unknown): boolean {
 	return isCapable(getSpringBoneState(group))
 }
 
-// Property 7 個を register (= Group 側 4 個 : 数値 3 + enum `spring_bone_enabled`、
-// Animation 側 3 個 : object `spring_bone_overrides` + number `spring_bone_schema_version`
-// + number `spring_bone_rest_fade_frames`)。
+// Property 11 個を register (= Group 側 4 個 : 数値 3 + enum `spring_bone_enabled`、
+// Animation 側 7 個 : object `spring_bone_overrides` + number `spring_bone_schema_version`
+// + number `spring_bone_rest_fade_frames` + bake metadata 4 個 (= string `spring_bone_baked_from`
+// / string `spring_bone_baked_param_hash` / string `spring_bone_baked_source_hash`
+// / number `spring_bone_baked_version`))。
 // plugin onload で 1 回だけ呼ぶ。 数値 Property の element_panel input は edit モードのみ
 // 表示 (= BB 本体側の element_panel.ts condition)、 animate モードでは自然に消える。
 // animate モード用の値編集は専用 Panel (= ui.ts) で提供。
@@ -501,6 +535,19 @@ function registerProperties(): void {
 		patchMerge(version_prop, ANIM_SCHEMA_VERSION_KEY)
 		patchMerge(rest_fade_prop, ANIM_REST_FADE_KEY)
 
+		// bake で作った派生 animation のメタデータ 4 個。 **schema version は上げない** :
+		// rest fade と同じく additive な optional field で、 欠落時は「bake 由来ではない」
+		// へ倒れるだけなので、 この Property を知らない旧 version で開いても壊れない。
+		// condition は付けない (= 他の Animation Property と同じ理由 : Property.copy の
+		// gate も兼ねるため、 付けると Undo 捕捉と blueprint 保存から key が落ちる)。
+		// 既定値は「bake 由来ではない」 を表す空文字 / 0 (= isBakedAnimation が false になる)。
+		// patchMerge は通さない : condition を付けていないので BB 標準の merge
+		// (= Merge.string / Merge.number) で load 時も正しく復帰する。
+		new Property(Animation, 'string', ANIM_BAKED_FROM_KEY, { default: '' })
+		new Property(Animation, 'string', ANIM_BAKED_PARAM_HASH_KEY, { default: '' })
+		new Property(Animation, 'string', ANIM_BAKED_SOURCE_HASH_KEY, { default: '' })
+		new Property(Animation, 'number', ANIM_BAKED_VERSION_KEY, { default: 0 })
+
 		// **登録前から存在する Animation instance への backfill** (= Group 側と同じ理由 :
 		// Property の default は新規 instance の constructor でしか入らないため、 plugin を
 		// 後から有効化した場合の既存 Animation には値が無いまま)。
@@ -563,6 +610,10 @@ function unregisterProperties(): void {
 		delete animProps[ANIM_OVERRIDES_KEY]
 		delete animProps[ANIM_SCHEMA_VERSION_KEY]
 		delete animProps[ANIM_REST_FADE_KEY]
+		delete animProps[ANIM_BAKED_FROM_KEY]
+		delete animProps[ANIM_BAKED_PARAM_HASH_KEY]
+		delete animProps[ANIM_BAKED_SOURCE_HASH_KEY]
+		delete animProps[ANIM_BAKED_VERSION_KEY]
 	}
 }
 
@@ -847,12 +898,65 @@ function registerContextMenuActions(): void {
 	registeredMenuEntries.push(sep, springify, springify_recursive, unspringify, unspringify_recursive)
 }
 
+// Animation 右クリ context menu (= Animations panel) に追加した entry。 Group 側とは
+// menu が別なので保持も別にする。
+let registeredAnimationMenuEntries: unknown[] = []
+
+// menu から渡された context を Animation instance として解決する。 Action は menu 経由なら
+// clicked entry を第 1 引数で受け取る (= menu.js:511 `s.click(scope_context, e)`) が、
+// keybind 等の Action.trigger 経由では Event が来るため、 生存確認を通したものだけ採用し、
+// 駄目なら選択中 animation へ fallback する (= Group 側の isRealGroup と同じ考え方)。
+function resolveMenuAnimation(context: unknown): any | null {
+	const all: any[] = Array.isArray((Animation as any)?.all) ? (Animation as any).all : []
+	if (context && all.includes(context)) return context
+	const selected = (Animation as any)?.selected
+	return selected && all.includes(selected) ? selected : null
+}
+
+// Animation 右クリ menu に bake action を 1 つ追加する。 対象は clicked animation
+// (= 無ければ選択中)。 bake 由来の派生 animation では出さない (= 二重 bake の防止)。
+function registerBakeAction(): void {
+	if (typeof Action !== 'function' || typeof MenuSeparator !== 'function') {
+		console.warn(`[${PLUGIN_ID}] Action or MenuSeparator not available, skipping bake action registration`)
+		return
+	}
+	const menu = (Animation as unknown as { prototype?: { menu?: { structure?: unknown[] } } })?.prototype?.menu
+	if (!menu || !Array.isArray(menu.structure)) {
+		console.warn(`[${PLUGIN_ID}] Animation.prototype.menu.structure not available, skipping bake action registration`)
+		return
+	}
+
+	const bake = new Action(`${PLUGIN_ID}_bake_animation`, {
+		name: 'Spring を bake (派生 animation)',
+		icon: 'save_as',
+		// spring bone が 1 本も無い project や、 既に bake 済みの派生 animation では隠す。
+		condition: (context?: unknown) => {
+			if (registry.size === 0) return false
+			const animation = resolveMenuAnimation(context)
+			return animation !== null && !isBakedAnimation(animation)
+		},
+		click(context?: unknown) {
+			const animation = resolveMenuAnimation(context)
+			if (!animation) return
+			runSpringBake(animation)
+		},
+	})
+
+	const sep = new MenuSeparator(`${PLUGIN_ID}_bake`)
+	menu.structure.push(sep, bake)
+	registeredAnimationMenuEntries.push(sep, bake)
+}
+
 function unregisterContextMenuActions(): void {
 	const menu = (Group as { prototype?: { menu?: { structure?: unknown[] } } })?.prototype?.menu
 	if (menu?.structure && Array.isArray(menu.structure)) {
 		menu.structure = menu.structure.filter((entry) => !registeredMenuEntries.includes(entry))
 	}
-	for (const entry of registeredMenuEntries) {
+	const animMenu = (Animation as unknown as { prototype?: { menu?: { structure?: unknown[] } } })?.prototype?.menu
+	if (animMenu?.structure && Array.isArray(animMenu.structure)) {
+		animMenu.structure = animMenu.structure.filter((entry) => !registeredAnimationMenuEntries.includes(entry))
+	}
+	for (const entry of [...registeredMenuEntries, ...registeredAnimationMenuEntries]) {
 		try {
 			;(entry as { delete?: () => void })?.delete?.()
 		} catch (e) {
@@ -860,6 +964,7 @@ function unregisterContextMenuActions(): void {
 		}
 	}
 	registeredMenuEntries = []
+	registeredAnimationMenuEntries = []
 }
 
 // 別軸 B : Outliner 上で Group Property が 'enabled' の group を視覚的に区別する軽量マーカー。
@@ -1076,6 +1181,14 @@ function isSpringActive(entry: BoneEntry): boolean {
 	return entry.enabled
 }
 
+// bake 由来の派生 animation の判定 (= isBakedAnimation / isBakedAnimationContext) は
+// bakeTimeline.ts が持つ。 **物理の抑制判定を通す経路は 2 つあり、 どちらも
+// isBakedAnimationContext を使うこと** :
+//   - preview = tick 入口の hasActiveSpringEntry (= session ごと張らない)
+//   - export / bake = previewOps.resolveConfigs (= 全 entry を disabled に解決する)
+// resolveConfigs は preview / export 共用の effective writer なので、 そこに置けば
+// AJ export も同じ判定を通る (= exporter だけ見落として datapack で Δ が二重に乗る事故を防ぐ)。
+
 // active (= 実際に物理を掛ける) な entry が 1 つでもあるか。 tick() の
 // early-return 判定用。 registry.size は capable (= 'enabled' + 'disabled') の件数なので、
 // 全 entry が無効だと size > 0 のまま runtime が pose 全体を capture し、
@@ -1086,6 +1199,11 @@ function isSpringActive(entry: BoneEntry): boolean {
 // 読んではいけない (= animation 切替直後の初回 tick では旧 animation の解決結果が
 // 残っている)。 生の Group 状態と context の override から resolveEnabled で判定する。
 function hasActiveSpringEntry(context: PreviewAnimationContext): boolean {
+	// bake 由来の派生 animation には物理を **二重に** 掛けない (= keyframe 側に既に
+	// 焼き込まれている)。 判定は isBakedAnimationContext に集約し、 export 側
+	// (= previewOps.resolveConfigs) も同じ関数を通す。 animation 未選択で複数 animation を
+	// 再生している場合は stack 側にしか baked animation が現れないため、 context ごと渡す。
+	if (isBakedAnimationContext(context)) return false
 	const overrides = readOverrides(context.animation)
 	for (const [uuid, entry] of registry) {
 		if (resolveEnabled(getSpringBoneState(entry.group), overrides[uuid])) return true
@@ -1766,8 +1884,46 @@ function resetAllToRest(): void {
 // 判断」 だけを置く。 capturePose / restorePose / updateMatrixWorld / applyOnlyOrdered は
 // runtime.evaluateSample 内で順序保証されているため、 tick から直接呼ばない。
 
-// 選択中 animation (= selected があればそれだけ、 無ければ playing 群) を解決して
-// animationStack に確定させる。 stack の解決はこの関数 1 箇所だけ。
+// BB が今このフレームで再生する animation の集合。 Animator.preview の分岐をそのまま写す
+// (= animation_mode.js:352-397)。
+// - controller 再生中 : selected_state と last_state が参照する animation (= blend 中は両方)
+// - それ以外 : playing が truthy な animation 全部 (= `true` と `'locked'` の両方が該当)
+// **blend_value は再現しない** : applyPoseAt は stackAnimations を multiplier 無しで呼ぶため、
+// controller の blend 比率は反映されない (= 従来からの制約。 ここで直すのは「どれを積むか」 だけ)。
+function collectPlayingAnimations(all: any[]): any[] {
+	const state = (AnimationController as any)?.selected?.selected_state
+	if (!state) return all.filter((a: any) => a?.playing)
+	const controller = (AnimationController as any).selected
+	// **last_state は blend 中だけ積む** : BB も `blend_value < 1` の間しか last_state を
+	// stack しない (= animation_mode.js:362-363 / 380)。 無条件に含めると遷移完了後も
+	// 既に再生されていない animation が base pose に乗り、 その state が bake 由来だと
+	// isBakedAnimationContext が誤って物理を全停止する。 判定式は BB をそのまま写す。
+	const lastState = controller?.last_state
+	let blendingFromLastState = false
+	if (lastState) {
+		const stateTime = typeof state.getStateTime === 'function' ? state.getStateTime() : 0
+		const progress = lastState.blend_transition
+			? Math.min(1, Math.max(0, stateTime / lastState.blend_transition))
+			: 1
+		const blendValue = typeof lastState.calculateBlendValue === 'function'
+			? lastState.calculateBlendValue(progress)
+			: progress
+		blendingFromLastState = typeof blendValue === 'number' ? blendValue < 1 : progress < 1
+	}
+	const out: any[] = []
+	for (const source of [state, blendingFromLastState ? lastState : null]) {
+		const entries = source?.animations
+		if (!Array.isArray(entries)) continue
+		for (const entry of entries) {
+			const animation = all.find((a: any) => a?.uuid === entry?.animation)
+			if (animation && !out.includes(animation)) out.push(animation)
+		}
+	}
+	return out
+}
+
+// 選択中 animation (= 物理パラの解決対象) と、 BB が再生している animation 集合
+// (= animationStack) を確定させる。 stack の解決はこの関数 1 箇所だけ。
 function makePreviewAnimationContext(): PreviewAnimationContext {
 	// **削除済み animation は未選択として扱う** : Animation.remove() は
 	// Animator.animations.remove() → remove_animation dispatch → selected = null の順で
@@ -1778,9 +1934,16 @@ function makePreviewAnimationContext(): PreviewAnimationContext {
 	const all: any[] = Array.isArray((Animation as any)?.all) ? (Animation as any).all : []
 	const rawSelected = (Animation as any)?.selected
 	const animSelected = rawSelected && all.includes(rawSelected) ? rawSelected : null
-	const animationStack: any[] = animSelected
-		? [animSelected]
-		: all.filter((a: any) => a?.playing)
+	// **stack は BB が実際に再生する集合と一致させる** (= Animator.preview の分岐と同じ条件、
+	// animation_mode.js:352-397)。 選択中 animation だけに絞ると、 BB が同時に再生している
+	// 他の animation が base pose から抜け落ちる :
+	//   - `playing === 'locked'` の animation は選択切替でも再生され続ける
+	//     (= Animation.select は `playing == true` のものしか false に落とさない、 animation.js:215)
+	//   - Animation Controller 再生中は controller の state が再生対象を決める (= playing flag は立たない)
+	// stack がズレると base pose がズレ、 preview の物理も bake の収集値もズレる。 さらに
+	// bake 由来 animation の検出 (= isBakedAnimationContext) もこの stack を見るため、
+	// 抜けがあると物理が二重に載る経路が残る。
+	const animationStack: any[] = collectPlayingAnimations(all)
 	// rest window は「選択中 animation が 1 つに定まる」 経路でのみ載せる
 	// (= makePreviewRestWindow が null 選択で undefined を返す)。
 	return { animation: animSelected, animationStack, restWindow: makePreviewRestWindow(animSelected) }
@@ -1796,6 +1959,11 @@ const previewOps: SpringRuntimeOps<PreviewAnimationContext, AnimatorPoseSnapshot
 	resolveConfigs: (context) => {
 		// animation 単位の override を引き当てる。 key = bone (Group) の uuid。
 		const overrides = readOverrides(context.animation)
+		// bake 由来の派生 animation は物理を全面停止する (= 二重適用の防止)。 preview は
+		// tick 入口の hasActiveSpringEntry で既に止まるが、 **export 経路はここだけが
+		// 通り道** なので、 同じ判定関数をこの effective writer にも通す
+		// (= stack 側だけに baked animation がある複数再生も同じ 1 関数で拾う)。
+		const suppressed = isBakedAnimationContext(context)
 		for (const [uuid, entry] of registry) {
 			// effective (= entry.enabled / entry.config) の唯一の writer。
 			// 合成は resolveEffective に委譲 (= override → base (= Group 既定値) →
@@ -1808,7 +1976,7 @@ const previewOps: SpringRuntimeOps<PreviewAnimationContext, AnimatorPoseSnapshot
 			// 無駄で、 除外前提の pose と食い違う)。 判定を resolveConfigs の中に置くのは
 			// **effective の writer を 1 箇所に保つため** (= isSpringActive 側で再解決すると
 			// 判定元が分裂する)。 preview 経路は excludedNodeUuids が undefined なので不変。
-			entry.enabled = eff.enabled && !(context.excludedNodeUuids?.has(uuid) ?? false)
+			entry.enabled = eff.enabled && !suppressed && !(context.excludedNodeUuids?.has(uuid) ?? false)
 			entry.config.drag = eff.drag
 			entry.config.stiffness = eff.stiffness
 			entry.config.gravity = eff.gravity
@@ -2160,7 +2328,22 @@ const exportDriverHost: ExportDriverHost<PreviewAnimationContext> = {
 	// capable な bone が 1 つも無い project では export に一切介入しない : 介入すると
 	// frame ごとに pose の capture / restore と 3 sub-step 分の base pose 再評価が乗り、
 	// 物理を掛ける対象がゼロのまま export だけが重くなる。
-	isEnabled: () => ENABLE_AJ_EXPORT && registry.size > 0,
+	//
+	// **runtime を他が握っている間の export は throw して止める** : runtime / exportGate は
+	// preview・export・bake で共用する singleton なので、 bake 中 (= stackAnimations 内の同期
+	// event 等から) export が始まると、 export 側が同じ gate を取って runtime.beginAnimation で
+	// bake の session を上書きし、 さらに bake 側の resume が export 中の gate まで解除してしまう。
+	// **false を返して黙って見送らない** : それだと物理の載っていない datapack がそのまま
+	// 出力される (= makeExportContext の契約違反時と同じ方針で、 気付ける形で止める)。
+	isEnabled: () => {
+		if (!ENABLE_AJ_EXPORT || registry.size === 0) return false
+		if (runtimeOwner !== 'none' || exportGate.isExportActive || runtime.isEvaluating) {
+			throw new Error(
+				`[${PLUGIN_ID}] spring runtime is busy (owner=${runtimeOwner}, exportActive=${exportGate.isExportActive}, evaluating=${runtime.isEvaluating}); aborting export instead of producing a datapack without spring physics`,
+			)
+		}
+		return true
+	},
 }
 
 // driver を AJ の render hook registry (= window.AnimatedJava.renderHooks) へ登録する。
@@ -2179,6 +2362,489 @@ function installAjExportDriver(): () => void {
 		warn: (message, e) => { console.warn(message, e) },
 	})
 	return (): void => { registrar.dispose() }
+}
+
+// --- spring bake (= 派生 animation への焼き込み) ---
+// 物理を replay して bone ごとの bezier keyframe を作る純粋部分は bakeTimeline.ts が持つ。
+// ここには「scene 側の作用を ops へ繋ぐ」 「派生 animation を BB へ登録する」 だけを置く。
+//
+// **元 animation は一切変更しない** : 出力は必ず新しい Animation instance で、
+// unbake = その派生 animation を削除するだけ (= Undo でも消える)。
+
+const RAD2DEG = 180 / Math.PI
+
+// runtime / exportGate (= preview・export・bake で共用する singleton) を今どの処理が
+// 握っているか。 現状は bake だけが明示的に所有権を取る (= export 側は exportGate の
+// isExportActive が実質の所有印)。 export driver の isEnabled がこれを見て、 bake 中に
+// 始まった export を弾く (= 互いの session と gate を上書きし合うのを防ぐ)。
+let runtimeOwner: 'none' | 'bake' = 'none'
+
+// bake の除外 node 集合 (= 常に空)。 AJ export の excluded_nodes 相当の口だが、 bake は
+// editor 上の全 spring bone を対象にするため空集合を渡す。
+const BAKE_EXCLUDED_NODES: ReadonlySet<string> = new Set<string>()
+
+// 全 node の mesh.rotation.order の出所 (= group.js:627 が Format.euler_order を代入)。
+// 誤差評価で Euler → quaternion に戻す時、 ここが食い違うと別の姿勢を測ることになる。
+function resolveEulerOrder(): string {
+	const order = (Format as { euler_order?: unknown } | undefined)?.euler_order
+	return typeof order === 'string' && /^[XYZ]{3}$/.test(order) ? order : 'ZYX'
+}
+
+// curveFit へ注入する quaternion 演算。 角度差は符号違いの同一姿勢を同一視する
+// (= dot の絶対値)。 **戻り値は毎回新しい instance にする** : fitSharedKnots が
+// 全 frame の真値 quaternion を保持するため、 使い回すと全部同じ値になる。
+function makeBakeQuaternionOps(): QuaternionOps<any> {
+	const order = resolveEulerOrder()
+	const euler = new THREE.Euler(0, 0, 0, order)
+	return {
+		quaternionFromEuler(x: number, y: number, z: number): any {
+			euler.set(x, y, z, order)
+			return new THREE.Quaternion().setFromEuler(euler)
+		},
+		quatAngleDeg(a: any, b: any): number {
+			const dot = Math.abs(a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w)
+			return 2 * Math.acos(Math.min(1, dot)) * RAD2DEG
+		},
+	}
+}
+
+// bone の rest 回転 (= BB の fix_rotation) を degrees で読む。
+// **BB の keyframe 適用は「componentwise な Euler の加算」** (= timeline_animators.js:387-389
+// `bone.rotation.x += degToRad(value)`、 その手前で showDefaultPose が
+// `bone.rotation.copy(bone.fix_rotation)` する = animation_mode.js:103) なので、
+//     mesh.rotation = fix_rotation + degToRad(keyframe 値)
+// が再生時の関係。 したがって keyframe 値 = 合成後の絶対 Euler − fix_rotation になる。
+// fix_rotation が無い mesh は 0 (= rest 無し) 扱い。
+function readRestRotationDeg(group: any): AxisTriple {
+	const fix = group?.mesh?.fix_rotation
+	const read = (axis: 'x' | 'y' | 'z'): number => {
+		const raw = fix?.[axis]
+		return typeof raw === 'number' && Number.isFinite(raw) ? raw * RAD2DEG : 0
+	}
+	return { x: read('x'), y: read('y'), z: read('z') }
+}
+
+// 物理適用後の **絶対** Euler (= degrees) を読む。 rest 差分への変換は bakeTimeline 側
+// (= フィッティングと連続化は絶対 Euler の空間で行う必要があるため。 rest を引いた
+// 空間では「双対解」 の関係式も geodesic 誤差も成立しない)。
+// composeSpringPose は mesh.quaternion を書くが、 Three.js の Object3D は quaternion の
+// onChange で rotation を同期するため、 ここは常に最新の合成結果になる。
+function readAbsoluteRotationDeg(uuid: string): AxisTriple | null {
+	const rotation = registry.get(uuid)?.group?.mesh?.rotation
+	if (!rotation) return null
+	return {
+		x: rotation.x * RAD2DEG,
+		y: rotation.y * RAD2DEG,
+		z: rotation.z * RAD2DEG,
+	}
+}
+
+// bakeTimeline の scene ops を BB / runtime へ繋ぐ。
+function makeBakeSceneOps(context: PreviewAnimationContext): BakeSceneOps {
+	return {
+		beginSession(): void {
+			// resolveConfigs (= effective の解決) はここで走る。 listTargets はその後に呼ばれる。
+			runtime.beginAnimation(context, applyPoseAt)
+		},
+		listTargets(): readonly BakeTarget[] {
+			const targets: BakeTarget[] = []
+			for (const uuid of topoOrder) {
+				const entry = registry.get(uuid)
+				if (!entry || !isSpringActive(entry) || !entry.group?.mesh) continue
+				targets.push({
+					uuid,
+					name: typeof entry.group.name === 'string' ? entry.group.name : uuid,
+					restRotationDeg: readRestRotationDeg(entry.group),
+				})
+			}
+			return targets
+		},
+		evaluateFrame(frameIndex: number): void {
+			const stepIndex = stepIndexFromFrame(frameIndex)
+			// **base pose を先に当てる** : runtime.evaluateStepIndex は冒頭で現在の scene pose を
+			// capture し、 sub-step 後にそこへ復元してから Δ を載せ直す。 当てておかないと
+			// 「前 frame の pose に今 frame の Δ」 という混ざった姿勢を読むことになる
+			// (= AJ export では AJ 側が frame の base pose を当ててから onPose を呼ぶ。 その手順を
+			// bake でも再現する)。 時刻は step 番号から逆写像して浮動小数の累積を避ける。
+			applyPoseAt(stepIndexToTime(stepIndex), context)
+			runtime.evaluateStepIndex(stepIndex)
+		},
+		readRotationDeg(uuid: string): AxisTriple | null {
+			return readAbsoluteRotationDeg(uuid)
+		},
+		endSession(): void {
+			runtime.endAnimation()
+		},
+	}
+}
+
+// bake が扱えない「元 animation の非既定な状態」 の検査。 該当したら **bake を拒否する**
+// (= 仮機能スコープなので、 中途半端に写すより止める)。
+//
+// 共通する構造は「stackAnimations の pose 評価には効くが、 派生 animation には正しく写らない
+// 状態」。 焼き込んだ rotation にはその効果が **既に入っている** のに、 複製した data 側にも
+// 同じ状態が残る (= blend_weight) か、 逆に落ちる (= muted) ため、 再生結果が食い違う。
+
+// blend_weight は Molang 文字列 Property (= animation.js:775、 既定 '')。
+// BB は `animation.blend_weight ? parse(...) : 1` で multiplier にする (= animation_mode.js:329)
+// ため、 falsy か定数 1 なら「掛からない」 = 既定と等価。 動的な Molang 式は値が読めないので
+// 一律拒否する。
+function isDefaultBlendWeight(raw: unknown): boolean {
+	if (!raw) return true
+	const text = typeof raw === 'number' ? String(raw) : typeof raw === 'string' ? raw.trim() : null
+	if (text === null) return false
+	if (text.length === 0) return true
+	return /^\+?1(\.0*)?$/.test(text)
+}
+
+// transform channel (= rotation / position / scale) を mute している animator の名前を返す。
+// mute は stackAnimations の pose 評価に効く (= timeline_animators.js:594-596) が、
+// getUndoCopy には含まれないため派生側では全 channel が unmute になる。 親 bone の rotation を
+// mute した状態で bake すると、 収集時は親回転が無い pose なのに派生再生では復活し、
+// 子 spring bone の world pose が変わる。
+const BAKE_TRANSFORM_CHANNELS = ['rotation', 'position', 'scale'] as const
+function findMutedTransformAnimator(animation: any): string | null {
+	const animators = animation?.animators
+	if (!animators || typeof animators !== 'object') return null
+	for (const key of Object.keys(animators)) {
+		const animator = (animators as Record<string, any>)[key]
+		const muted = animator?.muted
+		if (!muted || typeof muted !== 'object') continue
+		for (const channel of BAKE_TRANSFORM_CHANNELS) {
+			if (muted[channel]) {
+				return typeof animator.name === 'string' && animator.name.length > 0 ? animator.name : key
+			}
+		}
+	}
+	return null
+}
+
+// bake 中だけ effect channel (= particle / sound / timeline script) を止める。 戻り値は復元関数。
+//
+// **なぜ必要か** : base pose の評価は Animator.stackAnimations を通り、 その末尾で
+// `animation.animators.effects.displayFrame(in_loop)` が走る (= animation_mode.js:344-350)。
+// これは transform とは無関係に particle emitter の生成 / jumpTo (= timeline_animators.js:1046-1092)
+// と timeline script の Molang 実行 (= 同 :1095-1102) を行う。 preview は 1 frame ずつなので実害が
+// 小さいが、 bake は全 frame × sub-step を一気に replay するため桁が違う (= 10 秒の animation で
+// 600 sub-step ぶんの emitter 発火と script 実行が一瞬で走る)。
+//
+// **channel 名はハードコードしない** : AnimatedJava fork は EffectAnimator に `variant`
+// channel を足し、 displayFrame を差し替えて `muted.variant` が false なら
+// `result?.variant?.select()` を実行する (= animated-java/src/mods/customKeyframes.ts:216-249)。
+// 標準 3 channel (= particle / sound / timeline) だけを mute すると、 bake の全 frame で
+// variant 切替が走り、 未選択 animation を bake した場合に選択中 variant が元へ戻らない。
+// `muted` に **実在する key を全部** 立てる形にすれば、 fork が channel を増やしても追随する。
+//
+// **transform だけを評価する経路は BB に無い** : 公開されているのは stackAnimations /
+// Animator.preview だけで、 どちらも effects を含む。 bone loop を自前で書き写す手はあるが
+// (= Animation.sampleIK が部分的にやっている、 animation.js:170-194)、 blend_weight / pre_rotation /
+// Outliner.elements の animator 等の扱いまで複製することになり、 **bake と preview / export の
+// pose 評価が別実装に分裂する** (= 物理の正しさが評価経路の一致に依存しているので、 分裂させると
+// 「preview では合うが bake ではズレる」 を作り込む)。 そこで評価経路は stackAnimations のまま、
+// BB 自身の mute 機構で effect 側だけを止める。
+// last_displayed_time は mute に関係なく毎回上書きされる (= 同 :1104) ので、 これも復元する。
+function suppressEffectAnimator(animation: any): () => void {
+	const effects = animation?.animators?.effects
+	const muted = effects?.muted
+	if (!effects || typeof muted !== 'object' || muted === null) return (): void => {}
+	const savedMuted = { ...muted }
+	const savedLastDisplayedTime = effects.last_displayed_time
+	for (const channel of Object.keys(muted)) {
+		;(muted as Record<string, unknown>)[channel] = true
+	}
+	return (): void => {
+		try {
+			Object.assign(muted, savedMuted)
+			effects.last_displayed_time = savedLastDisplayedTime
+		} catch (e) {
+			console.warn(`[${PLUGIN_ID}] failed to restore effect animator state`, e)
+		}
+	}
+}
+
+// bake の結果 / 中断理由をユーザーへ伝える。 showMessageBox が使えない環境
+// (= 旧 BB / テスト) では console へ落とす。
+function showBakeMessage(title: string, message: string): void {
+	try {
+		if (typeof Blockbench.showMessageBox === 'function') {
+			Blockbench.showMessageBox({ title, message, icon: 'gesture', buttons: ['dialog.ok'] })
+			return
+		}
+	} catch (e) {
+		console.warn(`[${PLUGIN_ID}] showMessageBox failed`, e)
+	}
+	console.log(`[${PLUGIN_ID}] ${title}: ${message}`)
+}
+
+// bake 時の物理入力の snapshot (= param hash の元)。 uuid 昇順に並べて key 順依存を消す。
+// 物理パラは effective (= entry.config、 bake session の resolveConfigs が解決した値) を読む
+// ため、 animation 単位 override の反映後の値になる。
+function collectBakeParamSnapshot(animation: unknown): unknown {
+	const uuids = Array.from(registry.keys()).sort()
+	const bones = uuids.map((uuid) => {
+		const entry = registry.get(uuid)!
+		const dir = entry.geometry.restLocalDir
+		return {
+			uuid,
+			state: getSpringBoneState(entry.group),
+			parent: entry.parentUuid ?? null,
+			enabled: entry.enabled,
+			drag: entry.config.drag,
+			stiffness: entry.config.stiffness,
+			gravity: entry.config.gravity,
+			restLength: entry.config.restLength,
+			dir: [dir?.x ?? 0, dir?.y ?? 0, dir?.z ?? 0],
+		}
+	})
+	return {
+		bones,
+		overrides: overridesFingerprint(readOverrides(animation), uuids),
+		restFadeFrames: readRestFadeFrames(animation),
+	}
+}
+
+// bake 本体。 対象 animation の物理を replay して派生 animation を作る。
+function runSpringBake(animation: any): void {
+	const AnimationCtor = Animation as unknown as (new (data: unknown) => any) | undefined
+	if (typeof AnimationCtor !== 'function') {
+		showBakeMessage('Spring bake', 'Animation class is not available')
+		return
+	}
+	if (!animation) return
+	// **animate モード限定** : bake は applyPoseAt (= showDefaultPose + stackAnimations) で
+	// scene を frame ごとに書き換える。 edit モードで走らせると編集中の pose を壊したまま、
+	// 後始末の Animator.preview も (edit モードでは呼べないため) 効かない。
+	if (!Modes?.animate) {
+		showBakeMessage('Spring bake', 'animate モードで実行してください')
+		return
+	}
+	// export 中 / 評価中 / 別の bake 実行中は runtime (= 共用の singleton) を横取りしない。
+	if (runtimeOwner !== 'none' || exportGate.isExportActive || runtime.isEvaluating) {
+		showBakeMessage('Spring bake', 'AnimatedJava の export / 別の bake の実行中は bake できません')
+		return
+	}
+	if (isBakedAnimation(animation)) {
+		showBakeMessage('Spring bake', 'この animation は既に bake 済みの派生 animation です')
+		return
+	}
+	// **blend_weight が既定でない animation は拒否する** : 収集した rotation には
+	// blend_weight が既に掛かっている一方、 複製した data 側にも blend_weight が残るため
+	// 再生時に二重に掛かる (= 20° × 0.5 で焼いた 10° が、 再生では 5° になる)。
+	// 派生側から消すだけでは、 未 bake のまま複製する position / scale の意味が変わる
+	// (= そちらには掛かるべき) ので、 仮機能スコープでは bake ごと止める。
+	if (!isDefaultBlendWeight(animation.blend_weight)) {
+		showBakeMessage(
+			'Spring bake',
+			`blend_weight が既定ではありません ("${String(animation.blend_weight)}")。\n` +
+			'bake した rotation に blend_weight が二重に掛かるため、 この animation は bake できません。',
+		)
+		return
+	}
+	// **transform channel を mute した animator がある animation も拒否する** :
+	// mute は pose 評価に効くが派生側には写らないため、 再生で mute した channel が復活する。
+	const mutedAnimator = findMutedTransformAnimator(animation)
+	if (mutedAnimator !== null) {
+		showBakeMessage(
+			'Spring bake',
+			`animator "${mutedAnimator}" の transform channel が mute されています。\n` +
+			'mute は派生 animation に引き継げないため、 解除してから bake してください。',
+		)
+		return
+	}
+	// 直前の rig 編集 / Property 変更を取り込んでから走らせる (= registry と topoOrder の最新化)。
+	try {
+		rescanRegistry()
+	} catch (e) {
+		console.warn(`[${PLUGIN_ID}] rescanRegistry failed before bake`, e)
+	}
+	// frame 数は export と同じ数え方 (= 0.05 秒刻みで length 以下の sample 数)。
+	const frameCount = renderSampleCountCache.get(animation, animation.length)
+	if (frameCount === null || frameCount < 1) {
+		showBakeMessage('Spring bake', `animation の長さ (${String(animation.length)}) から frame 数を決められません`)
+		return
+	}
+	const context = makeExportAnimationContext(animation, BAKE_EXCLUDED_NODES, makePreviewRestWindow(animation))
+
+	let result: BakeResult | null = null
+	let paramHash = ''
+	// 後始末の対象。 **取得前に例外が出ても finally が扱えるよう null 始まりにする**。
+	let restoreEffects: (() => void) | null = null
+	let poseSnapshot: AnimatorPoseSnapshot | null = null
+	// **所有権を先に取る** : この後 stackAnimations 内の同期 event 等から export が始まっても、
+	// export driver の isEnabled がこれを見て弾く (= 互いの session / gate の上書きを防ぐ)。
+	// **所有権を取った直後から try/finally で囲む** : 準備段階 (= suspend / mute / capturePose) で
+	// 例外が出ると、 gate と所有権を握ったまま抜けて preview / export / bake が全部止まる
+	// (= plugin reload しないと戻らない)。
+	runtimeOwner = 'bake'
+	try {
+		// export driver と同じ順序で preview を明け渡す (= session を畳んでから tick を止める)。
+		invalidatePreviewSession()
+		exportGate.suspend()
+		// 全 frame 分の particle 発火 / timeline script 実行を止める (= transform だけが要る)。
+		restoreEffects = suppressEffectAnimator(animation)
+		// **bake 前の scene pose を退避する** : 評価後の scene は最後の bake frame の姿勢のままで、
+		// 復帰を requestAnimatorPreview (= 失敗を warn に落とす) だけに任せると、 そこで例外が出た
+		// 場合に playhead の姿勢へ戻らない。 runtime へ渡している ops と同じ capture / restore を
+		// 使って、 finally で無条件に書き戻す。
+		poseSnapshot = previewOps.capturePose()
+		result = bakeSpringRotations(makeBakeSceneOps(context), {
+			frameCount,
+			...makeBakeQuaternionOps(),
+		})
+		// **param hash は finally より前に取る** : entry.config は bake session の
+		// resolveConfigs が解決した値を保持しているが、 finally の requestAnimatorPreview →
+		// Animator.preview() は **同期的に** display_animation_frame を発火し、 その listener
+		// 経由で tick() → beginAnimation → resolveConfigs が走って entry.config を
+		// 「選択中 animation の解決結果」 で上書きする。 右クリック対象と選択中 animation が
+		// 違うと、 finally の後に読んだ値は別 animation のものになる。
+		paramHash = hashFingerprint(collectBakeParamSnapshot(animation))
+	} catch (e) {
+		console.warn(`[${PLUGIN_ID}] bake failed`, e)
+		showBakeMessage('Spring bake', `bake に失敗しました : ${String(e)}`)
+		return
+	} finally {
+		// **各復元は個別 try** : 1 つの失敗で残りの後始末を巻き込まない。
+		// **effect の mute を先に戻す** : この後の Animator.preview が現時刻の emitter を
+		// 張り直すため、 mute が残っていると bake 後に particle が出なくなる。
+		try {
+			restoreEffects?.()
+		} catch (e) {
+			console.warn(`[${PLUGIN_ID}] failed to restore effect animator state`, e)
+		}
+		// bake 前の pose へ書き戻す (= 以降の再描画が失敗しても最後の bake frame の姿勢が残らない)。
+		try {
+			if (poseSnapshot !== null) {
+				previewOps.restorePose(poseSnapshot)
+				previewOps.updateMatrixWorld()
+			}
+		} catch (e) {
+			console.warn(`[${PLUGIN_ID}] failed to restore the scene pose after bake`, e)
+		}
+		// suspend の逆順で戻す。 resume で export 中に skip した rescan 予約も取り戻る。
+		try {
+			exportGate.resume()
+		} catch (e) {
+			console.warn(`[${PLUGIN_ID}] exportGate.resume failed after bake`, e)
+		}
+		// bake が張った runtime session を畳み、 現在時刻の pose を editor へ描き直す。
+		try {
+			invalidatePreviewSession()
+		} catch (e) {
+			console.warn(`[${PLUGIN_ID}] invalidatePreviewSession failed after bake`, e)
+		}
+		// **所有権は preview を戻す前に解放する** : requestAnimatorPreview は同期的に
+		// tick 経路まで走らせるため、 握ったままだと以降の判定が bake 中扱いのままになる。
+		runtimeOwner = 'none'
+		requestAnimatorPreview('spring bake')
+	}
+	if (result === null || result.bones.length === 0) {
+		showBakeMessage('Spring bake', 'この animation で有効な spring bone がありません')
+		return
+	}
+	let sourceData: any
+	try {
+		sourceData = animation.getUndoCopy({})
+	} catch (e) {
+		console.warn(`[${PLUGIN_ID}] getUndoCopy failed`, e)
+		showBakeMessage('Spring bake', `元 animation を複製できませんでした : ${String(e)}`)
+		return
+	}
+	const sourceHash = hashFingerprint(sourceData?.animators ?? null)
+	const bakedData = applyBakedCurvesToAnimationData(sourceData, result.bones)
+	// uuid は必ず新規に振らせる (= Animation constructor が guid を作り、 extend は uuid を
+	// merge しない。 明示的に落として「複製元の uuid が紛れ込まない」 ことを保証する)。
+	delete bakedData.uuid
+	const baseName = typeof animation.name === 'string' && animation.name.length > 0 ? animation.name : 'animation'
+	bakedData.name = `${baseName}_baked`
+
+	let baked: any
+	try {
+		Undo?.initEdit?.({ animations: [] })
+		baked = new AnimationCtor(bakedData)
+		// **bake 由来である印**。 これが空だと isBakedAnimation が false になり、 派生
+		// animation の再生 / export で物理が二重に載る。 uuid が取れない異常時も空にしない。
+		baked[ANIM_BAKED_FROM_KEY] = (typeof animation.uuid === 'string' && animation.uuid) || 'unknown'
+		baked[ANIM_BAKED_PARAM_HASH_KEY] = paramHash
+		baked[ANIM_BAKED_SOURCE_HASH_KEY] = sourceHash
+		baked[ANIM_BAKED_VERSION_KEY] = BAKE_VERSION
+		// **BB 標準の複製処理と同じ後始末を通す** (= SharedActions 'duplicate'、 animation.js:846-856) :
+		// - resetUniqueValues = 複製してはいけない Property (= copy_value false) を既定へ戻す
+		// - saved = false = 未保存であることを明示する。 getUndoCopy は `saved` を含まないが、
+		//   Property 経由で複製される値もあるうえ、 Undo の before aspects が `{animations: []}` の
+		//   ため BB の finished_edit listener もこの新規 animation を dirty にしてくれない。
+		//   保存済み扱いのまま残ると、 外部 animation file の再読み込みで「保存済みの同一 path」
+		//   として削除されうる
+		try {
+			;(Property as { resetUniqueValues?: (type: unknown, instance: unknown) => void })
+				?.resetUniqueValues?.(Animation, baked)
+		} catch (e) {
+			console.warn(`[${PLUGIN_ID}] Property.resetUniqueValues failed`, e)
+		}
+		// **`path` は resetUniqueValues では消えない** : BB の `Animation.properties.path`
+		// (= animation.js:771) に `copy_value: false` が付いていないため、 resetUniqueValues
+		// (= property.ts:238-245 が `copy_value == false` の Property だけを reset する) の
+		// 対象外になる。 getUndoCopy で複製された元 animation の path が残ると、 外部 animation
+		// file の保存 / 削除で同一 file として扱われるので、 ここで明示的に空へ倒す。
+		baked.path = ''
+		baked.saved = false
+		// add(false) = Animator.animations へ追加 + createUniqueName (= 名前衝突の解決)。
+		// select はしない (= 選択中 animation を勝手に切り替えない)。
+		baked.add(false)
+		Undo?.finishEdit?.('Spring bake', { animations: [baked] })
+	} catch (e) {
+		console.warn(`[${PLUGIN_ID}] failed to register baked animation`, e)
+		// **部分生成物は自前で片付ける** : initEdit の aspects は `{animations: []}` なので、
+		// cancelEdit(true) の revert 経路 (= undo.js:143-151 → loadSave) では追加済み
+		// animation が消えない (= before / after どちらの save にも載っていないため、
+		// undo.js:715-722 の「reference にあって save に無い animation を remove」 に
+		// 引っかからない)。 先に自分で remove してから transaction を畳む。
+		try {
+			if (baked && typeof baked.remove === 'function') baked.remove(false, false)
+		} catch (removeError) {
+			console.warn(`[${PLUGIN_ID}] failed to roll back baked animation`, removeError)
+		}
+		try {
+			// revert_changes は付けない (= 上記のとおり空 aspects では効かず、
+			// Canvas.outlines を空にする副作用だけが残るため)。 目的は current_save を
+			// 畳んで次の Undo transaction を汚さないこと。
+			Undo?.cancelEdit?.()
+		} catch (cancelError) {
+			console.warn(`[${PLUGIN_ID}] Undo.cancelEdit failed`, cancelError)
+		}
+		showBakeMessage('Spring bake', `派生 animation を作成できませんでした : ${String(e)}`)
+		return
+	}
+
+	const summary =
+		`"${baked.name}" を作成しました\n` +
+		`bone ${result.bones.length} 本 / keyframe ${result.totalKeyframes} 個 ` +
+		`(最大 ${result.maxKeyframesPerSecond.toFixed(1)} kf/秒)\n` +
+		`姿勢誤差 最大 ${result.maxAngleDeg.toFixed(3)}°`
+	console.log(`[${PLUGIN_ID}] bake done : ${summary.replace(/\n/g, ' / ')}`)
+	// **どの警告でも bake は拒否しない** : 出来上がった animation はそのまま残し、
+	// 「そのまま使うと困りうる点」 だけを伝える。 複数該当しても dialog は 1 回にまとめる。
+	const warnings: string[] = []
+	if (result.maxKeyframesPerSecond > BAKE_DENSITY_WARN_KF_PER_SECOND) {
+		warnings.push(
+			`keyframe 密度が ${BAKE_DENSITY_WARN_KF_PER_SECOND} kf/秒 を超えています。` +
+			'手編集には向かない密度です (= 揺れが速いほど keyframe が増えます)。',
+		)
+	}
+	// 分割の打ち切り / 分割不能で要求精度に届かなかった bone (= 密度とは別軸の警告)。
+	if (result.unconvergedBones.length > 0) {
+		warnings.push(
+			`次の bone は目標の姿勢誤差に届きませんでした : ${result.unconvergedBones.join(', ')}\n` +
+			'物理の動きが速すぎて 20fps の keyframe では表現しきれていない可能性があります。',
+		)
+	}
+	if (warnings.length > 0) {
+		showBakeMessage('Spring bake', `${summary}\n\n${warnings.join('\n\n')}`)
+	}
+	try {
+		updateSelection()
+	} catch (e) {
+		console.warn(`[${PLUGIN_ID}] updateSelection failed after bake`, e)
+	}
 }
 
 Plugin.register(PLUGIN_ID, {
@@ -2213,6 +2879,9 @@ Plugin.register(PLUGIN_ID, {
 		// gesture (= 唯一の truth) は Group Property `spring_bone_enabled` の書き換えで、
 		// 名前は一切変更しない。
 		registerContextMenuActions()
+		// Animation 右クリ menu に bake action を追加 (= 物理を派生 animation へ焼き込む)。
+		// cleanup は unregisterContextMenuActions 側でまとめて行う。
+		registerBakeAction()
 		// Outliner 上で Property が 'enabled' の spring group を視覚的に区別する軽量マーカーを install。
 		cleanups.push(registerOutlinerMarker())
 		// AnimatedJava の datapack export へ物理を注入する driver を登録する。 AJ 不在でも
