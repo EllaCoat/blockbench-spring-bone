@@ -84,6 +84,9 @@ declare const Animator: {
 	preview?(): void
 }
 declare const Animation: { selected?: any; all?: any[] } | undefined
+// BB の Animation Controller。 controller 再生中は playing flag ではなく controller の
+// state が「今再生されている animation」 を決める (= animation_mode.js:357-394)。
+declare const AnimationController: { selected?: any } | undefined
 declare const Modes: { animate?: boolean; edit?: boolean } | undefined
 // BB の現行 format。 bake は `euler_order` (= 全 node の mesh.rotation.order の出所、
 // group.js:627) だけを読む。 未定義時は BB core の既定値 'ZYX' へ倒す (= format.ts:704)。
@@ -1881,8 +1884,30 @@ function resetAllToRest(): void {
 // 判断」 だけを置く。 capturePose / restorePose / updateMatrixWorld / applyOnlyOrdered は
 // runtime.evaluateSample 内で順序保証されているため、 tick から直接呼ばない。
 
-// 選択中 animation (= selected があればそれだけ、 無ければ playing 群) を解決して
-// animationStack に確定させる。 stack の解決はこの関数 1 箇所だけ。
+// BB が今このフレームで再生する animation の集合。 Animator.preview の分岐をそのまま写す
+// (= animation_mode.js:352-397)。
+// - controller 再生中 : selected_state と last_state が参照する animation (= blend 中は両方)
+// - それ以外 : playing が truthy な animation 全部 (= `true` と `'locked'` の両方が該当)
+// **blend_value は再現しない** : applyPoseAt は stackAnimations を multiplier 無しで呼ぶため、
+// controller の blend 比率は反映されない (= 従来からの制約。 ここで直すのは「どれを積むか」 だけ)。
+function collectPlayingAnimations(all: any[]): any[] {
+	const state = (AnimationController as any)?.selected?.selected_state
+	if (!state) return all.filter((a: any) => a?.playing)
+	const controller = (AnimationController as any).selected
+	const out: any[] = []
+	for (const source of [state, controller?.last_state]) {
+		const entries = source?.animations
+		if (!Array.isArray(entries)) continue
+		for (const entry of entries) {
+			const animation = all.find((a: any) => a?.uuid === entry?.animation)
+			if (animation && !out.includes(animation)) out.push(animation)
+		}
+	}
+	return out
+}
+
+// 選択中 animation (= 物理パラの解決対象) と、 BB が再生している animation 集合
+// (= animationStack) を確定させる。 stack の解決はこの関数 1 箇所だけ。
 function makePreviewAnimationContext(): PreviewAnimationContext {
 	// **削除済み animation は未選択として扱う** : Animation.remove() は
 	// Animator.animations.remove() → remove_animation dispatch → selected = null の順で
@@ -1893,9 +1918,16 @@ function makePreviewAnimationContext(): PreviewAnimationContext {
 	const all: any[] = Array.isArray((Animation as any)?.all) ? (Animation as any).all : []
 	const rawSelected = (Animation as any)?.selected
 	const animSelected = rawSelected && all.includes(rawSelected) ? rawSelected : null
-	const animationStack: any[] = animSelected
-		? [animSelected]
-		: all.filter((a: any) => a?.playing)
+	// **stack は BB が実際に再生する集合と一致させる** (= Animator.preview の分岐と同じ条件、
+	// animation_mode.js:352-397)。 選択中 animation だけに絞ると、 BB が同時に再生している
+	// 他の animation が base pose から抜け落ちる :
+	//   - `playing === 'locked'` の animation は選択切替でも再生され続ける
+	//     (= Animation.select は `playing == true` のものしか false に落とさない、 animation.js:215)
+	//   - Animation Controller 再生中は controller の state が再生対象を決める (= playing flag は立たない)
+	// stack がズレると base pose がズレ、 preview の物理も bake の収集値もズレる。 さらに
+	// bake 由来 animation の検出 (= isBakedAnimationContext) もこの stack を見るため、
+	// 抜けがあると物理が二重に載る経路が残る。
+	const animationStack: any[] = collectPlayingAnimations(all)
 	// rest window は「選択中 animation が 1 つに定まる」 経路でのみ載せる
 	// (= makePreviewRestWindow が null 選択で undefined を返す)。
 	return { animation: animSelected, animationStack, restWindow: makePreviewRestWindow(animSelected) }
@@ -2627,6 +2659,11 @@ function runSpringBake(animation: any): void {
 	exportGate.suspend()
 	// 全 frame 分の particle 発火 / timeline script 実行を止める (= transform だけが要る)。
 	const restoreEffects = suppressEffectAnimator(animation)
+	// **bake 前の scene pose を退避する** : 評価後の scene は最後の bake frame の姿勢のままで、
+	// 復帰を requestAnimatorPreview (= 失敗を warn に落とす) だけに任せると、 そこで例外が出た
+	// 場合に playhead の姿勢へ戻らない。 runtime へ渡している ops と同じ capture / restore を
+	// 使って、 finally で無条件に書き戻す。
+	const poseSnapshot = previewOps.capturePose()
 	try {
 		result = bakeSpringRotations(makeBakeSceneOps(context), {
 			frameCount,
@@ -2647,6 +2684,14 @@ function runSpringBake(animation: any): void {
 		// **effect の mute を先に戻す** : この後の Animator.preview が現時刻の emitter を
 		// 張り直すため、 mute が残っていると bake 後に particle が出なくなる。
 		restoreEffects()
+		// bake 前の pose へ書き戻す (= 以降の再描画が失敗しても最後の bake frame の姿勢が残らない)。
+		// **復元が失敗しても後続の後始末は続ける**。
+		try {
+			previewOps.restorePose(poseSnapshot)
+			previewOps.updateMatrixWorld()
+		} catch (e) {
+			console.warn(`[${PLUGIN_ID}] failed to restore the scene pose after bake`, e)
+		}
 		// suspend の逆順で戻す。 resume で export 中に skip した rescan 予約も取り戻る。
 		exportGate.resume()
 		// bake が張った runtime session を畳み、 現在時刻の pose を editor へ描き直す。
@@ -2686,6 +2731,21 @@ function runSpringBake(animation: any): void {
 		baked[ANIM_BAKED_PARAM_HASH_KEY] = paramHash
 		baked[ANIM_BAKED_SOURCE_HASH_KEY] = sourceHash
 		baked[ANIM_BAKED_VERSION_KEY] = BAKE_VERSION
+		// **BB 標準の複製処理と同じ後始末を通す** (= SharedActions 'duplicate'、 animation.js:846-856) :
+		// - resetUniqueValues = 複製してはいけない Property (= copy_value false、 animation file の
+		//   `path` 等) を既定へ戻す。 これをしないと元 animation と同じ file を指したままになる
+		// - saved = false = 未保存であることを明示する。 getUndoCopy は `saved` を含まないが、
+		//   Property 経由で複製される値もあるうえ、 Undo の before aspects が `{animations: []}` の
+		//   ため BB の finished_edit listener もこの新規 animation を dirty にしてくれない。
+		//   保存済み扱いのまま残ると、 外部 animation file の再読み込みで「保存済みの同一 path」
+		//   として削除されうる
+		try {
+			;(Property as { resetUniqueValues?: (type: unknown, instance: unknown) => void })
+				?.resetUniqueValues?.(Animation, baked)
+		} catch (e) {
+			console.warn(`[${PLUGIN_ID}] Property.resetUniqueValues failed`, e)
+		}
+		baked.saved = false
 		// add(false) = Animator.animations へ追加 + createUniqueName (= 名前衝突の解決)。
 		// select はしない (= 選択中 animation を勝手に切り替えない)。
 		baked.add(false)
