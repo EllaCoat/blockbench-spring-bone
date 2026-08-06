@@ -256,9 +256,13 @@ function makePreviewRestWindow(animation: any): RestWindowContext | undefined {
 		return undefined
 	}
 	const timing = {
-		// length が壊れている (= NaN / 負 / 数値でない) と sample 数が 0 になる。
+		// length が比較不能 (= NaN / 負 / undefined 等) だと sample 数が 0 になる。
 		// checkPreviewRestWindowTiming がこれを契約違反として拾う (= 実在する極小
 		// animation の N = 0 と区別する必要があるのは export 側だけ)。
+		// **数値以外がすべて 0 になるわけではない** : '2' のような数値へ暗黙変換
+		// できる値は AJ の `time <= animation.length` と同じ比較で数え切られる
+		// (= 41 件)。ここを型で弾くと同じ length から AJ と preview で件数が
+		// 食い違い、両端 rest の終点がズレる。
 		renderSampleCount: sampleCount,
 		loopMode: animation.loop,
 		loopDelayFrames: Number(animation.loop_delay) || 0,

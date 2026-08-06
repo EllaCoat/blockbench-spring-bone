@@ -247,10 +247,12 @@ test('checkPreviewRestWindowTiming: export 側の判定も引き継ぐ', () => {
 	assert.match(checkPreviewRestWindowTiming(timing(21, 'ping_pong', 0)), /loopMode/)
 })
 
-test('checkPreviewRestWindowTiming: 壊れた length から数えた結果が必ず違反になる', () => {
+test('checkPreviewRestWindowTiming: 0 件になる length から数えた結果は必ず違反になる', () => {
 	// deriveRenderSampleCount との組み合わせで、 preview 経路の入口から出口まで繋げて固定する。
 	// 0 件になる length は契約違反、 数え切れない length は null (= 呼び出し側が窓ごと省略) の
-	// 2 経路に分かれるが、 どちらも「窓を作らない」 結果に収束する
+	// 2 経路に分かれるが、 どちらも「窓を作らない」 結果に収束する。
+	// **数値でない length がすべてここに来るわけではない** : '2' のように数値へ暗黙変換
+	// できる値は AJ と同じ比較で数え切られるため、 通常の window が張られる (別 test で固定)。
 	for (const length of [Number.NaN, Number.NEGATIVE_INFINITY, -1, undefined]) {
 		const count = deriveRenderSampleCount(length)
 		assert.equal(count, 0, `length=${String(length)}`)
