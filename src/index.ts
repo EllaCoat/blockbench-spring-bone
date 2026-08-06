@@ -1894,8 +1894,24 @@ function collectPlayingAnimations(all: any[]): any[] {
 	const state = (AnimationController as any)?.selected?.selected_state
 	if (!state) return all.filter((a: any) => a?.playing)
 	const controller = (AnimationController as any).selected
+	// **last_state は blend 中だけ積む** : BB も `blend_value < 1` の間しか last_state を
+	// stack しない (= animation_mode.js:362-363 / 380)。 無条件に含めると遷移完了後も
+	// 既に再生されていない animation が base pose に乗り、 その state が bake 由来だと
+	// isBakedAnimationContext が誤って物理を全停止する。 判定式は BB をそのまま写す。
+	const lastState = controller?.last_state
+	let blendingFromLastState = false
+	if (lastState) {
+		const stateTime = typeof state.getStateTime === 'function' ? state.getStateTime() : 0
+		const progress = lastState.blend_transition
+			? Math.min(1, Math.max(0, stateTime / lastState.blend_transition))
+			: 1
+		const blendValue = typeof lastState.calculateBlendValue === 'function'
+			? lastState.calculateBlendValue(progress)
+			: progress
+		blendingFromLastState = typeof blendValue === 'number' ? blendValue < 1 : progress < 1
+	}
 	const out: any[] = []
-	for (const source of [state, controller?.last_state]) {
+	for (const source of [state, blendingFromLastState ? lastState : null]) {
 		const entries = source?.animations
 		if (!Array.isArray(entries)) continue
 		for (const entry of entries) {
@@ -2651,20 +2667,26 @@ function runSpringBake(animation: any): void {
 
 	let result: BakeResult | null = null
 	let paramHash = ''
+	// 後始末の対象。 **取得前に例外が出ても finally が扱えるよう null 始まりにする**。
+	let restoreEffects: (() => void) | null = null
+	let poseSnapshot: AnimatorPoseSnapshot | null = null
 	// **所有権を先に取る** : この後 stackAnimations 内の同期 event 等から export が始まっても、
 	// export driver の isEnabled がこれを見て弾く (= 互いの session / gate の上書きを防ぐ)。
+	// **所有権を取った直後から try/finally で囲む** : 準備段階 (= suspend / mute / capturePose) で
+	// 例外が出ると、 gate と所有権を握ったまま抜けて preview / export / bake が全部止まる
+	// (= plugin reload しないと戻らない)。
 	runtimeOwner = 'bake'
-	// export driver と同じ順序で preview を明け渡す (= session を畳んでから tick を止める)。
-	invalidatePreviewSession()
-	exportGate.suspend()
-	// 全 frame 分の particle 発火 / timeline script 実行を止める (= transform だけが要る)。
-	const restoreEffects = suppressEffectAnimator(animation)
-	// **bake 前の scene pose を退避する** : 評価後の scene は最後の bake frame の姿勢のままで、
-	// 復帰を requestAnimatorPreview (= 失敗を warn に落とす) だけに任せると、 そこで例外が出た
-	// 場合に playhead の姿勢へ戻らない。 runtime へ渡している ops と同じ capture / restore を
-	// 使って、 finally で無条件に書き戻す。
-	const poseSnapshot = previewOps.capturePose()
 	try {
+		// export driver と同じ順序で preview を明け渡す (= session を畳んでから tick を止める)。
+		invalidatePreviewSession()
+		exportGate.suspend()
+		// 全 frame 分の particle 発火 / timeline script 実行を止める (= transform だけが要る)。
+		restoreEffects = suppressEffectAnimator(animation)
+		// **bake 前の scene pose を退避する** : 評価後の scene は最後の bake frame の姿勢のままで、
+		// 復帰を requestAnimatorPreview (= 失敗を warn に落とす) だけに任せると、 そこで例外が出た
+		// 場合に playhead の姿勢へ戻らない。 runtime へ渡している ops と同じ capture / restore を
+		// 使って、 finally で無条件に書き戻す。
+		poseSnapshot = previewOps.capturePose()
 		result = bakeSpringRotations(makeBakeSceneOps(context), {
 			frameCount,
 			...makeBakeQuaternionOps(),
@@ -2681,21 +2703,35 @@ function runSpringBake(animation: any): void {
 		showBakeMessage('Spring bake', `bake に失敗しました : ${String(e)}`)
 		return
 	} finally {
+		// **各復元は個別 try** : 1 つの失敗で残りの後始末を巻き込まない。
 		// **effect の mute を先に戻す** : この後の Animator.preview が現時刻の emitter を
 		// 張り直すため、 mute が残っていると bake 後に particle が出なくなる。
-		restoreEffects()
-		// bake 前の pose へ書き戻す (= 以降の再描画が失敗しても最後の bake frame の姿勢が残らない)。
-		// **復元が失敗しても後続の後始末は続ける**。
 		try {
-			previewOps.restorePose(poseSnapshot)
-			previewOps.updateMatrixWorld()
+			restoreEffects?.()
+		} catch (e) {
+			console.warn(`[${PLUGIN_ID}] failed to restore effect animator state`, e)
+		}
+		// bake 前の pose へ書き戻す (= 以降の再描画が失敗しても最後の bake frame の姿勢が残らない)。
+		try {
+			if (poseSnapshot !== null) {
+				previewOps.restorePose(poseSnapshot)
+				previewOps.updateMatrixWorld()
+			}
 		} catch (e) {
 			console.warn(`[${PLUGIN_ID}] failed to restore the scene pose after bake`, e)
 		}
 		// suspend の逆順で戻す。 resume で export 中に skip した rescan 予約も取り戻る。
-		exportGate.resume()
+		try {
+			exportGate.resume()
+		} catch (e) {
+			console.warn(`[${PLUGIN_ID}] exportGate.resume failed after bake`, e)
+		}
 		// bake が張った runtime session を畳み、 現在時刻の pose を editor へ描き直す。
-		invalidatePreviewSession()
+		try {
+			invalidatePreviewSession()
+		} catch (e) {
+			console.warn(`[${PLUGIN_ID}] invalidatePreviewSession failed after bake`, e)
+		}
 		// **所有権は preview を戻す前に解放する** : requestAnimatorPreview は同期的に
 		// tick 経路まで走らせるため、 握ったままだと以降の判定が bake 中扱いのままになる。
 		runtimeOwner = 'none'
