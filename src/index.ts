@@ -244,11 +244,22 @@ function makePreviewRestWindow(animation: any): RestWindowContext | undefined {
 	// animation 未選択 (= 複数 animation の同時 stack preview) では終点が 1 つに定まらない
 	// ため rest window を作らない (= weight ≡ 1 で従来動作)。
 	if (!animation) return undefined
+	// null = 数え切れない (= length が +Infinity、 または時刻が進まなくなった)。
+	// **件数を打ち切った近似値では代用しない** : 妥当な整数に見えてしまい、 警告も出ないまま
+	// preview と export の終端が食い違う。
+	const sampleCount = renderSampleCountCache.get(animation, animation.length)
+	if (sampleCount === null) {
+		warnRestWindowOnce(
+			animation,
+			`cannot enumerate render samples for animation.length ${String(animation.length)}`,
+		)
+		return undefined
+	}
 	const timing = {
 		// length が壊れている (= NaN / 負 / 数値でない) と sample 数が 0 になる。
 		// checkPreviewRestWindowTiming がこれを契約違反として拾う (= 実在する極小
 		// animation の N = 0 と区別する必要があるのは export 側だけ)。
-		renderSampleCount: renderSampleCountCache.get(animation, animation.length),
+		renderSampleCount: sampleCount,
 		loopMode: animation.loop,
 		loopDelayFrames: Number(animation.loop_delay) || 0,
 	}

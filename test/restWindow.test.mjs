@@ -8,6 +8,7 @@ const {
 	checkPreviewRestWindowTiming,
 	createRenderSampleCountCache,
 	deriveRenderSampleCount,
+	nextRenderSampleTime,
 	deriveDisplayedFinalFrame,
 	resolveFadeFrames,
 	computeRestWindowWeight,
@@ -74,16 +75,37 @@ test('deriveRenderSampleCount: 極小の length も 1 sample', () => {
 	}
 })
 
-test('deriveRenderSampleCount: 非有限 / 負は 0', () => {
-	for (const length of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, -1, -0.01]) {
-		assert.equal(deriveRenderSampleCount(length), 0, `length=${length}`)
+test('deriveRenderSampleCount: NaN / -Infinity / 負は 0 件で通す', () => {
+	// 旧実装の `time <= NaN` が偽になる挙動と一致 (= AJ 側と同じ扱い)。
+	// 「数え切れない」 (= null) とは区別する : 0 件は preview 側で契約違反として拾われる
+	for (const length of [Number.NaN, Number.NEGATIVE_INFINITY, -1, -0.01, undefined]) {
+		assert.equal(deriveRenderSampleCount(length), 0, `length=${String(length)}`)
 	}
 })
 
-test('deriveRenderSampleCount: 巨大な length でも停止する (= 上限で打ち切り)', () => {
-	// 進行不能な入力でも無限ループにならないことを固定する
-	const result = deriveRenderSampleCount(1e9)
-	assert.ok(Number.isInteger(result) && result > 0 && result <= 100000, `result=${result}`)
+test('deriveRenderSampleCount: +Infinity は数え切れないので null', () => {
+	// `time <= +Infinity` が永久に真になる = 終わらない条件
+	assert.equal(deriveRenderSampleCount(Number.POSITIVE_INFINITY), null)
+})
+
+test('deriveRenderSampleCount: 件数の上限が無い (= 打ち切って preview と export を食い違わせない)', () => {
+	// 上限 100000 件で打ち切っていた頃は length 5000 で N = 100000 になり、 AJ 側の
+	// N = 100001 と 1 frame ずれていた。 しかも打ち切った値は妥当な整数として契約検査を
+	// 通るため警告も出ない (= preview と export が黙って食い違う)。
+	assert.equal(deriveRenderSampleCount(5000), 100001)
+	assert.equal(deriveRenderSampleCount(5000), referenceSampleCount(5000))
+})
+
+test('nextRenderSampleTime: 通常の時刻では 0.05 進み、 精度限界では null', () => {
+	// 「時刻が進まない」 判定そのものの固定。 deriveRenderSampleCount は time 0 から
+	// 0.05 刻みで数えるため、 この帯に到達させるには非現実的な反復が要る (= 直接固定する)
+	assert.equal(nextRenderSampleTime(0), 0.05)
+	assert.equal(nextRenderSampleTime(0.05), 0.1)
+	assert.equal(nextRenderSampleTime(1e10), 10000000000.05)
+	// double の精度限界 : time + 0.05 が丸めで消える
+	for (const time of [1e15, 1e16, 1e17, 2 ** 49, Number.MAX_SAFE_INTEGER]) {
+		assert.equal(nextRenderSampleTime(time), null, `time=${time}`)
+	}
 })
 
 // --- checkRestWindowTiming (= export 経路の契約判定) ---
@@ -137,6 +159,62 @@ test('checkRestWindowTiming: 未知の loopMode は契約違反', () => {
 	}
 })
 
+// 文字列化できない外部値の一覧 (= JSON.stringify / String() のどちらかが throw する形)。
+// エラー文 / fingerprint の生成でこれらを踏むと、 「窓を省略して w ≡ 1 に倒す」 はずの
+// preview が tick ごと失敗する。
+function unstringifiableValues() {
+	const circular = { name: 'loop' }
+	circular.self = circular
+	const nullProto = Object.create(null)
+	nullProto.mode = 'loop'
+	const throwingToString = { toString() { throw new Error('nope') } }
+	const throwingPrimitive = { [Symbol.toPrimitive]() { throw new Error('nope') } }
+	return [1n, circular, nullProto, throwingToString, throwingPrimitive, Symbol('loop'), () => {}]
+}
+
+test('checkRestWindowTiming: 文字列化できない loopMode でも throw せず契約違反として返す', () => {
+	for (const loopMode of unstringifiableValues()) {
+		let reason
+		assert.doesNotThrow(() => {
+			reason = checkRestWindowTiming({ renderSampleCount: 21, loopMode, loopDelayFrames: 0 })
+		}, `loopMode=${typeof loopMode}`)
+		assert.equal(typeof reason, 'string')
+		assert.match(reason, /loopMode/)
+	}
+})
+
+test('checkRestWindowTiming: 文字列化できない renderSampleCount でも throw しない', () => {
+	for (const renderSampleCount of unstringifiableValues()) {
+		let reason
+		assert.doesNotThrow(() => {
+			reason = checkRestWindowTiming({ renderSampleCount, loopMode: 'once', loopDelayFrames: 0 })
+		}, `N=${typeof renderSampleCount}`)
+		assert.equal(typeof reason, 'string')
+		assert.match(reason, /renderSampleCount/)
+	}
+})
+
+test('checkPreviewRestWindowTiming: 文字列化できない値でも throw しない', () => {
+	for (const loopMode of unstringifiableValues()) {
+		assert.doesNotThrow(() => checkPreviewRestWindowTiming({
+			renderSampleCount: 21, loopMode, loopDelayFrames: 0,
+		}))
+	}
+})
+
+test('restWindowFingerprint: 文字列化できない値でも throw しない', () => {
+	// fingerprint は毎 tick 計算されるため、 ここで throw すると preview が止まる
+	for (const loopMode of unstringifiableValues()) {
+		let fp
+		assert.doesNotThrow(() => {
+			fp = restWindowFingerprint({ renderSampleCount: 21, loopMode, loopDelayFrames: 0 }, 4)
+		}, `loopMode=${typeof loopMode}`)
+		assert.equal(typeof fp, 'string')
+	}
+	// BigInt の requestedFrames / renderSampleCount も同様
+	assert.doesNotThrow(() => restWindowFingerprint({ renderSampleCount: 1n, loopMode: 'once', loopDelayFrames: 0 }, 1n))
+})
+
 test('checkRestWindowTiming: loopDelayFrames は検査しない (= 「> 0 か否か」 しか見ないため)', () => {
 	for (const loopDelayFrames of [-3, 0.5, Number.NaN, Number.POSITIVE_INFINITY]) {
 		assert.equal(
@@ -170,11 +248,18 @@ test('checkPreviewRestWindowTiming: export 側の判定も引き継ぐ', () => {
 })
 
 test('checkPreviewRestWindowTiming: 壊れた length から数えた結果が必ず違反になる', () => {
-	// deriveRenderSampleCount との組み合わせで、 preview 経路の入口から出口まで繋げて固定する
-	for (const length of [Number.NaN, Number.POSITIVE_INFINITY, -1, undefined, '2']) {
-		const t = timing(deriveRenderSampleCount(length), 'once', 0)
-		assert.notEqual(checkPreviewRestWindowTiming(t), null, `length=${String(length)}`)
+	// deriveRenderSampleCount との組み合わせで、 preview 経路の入口から出口まで繋げて固定する。
+	// 0 件になる length は契約違反、 数え切れない length は null (= 呼び出し側が窓ごと省略) の
+	// 2 経路に分かれるが、 どちらも「窓を作らない」 結果に収束する
+	for (const length of [Number.NaN, Number.NEGATIVE_INFINITY, -1, undefined]) {
+		const count = deriveRenderSampleCount(length)
+		assert.equal(count, 0, `length=${String(length)}`)
+		assert.notEqual(checkPreviewRestWindowTiming(timing(count, 'once', 0)), null, `length=${String(length)}`)
 	}
+	assert.equal(deriveRenderSampleCount(Number.POSITIVE_INFINITY), null)
+	// 数値でない length は AJ の loop と同じく比較で暗黙変換される (= 弾かない)。
+	// 独自に型で弾くと、 同じ値から AJ 側は 41 件 / preview は 0 件、 と食い違ってしまう
+	assert.equal(deriveRenderSampleCount('2'), 41)
 	// 正当な length は必ず通る
 	for (const length of [0, 0.001, 1, 2.5]) {
 		const t = timing(deriveRenderSampleCount(length), 'once', 0)
@@ -231,6 +316,16 @@ test('createRenderSampleCountCache: 壊れた length も 0 として扱い、 �
 	// NaN → NaN は memo hit (= Object.is 比較)、 値は変わらない
 	assert.equal(cache.get(anim, Number.NaN), 0)
 	// 正常値へ戻れば再計算される
+	assert.equal(cache.get(anim, 1), 21)
+})
+
+test('createRenderSampleCountCache: 数え切れない length は null を memo する', () => {
+	// null を毎 frame 数え直さない (= +Infinity は即返るが、 契約として固定しておく)
+	const cache = createRenderSampleCountCache()
+	const anim = { name: 'walk' }
+	assert.equal(cache.get(anim, Number.POSITIVE_INFINITY), null)
+	assert.equal(cache.get(anim, Number.POSITIVE_INFINITY), null)
+	// length が変われば再計算される (= null に固着しない)
 	assert.equal(cache.get(anim, 1), 21)
 })
 

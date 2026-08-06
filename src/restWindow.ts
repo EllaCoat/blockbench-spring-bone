@@ -38,6 +38,22 @@ export interface RestWindowTiming {
 // BB Animation の loop 種別。 これ以外の値は「周期を判断できない」 = 契約違反として扱う。
 export const KNOWN_LOOP_MODES = ['once', 'hold', 'loop'] as const
 
+// 外部由来の値を **絶対に throw しない形で** 短く文字列化する。
+// `JSON.stringify` は BigInt と循環参照で throw し、 `String()` も Symbol.toPrimitive が
+// 壊れた object や null-prototype object (= `Object.create(null)`) で throw する。
+// エラー文 / fingerprint を作る側で例外が飛ぶと、 「契約違反なので窓を省略して w ≡ 1 に
+// 倒す」 はずの preview が tick ごと失敗する (= 型どおりの値を仮定しない方針が、
+// 文字列化の 1 行だけ破られている状態になる)。
+// object / function は型名だけを出す (= 中身は覗かない)。 primitive の `String()` は
+// Symbol / BigInt を含めて仕様上 throw しない。
+function describeValue(value: unknown): string {
+	if (value === null) return 'null'
+	const type = typeof value
+	if (type === 'object' || type === 'function') return `[${type}]`
+	if (type === 'string') return `"${value as string}"`
+	return String(value)
+}
+
 // timing が AJ v2 hook の契約を満たしているかの判定。 満たしていれば null、 破っていれば
 // 理由の文字列を返す (= 呼び出し側が throw / warn のメッセージに使う)。
 //
@@ -55,10 +71,10 @@ export const KNOWN_LOOP_MODES = ['once', 'hold', 'loop'] as const
 export function checkRestWindowTiming(timing: RestWindowTiming): string | null {
 	const sampleCount = timing.renderSampleCount
 	if (!Number.isInteger(sampleCount) || sampleCount < 0) {
-		return `renderSampleCount must be a non-negative integer, got ${String(sampleCount)}`
+		return `renderSampleCount must be a non-negative integer, got ${describeValue(sampleCount)}`
 	}
 	if (!(KNOWN_LOOP_MODES as readonly string[]).includes(timing.loopMode)) {
-		return `unknown loopMode ${JSON.stringify(timing.loopMode)}`
+		return `unknown loopMode ${describeValue(timing.loopMode)}`
 	}
 	return null
 }
@@ -98,29 +114,37 @@ function toFrameCount(value: number): number {
 // 時刻を進めており、 丸めの入り方まで一致させないと格子際の length で off-by-one が出る。
 // ここでは同じ loop をそのまま数え直す。
 //
-// 非有限 / 負の length は 0 に倒す (= 数える対象が無い)。 length が 0 ちょうどの場合は
-// AJ 側と同じく 1 (= time 0 の 1 sample だけ) になる。
+// 負の length は 0 件 (= `0 <= -1` が偽)。 length が 0 ちょうどなら 1 件 (= time 0 だけ)。
+// `NaN` / `-Infinity` も比較が偽なので 0 件で通す (= AJ 側と同じ扱い)。
+//
+// **件数の上限は設けない** : 上限で打ち切ると、 打ち切った値が妥当な整数として契約検査を
+// 通り cache にも載るため、 警告なしに preview と export の終端が食い違う (= AJ 側は上限を
+// 撤廃済み)。 代わりに「終わらない条件」 だけを弾いて null を返す。
 const EXPORT_SAMPLE_STEP_SECONDS = 0.05
 const EXPORT_SAMPLE_ROUND_NTH = 20
-// 進行不能な入力 (= 巨大 length で time + 0.05 が丸めに吸われて増えなくなる) でも
-// 必ず停止させるための上限。 100000 sample = 5000 秒 (= 約 83 分) で、 実用上の
-// animation 長は遥かに下回る。
-const MAX_RENDER_SAMPLE_COUNT = 100000
 
 function roundToNth(n: number, x: number): number {
 	return Math.round(n * x) / x
 }
 
-export function deriveRenderSampleCount(lengthSeconds: number): number {
-	if (!Number.isFinite(lengthSeconds) || lengthSeconds < 0) return 0
+// 次の sample 時刻。 double の精度限界 (= time が大きすぎて +0.05 が丸めで消える) に達して
+// 時刻が進まなくなったら null を返す。 そのまま回すと同じ frame を延々と数え続ける。
+export function nextRenderSampleTime(time: number): number | null {
+	const next = roundToNth(time + EXPORT_SAMPLE_STEP_SECONDS, EXPORT_SAMPLE_ROUND_NTH)
+	return next > time ? next : null
+}
+
+// 戻り値 null = **数え切れない** (= length が +Infinity、 または時刻が進まなくなった)。
+// 呼び出し側は preview 経路の方針に合わせ、 警告のうえで窓を省略する (= w ≡ 1 へ倒す)。
+export function deriveRenderSampleCount(lengthSeconds: number): number | null {
+	// +Infinity は `time <= length` が永久に真になるため数え切れない。
+	if (lengthSeconds === Number.POSITIVE_INFINITY) return null
 	let count = 0
-	for (
-		let time = 0;
-		time <= lengthSeconds;
-		time = roundToNth(time + EXPORT_SAMPLE_STEP_SECONDS, EXPORT_SAMPLE_ROUND_NTH)
-	) {
+	for (let time = 0; time <= lengthSeconds; ) {
 		count++
-		if (count >= MAX_RENDER_SAMPLE_COUNT) break
+		const next = nextRenderSampleTime(time)
+		if (next === null) return null
+		time = next
 	}
 	return count
 }
@@ -136,14 +160,16 @@ export function deriveRenderSampleCount(lengthSeconds: number): number {
 // factory にしているのは module singleton にしないため (= 呼び出し側が生存期間を持ち、
 // project 切替時に clear して旧 animation instance の参照を手放せる)。
 export interface RenderSampleCountCache {
-	get(animation: unknown, lengthSeconds: number): number
+	// 戻り値 null = 数え切れない (= deriveRenderSampleCount と同じ意味)。 null も memo する
+	// (= 数え切れない length を毎 frame 数え直さない)。
+	get(animation: unknown, lengthSeconds: number): number | null
 	clear(): void
 }
 
 export function createRenderSampleCountCache(): RenderSampleCountCache {
-	let memo: { animation: unknown; length: number; count: number } | null = null
+	let memo: { animation: unknown; length: number; count: number | null } | null = null
 	return {
-		get(animation: unknown, lengthSeconds: number): number {
+		get(animation: unknown, lengthSeconds: number): number | null {
 			if (memo !== null && memo.animation === animation && Object.is(memo.length, lengthSeconds)) {
 				return memo.count
 			}
@@ -256,14 +282,18 @@ export function classifyRestWindowWeight(weight: number): RestWindowDeltaMode {
 // **導出値ではなく raw 値**を並べる : 導出関数に bug があった場合に invalidate 判定まで
 // 道連れにしないため (= raw が変わったのに fingerprint が変わらない、 という取りこぼしを
 // 導出ロジック側の都合で作らない)。
-// 数値は JSON.stringify に直接載せず String() で文字列化する : JSON.stringify は
-// NaN と Infinity を等しく null にするため、 両者の差を fingerprint が見落とす。
-// String() は丸めを伴わないので 0.0500001 と 0.05 も別の文字列になる。
+// 値は JSON.stringify に直接載せず describeValue で文字列化する :
+// - JSON.stringify は NaN と Infinity を等しく null にするため、 両者の差を見落とす。
+//   また BigInt / 循環参照で throw する (= fingerprint の計算が毎 tick 失敗する)
+// - describeValue は丸めを伴わないので 0.0500001 と 0.05 も別の文字列になり、 かつ
+//   どんな外部値でも throw しない
+// object / function はすべて型名へ潰れる (= 個体差を見分けられない) が、 fingerprint を
+// 使う経路 (= 契約検査を通った rest window) には既知の文字列 loopMode しか来ない。
 export function restWindowFingerprint(timing: RestWindowTiming, requestedFrames: number): string {
 	return JSON.stringify([
-		String(timing.renderSampleCount),
-		String(timing.loopMode),
-		String(timing.loopDelayFrames),
-		String(requestedFrames),
+		describeValue(timing.renderSampleCount),
+		describeValue(timing.loopMode),
+		describeValue(timing.loopDelayFrames),
+		describeValue(requestedFrames),
 	])
 }

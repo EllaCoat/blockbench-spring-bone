@@ -5,6 +5,7 @@ const { timeToStepIndex, stepIndexToTime, stepIndexFromFrame, SpringRuntime } = 
 const {
 	computeRestWindowWeight,
 	deriveDisplayedFinalFrame,
+	deriveRenderSampleCount,
 	checkPreviewRestWindowTiming,
 } = await import('../dist-test/restWindow.mjs')
 
@@ -537,31 +538,53 @@ test('SpringRuntime: rest window が無い context では weight ≡ 1 (= 従来
 	assert.deepEqual(applyWeights(calls), [1, 1])
 })
 
+// index.ts の makePreviewRestWindow 相当。 数え切れない length と契約違反の timing の
+// どちらでも窓ごと省略する (= preview は止めず、 減衰だけ諦めて従来動作へ倒す)。
+const makePreviewRestWindow = (lengthSeconds, loopMode = 'once', loopDelayFrames = 0) => {
+	const renderSampleCount = deriveRenderSampleCount(lengthSeconds)
+	if (renderSampleCount === null) return undefined
+	const timing = { renderSampleCount, loopMode, loopDelayFrames }
+	return checkPreviewRestWindowTiming(timing) !== null ? undefined : { timing, requestedFadeFrames: 4 }
+}
+
+// restWindow を省略した context で全 step の weight が exact 1 になることを確認する。
+const assertNoDecay = (restWindow, label) => {
+	const calls = []
+	assert.equal(restWindow, undefined, label)
+	const { runtime, context, basePose } = makeRuntime(calls, { restWindow })
+	runtime.beginAnimation(context, basePose)
+	runtime.evaluateSample(stepIndexToTime(70))
+	runtime.applyWithoutAdvance()
+	// 物理が消えない (= 全 step で Δ をそのまま載せる)
+	for (const w of stepWeights(calls)) assert.strictEqual(w, 1, label)
+	for (const w of applyWeights(calls)) assert.strictEqual(w, 1, label)
+}
+
+test('SpringRuntime: 数え切れない length の preview context では w ≡ 1 に倒れる', () => {
+	// +Infinity = 終わらない条件。 「時刻が進まない」 側も deriveRenderSampleCount が同じ
+	// null を返すため、 ここから先の経路は共通 (= 進まない判定自体は restWindow.test.mjs の
+	// nextRenderSampleTime で固定している)。
+	assert.equal(deriveRenderSampleCount(Number.POSITIVE_INFINITY), null)
+	assertNoDecay(makePreviewRestWindow(Number.POSITIVE_INFINITY), 'length=+Infinity')
+})
+
 test('SpringRuntime: 契約違反の timing を弾いた preview context では w ≡ 1 に倒れる', () => {
-	// index.ts の makePreviewRestWindow 相当 : 契約違反なら窓ごと省略する
-	// (= preview は止めず、 減衰だけ諦めて従来動作へ倒す)。
-	const makePreviewRestWindow = (timing) =>
-		checkPreviewRestWindowTiming(timing) !== null ? undefined : { timing, requestedFadeFrames: 4 }
-	const brokenTimings = [
-		{ renderSampleCount: Number.NaN, loopMode: 'once', loopDelayFrames: 0 },
-		{ renderSampleCount: -1, loopMode: 'once', loopDelayFrames: 0 },
-		{ renderSampleCount: 20.5, loopMode: 'once', loopDelayFrames: 0 },
-		{ renderSampleCount: 21, loopMode: 'ping_pong', loopDelayFrames: 0 },
-		// preview の N = 0 は length 破損の徴候 (= 実在する極小 animation ではない)
-		{ renderSampleCount: 0, loopMode: 'once', loopDelayFrames: 0 },
-	]
-	for (const timing of brokenTimings) {
-		const calls = []
-		const restWindow = makePreviewRestWindow(timing)
-		assert.equal(restWindow, undefined, JSON.stringify(timing))
-		const { runtime, context, basePose } = makeRuntime(calls, { restWindow })
-		runtime.beginAnimation(context, basePose)
-		runtime.evaluateSample(stepIndexToTime(70))
-		runtime.applyWithoutAdvance()
-		// 物理が消えない (= 全 step で Δ をそのまま載せる)
-		for (const w of stepWeights(calls)) assert.strictEqual(w, 1, JSON.stringify(timing))
-		for (const w of applyWeights(calls)) assert.strictEqual(w, 1, JSON.stringify(timing))
+	// length 由来 (= 0 件になる) の経路
+	for (const length of [Number.NaN, Number.NEGATIVE_INFINITY, -1]) {
+		assertNoDecay(makePreviewRestWindow(length), `length=${length}`)
 	}
+	// timing 由来 (= 未知 loopMode) の経路
+	assertNoDecay(makePreviewRestWindow(1, 'ping_pong'), 'loopMode=ping_pong')
+
+	// 正当な length / loopMode では窓が作られ、 終端で減衰する (= 上の縮退と対になる確認)
+	const restWindow = makePreviewRestWindow(1, 'once', 0)
+	assert.notEqual(restWindow, undefined)
+	assert.equal(restWindow.timing.renderSampleCount, 21)
+	const calls = []
+	const { runtime, context, basePose } = makeRuntime(calls, { restWindow })
+	runtime.beginAnimation(context, basePose)
+	runtime.evaluateSample(stepIndexToTime(60))
+	assert.deepEqual(applyWeights(calls), [0])
 })
 
 test('SpringRuntime: sub-step の weight は「これから進む step (= next)」 基準', () => {
