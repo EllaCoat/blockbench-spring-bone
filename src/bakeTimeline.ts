@@ -108,6 +108,9 @@ export interface BakedBoneCurve {
 	avgAngleDeg: number
 	// この bone の keyframe 密度 (= keyframe / 秒)
 	keyframesPerSecond: number
+	// 採用した傾きの求め方 (= true なら一括最小二乗、 false なら中央差分)。
+	// 2 通り試して keyframe が少ない方を採るので、 bone ごとに変わり得る
+	usedLeastSquares: boolean
 }
 
 export interface BakeResult {
@@ -133,10 +136,12 @@ function toTriple(values: AxisTriple): [number, number, number] {
 }
 
 // 読めなかった / 非有限だった sample は直前の値で埋める (= 系列に穴や NaN を作らない)。
-// 先頭で読めなければ 0 (= rest) 扱いにする。
-function pushSample(series: MutableSeries, value: AxisTriple | null): void {
+// **先頭 sample の fallback は rest (= 絶対 Euler での rest 姿勢)**。 系列は絶対 Euler なので、
+// ここで 0 を入れると fix_rotation が非ゼロの bone で「絶対角 0°」 = rest とは別の姿勢になり、
+// keyframe 値が `0 − rest` になってしまう。
+function pushSample(series: MutableSeries, value: AxisTriple | null, rest: AxisTriple): void {
 	const last = series.x.length - 1
-	const fallback = (axis: 'x' | 'y' | 'z'): number => (last >= 0 ? series[axis][last] : 0)
+	const fallback = (axis: 'x' | 'y' | 'z'): number => (last >= 0 ? series[axis][last] : rest[axis])
 	const pick = (raw: number | undefined, axis: 'x' | 'y' | 'z'): number =>
 		typeof raw === 'number' && Number.isFinite(raw) ? raw : fallback(axis)
 	series.x.push(pick(value?.x, 'x'))
@@ -170,7 +175,7 @@ export function bakeSpringRotations<Q>(scene: BakeSceneOps, options: BakeOptions
 			for (let frame = 0; frame < frameCount; frame++) {
 				scene.evaluateFrame(frame)
 				for (const target of targets) {
-					pushSample(collected.get(target.uuid)!, scene.readRotationDeg(target.uuid))
+					pushSample(collected.get(target.uuid)!, scene.readRotationDeg(target.uuid), target.restRotationDeg)
 				}
 			}
 		}
@@ -188,12 +193,28 @@ export function bakeSpringRotations<Q>(scene: BakeSceneOps, options: BakeOptions
 		// quaternion → Euler の正準形が gimbal 付近で飛ぶと、 姿勢としては連続でも
 		// 曲線が急変して分割が誘発される。 フィッティングの **前** に潰しておく。
 		const continuous = continuifyEulerSeries(raw)
-		const fit = fitSharedKnots(times, continuous, maxAngleDeg, {
+		// **傾きの求め方は 2 通り試して keyframe が少ない方を採る** : 一括最小二乗 (= useLS)
+		// が効く条件 (= spike の walk で 168 → 102) と、 中央差分の方が少なくなる条件の
+		// 両方があり、 事前にどちらが勝つかは決められない。 bake は 1 回きりの処理なので
+		// 2 回 fit するコストは許容する (= preview のように毎 frame 走る経路ではない)。
+		// 同数なら誤差の小さい方 (= 見た目に近い方) を採る。
+		const leastSquares = fitSharedKnots(times, continuous, maxAngleDeg, {
 			fps,
 			minGapFrames,
+			useLS: true,
 			quaternionFromEuler: options.quaternionFromEuler,
 			quatAngleDeg: options.quatAngleDeg,
 		})
+		const centralDiff = fitSharedKnots(times, continuous, maxAngleDeg, {
+			fps,
+			minGapFrames,
+			useLS: false,
+			quaternionFromEuler: options.quaternionFromEuler,
+			quatAngleDeg: options.quatAngleDeg,
+		})
+		const preferCentral = centralDiff.keyframeCount < leastSquares.keyframeCount ||
+			(centralDiff.keyframeCount === leastSquares.keyframeCount && centralDiff.maxAngle < leastSquares.maxAngle)
+		const fit = preferCentral ? centralDiff : leastSquares
 		// keyframe 値 = 絶対 Euler − rest。 handle は値の差分なので rest の影響を受けない
 		// (= 曲線全体が値方向に平行移動するだけ)。
 		const rest = target.restRotationDeg
@@ -223,6 +244,7 @@ export function bakeSpringRotations<Q>(scene: BakeSceneOps, options: BakeOptions
 			maxAngleDeg: fit.maxAngle,
 			avgAngleDeg: fit.avgAngle,
 			keyframesPerSecond: perSecond,
+			usedLeastSquares: !preferCentral,
 		})
 	}
 

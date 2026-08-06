@@ -2408,6 +2408,42 @@ function makeBakeSceneOps(context: PreviewAnimationContext): BakeSceneOps {
 	}
 }
 
+// bake 中だけ effect channel (= particle / sound / timeline script) を止める。 戻り値は復元関数。
+//
+// **なぜ必要か** : base pose の評価は Animator.stackAnimations を通り、 その末尾で
+// `animation.animators.effects.displayFrame(in_loop)` が走る (= animation_mode.js:344-350)。
+// これは transform とは無関係に particle emitter の生成 / jumpTo (= timeline_animators.js:1046-1092)
+// と timeline script の Molang 実行 (= 同 :1095-1102) を行う。 preview は 1 frame ずつなので実害が
+// 小さいが、 bake は全 frame × sub-step を一気に replay するため桁が違う (= 10 秒の animation で
+// 600 sub-step ぶんの emitter 発火と script 実行が一瞬で走る)。
+//
+// **transform だけを評価する経路は BB に無い** : 公開されているのは stackAnimations /
+// Animator.preview だけで、 どちらも effects を含む。 bone loop を自前で書き写す手はあるが
+// (= Animation.sampleIK が部分的にやっている、 animation.js:170-194)、 blend_weight / pre_rotation /
+// Outliner.elements の animator 等の扱いまで複製することになり、 **bake と preview / export の
+// pose 評価が別実装に分裂する** (= 物理の正しさが評価経路の一致に依存しているので、 分裂させると
+// 「preview では合うが bake ではズレる」 を作り込む)。 そこで評価経路は stackAnimations のまま、
+// BB 自身の mute 機構で effect 側だけを止める。
+// last_displayed_time は mute に関係なく毎回上書きされる (= 同 :1104) ので、 これも復元する。
+function suppressEffectAnimator(animation: any): () => void {
+	const effects = animation?.animators?.effects
+	const muted = effects?.muted
+	if (!effects || typeof muted !== 'object' || muted === null) return (): void => {}
+	const savedMuted = { ...muted }
+	const savedLastDisplayedTime = effects.last_displayed_time
+	muted.particle = true
+	muted.sound = true
+	muted.timeline = true
+	return (): void => {
+		try {
+			Object.assign(muted, savedMuted)
+			effects.last_displayed_time = savedLastDisplayedTime
+		} catch (e) {
+			console.warn(`[${PLUGIN_ID}] failed to restore effect animator state`, e)
+		}
+	}
+}
+
 // bake の結果 / 中断理由をユーザーへ伝える。 showMessageBox が使えない環境
 // (= 旧 BB / テスト) では console へ落とす。
 function showBakeMessage(title: string, message: string): void {
@@ -2491,6 +2527,8 @@ function runSpringBake(animation: any): void {
 	// export driver と同じ順序で preview を明け渡す (= session を畳んでから tick を止める)。
 	invalidatePreviewSession()
 	exportGate.suspend()
+	// 全 frame 分の particle 発火 / timeline script 実行を止める (= transform だけが要る)。
+	const restoreEffects = suppressEffectAnimator(animation)
 	try {
 		result = bakeSpringRotations(makeBakeSceneOps(context), {
 			frameCount,
@@ -2501,6 +2539,9 @@ function runSpringBake(animation: any): void {
 		showBakeMessage('Spring bake', `bake に失敗しました : ${String(e)}`)
 		return
 	} finally {
+		// **effect の mute を先に戻す** : この後の Animator.preview が現時刻の emitter を
+		// 張り直すため、 mute が残っていると bake 後に particle が出なくなる。
+		restoreEffects()
 		// suspend の逆順で戻す。 resume で export 中に skip した rescan 予約も取り戻る。
 		exportGate.resume()
 		// bake が張った runtime session を畳み、 現在時刻の pose を editor へ描き直す。
@@ -2547,6 +2588,24 @@ function runSpringBake(animation: any): void {
 		Undo?.finishEdit?.('Spring bake', { animations: [baked] })
 	} catch (e) {
 		console.warn(`[${PLUGIN_ID}] failed to register baked animation`, e)
+		// **部分生成物は自前で片付ける** : initEdit の aspects は `{animations: []}` なので、
+		// cancelEdit(true) の revert 経路 (= undo.js:143-151 → loadSave) では追加済み
+		// animation が消えない (= before / after どちらの save にも載っていないため、
+		// undo.js:715-722 の「reference にあって save に無い animation を remove」 に
+		// 引っかからない)。 先に自分で remove してから transaction を畳む。
+		try {
+			if (baked && typeof baked.remove === 'function') baked.remove(false, false)
+		} catch (removeError) {
+			console.warn(`[${PLUGIN_ID}] failed to roll back baked animation`, removeError)
+		}
+		try {
+			// revert_changes は付けない (= 上記のとおり空 aspects では効かず、
+			// Canvas.outlines を空にする副作用だけが残るため)。 目的は current_save を
+			// 畳んで次の Undo transaction を汚さないこと。
+			Undo?.cancelEdit?.()
+		} catch (cancelError) {
+			console.warn(`[${PLUGIN_ID}] Undo.cancelEdit failed`, cancelError)
+		}
 		showBakeMessage('Spring bake', `派生 animation を作成できませんでした : ${String(e)}`)
 		return
 	}

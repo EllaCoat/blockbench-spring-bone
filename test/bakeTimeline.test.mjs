@@ -10,7 +10,7 @@ const {
 	BAKE_DENSITY_WARN_KF_PER_SECOND,
 	ANIM_BAKED_FROM_KEY,
 } = await import('../dist-test/bakeTimeline.mjs')
-const { evalBezierBB } = await import('../dist-test/curveFit.mjs')
+const { evalBezierBB, fitSharedKnots } = await import('../dist-test/curveFit.mjs')
 
 // --- テスト用の最小 quaternion 演算 (= 本番は THREE を注入する) ---
 
@@ -245,6 +245,36 @@ test('bakeSpringRotations: BB の再生手順で元の絶対 Euler を閾値内�
 	assert.ok(curve.keyframes.length < 201 * 0.6, `keyframe が多すぎる : ${curve.keyframes.length}`)
 })
 
+test('bakeSpringRotations: 中央差分と一括 LS の両方を試して keyframe が少ない方を採る', () => {
+	const frameCount = 121
+	const pose = (_uuid, frame) => ({
+		x: 22 * Math.exp(-frame / 40) * Math.sin(2 * Math.PI * frame / 7),
+		y: 8 * Math.sin(2 * Math.PI * frame / 11 + 0.6),
+		z: 0,
+	})
+	const scene = makeFakeScene([target('a', 'bone_a')], pose)
+
+	const result = bakeSpringRotations(scene, { frameCount, ...OPS })
+
+	// 同じ入力で 2 通りを直接 fit して、 採用結果が「少ない方」 になっているか確かめる
+	const times = []
+	const axes = { x: [], y: [], z: [] }
+	for (let frame = 0; frame < frameCount; frame++) {
+		times.push(frame / 20)
+		const value = pose('a', frame)
+		axes.x.push(value.x)
+		axes.y.push(value.y)
+		axes.z.push(value.z)
+	}
+	const ls = fitSharedKnots(times, axes, DEFAULT_BAKE_MAX_ANGLE_DEG, { fps: 20, useLS: true, ...OPS })
+	const cd = fitSharedKnots(times, axes, DEFAULT_BAKE_MAX_ANGLE_DEG, { fps: 20, useLS: false, ...OPS })
+
+	assert.notEqual(ls.keyframeCount, cd.keyframeCount, 'この入力は両者が同数 = 比較にならない')
+	assert.equal(result.bones[0].keyframes.length, Math.min(ls.keyframeCount, cd.keyframeCount))
+	assert.equal(result.bones[0].usedLeastSquares, ls.keyframeCount <= cd.keyframeCount)
+	assert.ok(result.bones[0].maxAngleDeg <= DEFAULT_BAKE_MAX_ANGLE_DEG)
+})
+
 test('bakeSpringRotations: 閾値を上げると keyframe が減る', () => {
 	const pose = (_uuid, frame) => ({ x: 25 * Math.sin(2 * Math.PI * frame / 9), y: 0, z: 0 })
 	const tight = bakeSpringRotations(makeFakeScene([target('a', 'bone_a')], pose), { frameCount: 101, ...OPS })
@@ -293,9 +323,25 @@ test('bakeSpringRotations: 読めない / 非有限の sample は直前の値で
 	for (const kf of curve.keyframes) {
 		assert.ok(Number.isFinite(kf.data_points[0].x))
 	}
-	// frame 0 は読めないので 0 (= rest)、 以降は 10 に張り付く
+	// frame 0 は読めないので rest (= keyframe 値 0)、 以降は 10 に張り付く
 	assert.ok(Math.abs(curve.keyframes[0].data_points[0].x) < 1e-9)
 	assert.ok(Math.abs(curve.keyframes.at(-1).data_points[0].x - 10) < 1e-9)
+})
+
+test('bakeSpringRotations: 先頭 sample が読めない場合の fallback は絶対 0° ではなく rest', () => {
+	// rest が非ゼロの bone で先頭が読めないケース。 fallback が絶対 0° だと
+	// keyframe 値が `0 − rest` になり、 rest ではない姿勢を再生してしまう
+	const rest = { x: 25, y: -40, z: 10 }
+	const scene = makeFakeScene([target('a', 'bone_a', rest)], (_uuid, frame) => (
+		frame === 0 ? null : { ...rest }
+	))
+
+	const result = bakeSpringRotations(scene, { frameCount: 9, ...OPS })
+	const first = result.bones[0].keyframes[0]
+
+	for (const axis of ['x', 'y', 'z']) {
+		assert.ok(Math.abs(first.data_points[0][axis]) < 1e-9, `${axis} = ${first.data_points[0][axis]}`)
+	}
 })
 
 // --- 派生 animation data の組み立て ---
