@@ -103,8 +103,8 @@ export interface InspectionProjectLifecycle<Project extends object = object> {
 	readonly generation: number
 	readonly loadObserved: boolean
 	readonly fault: InspectionFault | null
-	beginPluginLoad(project: Project | null): void
-	observeProject(project: Project | null, loadObserved: boolean): void
+	beginPluginLoad(project: Project | null | undefined): void
+	observeProject(project: Project | null | undefined, loadObserved: boolean): void
 	latchFault(generation: number, reason: unknown): void
 	isFaulted(generation: number): boolean
 }
@@ -131,34 +131,36 @@ export function createInspectionProjectLifecycle<Project extends object = object
 		get loadObserved(): boolean { return loadObserved },
 		get fault(): InspectionFault | null { return currentFault },
 		beginPluginLoad(project): void {
+			const normalizedProject = project ?? null
 			generation++
 			generations = new WeakMap<Project, number>()
 			observedProjects = new WeakSet<Project>()
 			faults = new WeakMap<Project, InspectionFault>()
-			if (project !== null) generations.set(project, generation)
-			setCurrentProject(project)
+			if (normalizedProject !== null) generations.set(normalizedProject, generation)
+			setCurrentProject(normalizedProject)
 		},
 		observeProject(project, projectWasLoaded): void {
-			if (project === null) {
+			const normalizedProject = project ?? null
+			if (normalizedProject === null) {
 				generation++
 				setCurrentProject(null)
 				return
 			}
 			if (projectWasLoaded) {
 				generation++
-				generations.set(project, generation)
-				observedProjects.add(project)
-				faults.delete(project)
+				generations.set(normalizedProject, generation)
+				observedProjects.add(normalizedProject)
+				faults.delete(normalizedProject)
 			} else {
-				const knownGeneration = generations.get(project)
+				const knownGeneration = generations.get(normalizedProject)
 				if (knownGeneration === undefined) {
 					generation++
-					generations.set(project, generation)
+					generations.set(normalizedProject, generation)
 				} else {
 					generation = knownGeneration
 				}
 			}
-			setCurrentProject(project)
+			setCurrentProject(normalizedProject)
 		},
 		latchFault(faultGeneration, reason): void {
 			if (faultGeneration !== generation) return
