@@ -84,6 +84,11 @@ import {
 	type SpringEvaluationInputV1,
 	type InspectionPoseRead,
 } from './inspectionProvider'
+import {
+	createLoadSignalCoalescer,
+	installAjCodecObserver,
+	type AjBlueprintCodecHandleLike,
+} from './ajCodecObserver'
 
 declare const Plugin: { register(id: string, opts: Record<string, unknown>): void }
 declare const Blockbench: {
@@ -130,7 +135,7 @@ declare function updateSelection(): void
 // AnimatedJava が公開する render hook registry を持つ global。 registry の形 (=
 // AjRenderHooksApi) と optional で受ける理由は ajRegistrar.ts 側に集約する。
 declare const window: {
-	AnimatedJava?: { renderHooks?: AjRenderHooksApi }
+	AnimatedJava?: { renderHooks?: AjRenderHooksApi; BLUEPRINT_CODEC?: AjBlueprintCodecHandleLike }
 	BlockbenchSpringBoneInspection?: unknown
 } | undefined
 
@@ -2098,6 +2103,7 @@ function installTickLoop(): () => void {
 	// wasKeyframeEditActive の宣言は invalidateAnimationCache より先 (= 内部で reset するため)。
 	// 詳細な役割は下記 onAnimFrame ブロックのコメント参照。
 	let wasKeyframeEditActive = false
+	const shouldMarkLoadGeneration = createLoadSignalCoalescer()
 
 	// finished_edit / select_animation は BB core の最後の preview より後に発火する経路があるため、
 	// invalidate だけでなく preview を再発火し、paused 中も新 pose をその場で replay する。
@@ -2187,7 +2193,17 @@ function installTickLoop(): () => void {
 	// flag を見て即 return するため、 遅延中の評価は遮断される (= module スコープ側の
 	// projectSwitchPending コメント参照)。
 	const onProjectSwitch = (loadObserved = false): void => {
-		markInspectionProjectGeneration(loadObserved)
+		if (loadObserved) {
+			const project = Project as object | null
+			// AJ's codec load can emit Blockbench's load_project and its own parsed
+			// event in one synchronous load. They are one provenance signal, not two
+			// project generations; keep the first signal's fault boundary intact.
+			if (shouldMarkLoadGeneration(project)) {
+				markInspectionProjectGeneration(true)
+			}
+		} else {
+			markInspectionProjectGeneration(false)
+		}
 		projectSwitchPending = true
 		invalidatePreviewSession()
 		// override memo をクリア (= 旧 project の animation instance 参照を握り続けない。
@@ -2266,6 +2282,13 @@ function installTickLoop(): () => void {
 			console.warn(`[${PLUGIN_ID}] undo/redo refresh failed`, e)
 		}
 	}
+	const disposeAjCodecObserver = installAjCodecObserver({
+		getHandle: () => window?.AnimatedJava?.BLUEPRINT_CODEC,
+		onPluginLoaded: (listener) => { Blockbench.on('loaded_plugin', listener) },
+		offPluginLoaded: (listener) => { Blockbench.removeListener?.('loaded_plugin', listener) },
+		onPluginUnloaded: (listener) => { Blockbench.on('unloaded_plugin', listener) },
+		offPluginUnloaded: (listener) => { Blockbench.removeListener?.('unloaded_plugin', listener) },
+	}, () => onProjectSwitch(true))
 
 	Blockbench.on('display_animation_frame', onAnimFrame)
 	Blockbench.on('select_project', onProjectSelect)
@@ -2279,6 +2302,7 @@ function installTickLoop(): () => void {
 	Blockbench.on('select_animation', onSelectAnimation)
 
 	return (): void => {
+		disposeAjCodecObserver()
 		// 予約済み rAF の cancel + disposed guard (= unload 後にコールバックが走って
 		// cleanup 済みの registry を再充填するのを防ぐ)。 flag 類も元に戻す。
 		tickLoopDisposed = true
