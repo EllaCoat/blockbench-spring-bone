@@ -32,6 +32,15 @@ Personal-use plugin. Not distributed publicly. Issues / PRs may not be triaged.
 - AnimatedJava integration: bake simulated transforms into the export pipeline so the
   motion is reproducible in-game
 
+## Inspection API
+
+Version 0.0.17 publishes a synchronous, read-only
+`window.BlockbenchSpringBoneInspection` object on each plugin load. API version 1 exposes
+`inspectAnimation(animationUuid)` and `evaluatePoseBatch(request)` for the
+`aj_export_single_animation` basis. Requests are capped at 64 frames, 32 nodes, 512 pose
+samples, and 3,600 total Spring substeps; scene and editor state are restored before a result
+is returned.
+
 ## Roadmap
 
 - Phase 0 — plugin skeleton + Blockbench load

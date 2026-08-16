@@ -44,6 +44,8 @@ import {
 	checkRestWindowTiming,
 	classifyRestWindowWeight,
 	createRenderSampleCountCache,
+	deriveDisplayedFinalFrame,
+	resolveFadeFrames,
 	restWindowFingerprint,
 } from './restWindow'
 import {
@@ -64,6 +66,24 @@ import {
 } from './bakeTimeline'
 import type { AxisTriple, QuaternionOps } from './curveFit'
 import { registerSpringPanel } from './ui'
+import {
+	createAjSingleAnimationEvaluator,
+	createInspectionHost,
+	createInspectionProjectLifecycle,
+	evaluateInspectionFrame,
+	restoreSelectionInPlace,
+	suppressInspectionEffects,
+} from './inspectionAdapter'
+import {
+	createSpringBoneInspectionApi,
+	isInspectionFaultedForGeneration,
+	installInspectionGlobal,
+	type InspectionHost,
+	type InspectionMode,
+	type InspectionRuntimeOwner,
+	type SpringEvaluationInputV1,
+	type InspectionPoseRead,
+} from './inspectionProvider'
 
 declare const Plugin: { register(id: string, opts: Record<string, unknown>): void }
 declare const Blockbench: {
@@ -72,18 +92,20 @@ declare const Blockbench: {
 	// bake の結果通知 / 密度警告に使う (= js/api.ts:235)。
 	showMessageBox?(options: Record<string, unknown>, callback?: (button: number | string) => void): unknown
 }
-declare const Project: { groups?: unknown[]; elements?: unknown[]; saved?: boolean } | null
+declare const Project: { uuid?: string; groups?: unknown[]; elements?: unknown[]; saved?: boolean } | null
 declare const Group: any
 declare const Canvas: { scene?: { updateMatrixWorld?(force?: boolean): void }; updateView?(opt: unknown): void }
 declare const Timeline: { time?: number; playing?: boolean }
 declare const Animator: {
 	showDefaultPose?(reduced?: boolean): void
+	resetLastValues?(): void
 	stackAnimations?(stack: unknown[], in_loop: boolean, blend?: number): void
 	// paused 中の即時反映用 (= Property 値変更で display_animation_frame を強制 fire、
 	// 停止中でも Panel slider の効果が視覚に出る)。
 	preview?(): void
 }
 declare const Animation: { selected?: any; all?: any[] } | undefined
+declare const Outliner: { selected?: any[]; elements?: any[] } | undefined
 // BB の Animation Controller。 controller 再生中は playing flag ではなく controller の
 // state が「今再生されている animation」 を決める (= animation_mode.js:357-394)。
 declare const AnimationController: { selected?: any } | undefined
@@ -107,10 +129,13 @@ declare const Undo: any
 declare function updateSelection(): void
 // AnimatedJava が公開する render hook registry を持つ global。 registry の形 (=
 // AjRenderHooksApi) と optional で受ける理由は ajRegistrar.ts 側に集約する。
-declare const window: { AnimatedJava?: { renderHooks?: AjRenderHooksApi } } | undefined
+declare const window: {
+	AnimatedJava?: { renderHooks?: AjRenderHooksApi }
+	BlockbenchSpringBoneInspection?: unknown
+} | undefined
 
 const PLUGIN_ID = 'spring_bone'
-const PLUGIN_VERSION = '0.0.16'
+const PLUGIN_VERSION = '0.0.17'
 
 // name prefix `spring_` = **旧方式** (= v0.0.10 まで) の spring 化 truth。 現在の truth は
 // Group Property `spring_bone_enabled` (= enum 3 値) に移行済みで、 prefix は
@@ -2009,6 +2034,9 @@ function ensurePreviewSession(context: PreviewAnimationContext): void { previewS
 function invalidatePreviewSession(): void { previewSession.invalidate() }
 
 function tick(): void {
+	// A failed inspection restore leaves the current scene generation unsafe. Keep the
+	// ordinary preview path stopped until a new load or plugin reload clears the latch.
+	if (isInspectionFaulted()) return
 	// exportActive 中は preview session を張らない : 張ると runtime.evaluateSample が走り、
 	// AJ が確定させた scene pose を preview 側の評価結果で上書きしてしまう
 	// (= runtime は preview / export で共用する module singleton)。
@@ -2158,7 +2186,8 @@ function installTickLoop(): () => void {
 	// Animation.select() → Animator.preview() が旧 entry を評価してしまう。 tick() が冒頭で
 	// flag を見て即 return するため、 遅延中の評価は遮断される (= module スコープ側の
 	// projectSwitchPending コメント参照)。
-	const onProjectSwitch = (): void => {
+	const onProjectSwitch = (loadObserved = false): void => {
+		markInspectionProjectGeneration(loadObserved)
 		projectSwitchPending = true
 		invalidatePreviewSession()
 		// override memo をクリア (= 旧 project の animation instance 参照を握り続けない。
@@ -2188,6 +2217,8 @@ function installTickLoop(): () => void {
 			requestAnimatorPreview('project switch')
 		})
 	}
+	const onProjectLoad = (): void => { onProjectSwitch(true) }
+	const onProjectSelect = (): void => { onProjectSwitch(false) }
 	const onUpdateSelection = (): void => {
 		// export 中の扱いは rescanRegistry() 側の guard に委ねる (= ここで早期 return しない)。
 		// この event は AJ の export 中にも飛ぶ : Animation.select() → unselectAllElements() が
@@ -2237,8 +2268,9 @@ function installTickLoop(): () => void {
 	}
 
 	Blockbench.on('display_animation_frame', onAnimFrame)
-	Blockbench.on('select_project', onProjectSwitch)
-	Blockbench.on('load_project', onProjectSwitch)
+	Blockbench.on('select_project', onProjectSelect)
+	Blockbench.on('load_project', onProjectLoad)
+	Blockbench.on('new_project', onProjectLoad)
 	Blockbench.on('update_selection', onUpdateSelection)
 	Blockbench.on('select_mode', onModeChange)
 	Blockbench.on('undo', onUndoRedo)
@@ -2259,8 +2291,9 @@ function installTickLoop(): () => void {
 		// 止まったままになるのを防ぐ)。
 		exportGate.reset()
 		Blockbench.removeListener?.('display_animation_frame', onAnimFrame)
-		Blockbench.removeListener?.('select_project', onProjectSwitch)
-		Blockbench.removeListener?.('load_project', onProjectSwitch)
+		Blockbench.removeListener?.('select_project', onProjectSelect)
+		Blockbench.removeListener?.('load_project', onProjectLoad)
+		Blockbench.removeListener?.('new_project', onProjectLoad)
 		Blockbench.removeListener?.('update_selection', onUpdateSelection)
 		Blockbench.removeListener?.('select_mode', onModeChange)
 		Blockbench.removeListener?.('undo', onUndoRedo)
@@ -2297,8 +2330,19 @@ const exportDriverHost: ExportDriverHost<PreviewAnimationContext> = {
 	endAnimation: () => { runtime.endAnimation() },
 	get currentStepIndex(): number | null { return runtime.currentStepIndex },
 	get isEvaluating(): boolean { return runtime.isEvaluating },
-	suspendTick: () => { exportGate.suspend() },
-	resumeTick: () => { exportGate.resume() },
+	suspendTick: () => {
+		exportGate.suspend()
+		// export hook と inspection / bake は同じ runtime singleton を共有する。
+		// owner を gate とは別に記録して、AJ が評価中の再入を黙って通さない。
+		runtimeOwner = 'aj_export'
+	},
+	resumeTick: () => {
+		try {
+			exportGate.resume()
+		} finally {
+			if (runtimeOwner === 'aj_export') runtimeOwner = 'none'
+		}
+	},
 	invalidatePreview: () => { invalidatePreviewSession() },
 	// AJ v2 の周期情報をそのまま rest window の入力にする (= export では
 	// renderSampleCount が正本。 preview 側の deriveRenderSampleCount で数え直さない)。
@@ -2336,6 +2380,11 @@ const exportDriverHost: ExportDriverHost<PreviewAnimationContext> = {
 	// **false を返して黙って見送らない** : それだと物理の載っていない datapack がそのまま
 	// 出力される (= makeExportContext の契約違反時と同じ方針で、 気付ける形で止める)。
 	isEnabled: () => {
+		if (isInspectionFaulted()) {
+			throw new Error(
+				`[${PLUGIN_ID}] spring inspection restore failed for the current project; do not save and reopen the project before exporting`,
+			)
+		}
 		if (!ENABLE_AJ_EXPORT || registry.size === 0) return false
 		if (runtimeOwner !== 'none' || exportGate.isExportActive || runtime.isEvaluating) {
 			throw new Error(
@@ -2377,7 +2426,19 @@ const RAD2DEG = 180 / Math.PI
 // 握っているか。 現状は bake だけが明示的に所有権を取る (= export 側は exportGate の
 // isExportActive が実質の所有印)。 export driver の isEnabled がこれを見て、 bake 中に
 // 始まった export を弾く (= 互いの session と gate を上書きし合うのを防ぐ)。
-let runtimeOwner: 'none' | 'bake' = 'none'
+let runtimeOwner: InspectionRuntimeOwner = 'none'
+
+// evaluation の fault は project identity + generation 単位。復元不能な scene を同じ世代で
+// 再利用すると結果や export を壊すため、該当 project の full load / new project / plugin reload まで fail closed。
+const inspectionLifecycle = createInspectionProjectLifecycle<object>()
+
+function isInspectionFaulted(): boolean {
+	return isInspectionFaultedForGeneration(inspectionLifecycle.fault, inspectionLifecycle.generation)
+}
+
+function markInspectionProjectGeneration(loadObserved: boolean): void {
+	inspectionLifecycle.observeProject(Project as object | null, loadObserved)
+}
 
 // bake の除外 node 集合 (= 常に空)。 AJ export の excluded_nodes 相当の口だが、 bake は
 // editor 上の全 spring bone を対象にするため空集合を渡す。
@@ -2562,6 +2623,340 @@ function suppressEffectAnimator(animation: any): () => void {
 	}
 }
 
+interface InspectionSceneState {
+	pose: AnimatorPoseSnapshot
+	timelineTime: unknown
+	timelinePlaying: unknown
+	playing: Array<{ animation: any; value: unknown }>
+	selection: {
+		outliner: any[] | null
+		group: unknown
+		animation: unknown
+		controller: unknown
+	}
+	projectSaved: unknown
+	projectUuid: string | null
+	undoIndex: unknown
+	undoHistory: unknown
+	undoCurrentSave: unknown
+}
+
+function captureInspectionState(): InspectionSceneState {
+	const animations = Array.isArray(Animation?.all) ? Animation.all : []
+	return {
+		pose: captureAnimatorPose(),
+		timelineTime: Timeline?.time,
+		timelinePlaying: Timeline?.playing,
+		playing: animations.map((animation) => ({ animation, value: animation?.playing })),
+		selection: {
+			outliner: Array.isArray(Outliner?.selected) ? Outliner.selected.slice() : null,
+			group: (Group as any)?.selected,
+			animation: Animation?.selected,
+			controller: AnimationController?.selected,
+		},
+		projectSaved: Project?.saved,
+		projectUuid: typeof Project?.uuid === 'string' ? Project.uuid : null,
+		undoIndex: Undo?.index,
+		undoHistory: Undo?.history,
+		undoCurrentSave: Undo?.current_save,
+	}
+}
+
+function restoreInspectionState(state: InspectionSceneState): void {
+	restoreAnimatorPose(state.pose)
+	Canvas?.scene?.updateMatrixWorld?.(true)
+	if (Timeline) {
+		Timeline.time = state.timelineTime as number
+		Timeline.playing = state.timelinePlaying as boolean
+	}
+	for (const entry of state.playing) entry.animation.playing = entry.value
+	if (Outliner && state.selection.outliner !== null) restoreSelectionInPlace(Outliner, state.selection.outliner)
+	if (Group) (Group as any).selected = state.selection.group
+	if (Animation) Animation.selected = state.selection.animation
+	if (AnimationController) AnimationController.selected = state.selection.controller
+	if (Project && !Object.is(Project.saved, state.projectSaved)) Project.saved = state.projectSaved as boolean
+	if (Undo) {
+		Undo.index = state.undoIndex as number
+		Undo.current_save = state.undoCurrentSave
+	}
+}
+
+function sameReferenceList(a: readonly unknown[] | null, b: readonly unknown[] | null): boolean {
+	if (a === null || b === null) return a === b
+	return a.length === b.length && a.every((value, index) => value === b[index])
+}
+
+function sameAnimatorPose(a: AnimatorPoseSnapshot, b: AnimatorPoseSnapshot): boolean {
+	if (a.entries.length !== b.entries.length) return false
+	return a.entries.every((entry, index) => {
+		const other = b.entries[index]
+		return entry.mesh === other.mesh &&
+			Object.is(entry.px, other.px) && Object.is(entry.py, other.py) && Object.is(entry.pz, other.pz) &&
+			Object.is(entry.qx, other.qx) && Object.is(entry.qy, other.qy) &&
+			Object.is(entry.qz, other.qz) && Object.is(entry.qw, other.qw) &&
+			Object.is(entry.sx, other.sx) && Object.is(entry.sy, other.sy) && Object.is(entry.sz, other.sz) &&
+			entry.hasPre === other.hasPre && Object.is(entry.prx, other.prx) &&
+			Object.is(entry.pry, other.pry) && Object.is(entry.prz, other.prz) && entry.pro === other.pro
+	})
+}
+
+function verifyInspectionState(state: InspectionSceneState): boolean {
+	const current = captureInspectionState()
+	return sameAnimatorPose(state.pose, current.pose) &&
+		Object.is(state.timelineTime, current.timelineTime) &&
+		Object.is(state.timelinePlaying, current.timelinePlaying) &&
+		state.playing.length === current.playing.length &&
+		state.playing.every((entry, index) => entry.animation === current.playing[index].animation && Object.is(entry.value, current.playing[index].value)) &&
+		sameReferenceList(state.selection.outliner, current.selection.outliner) &&
+		state.selection.group === current.selection.group &&
+		state.selection.animation === current.selection.animation &&
+		state.selection.controller === current.selection.controller &&
+		Object.is(state.projectSaved, current.projectSaved) &&
+		state.projectUuid === current.projectUuid &&
+		Object.is(state.undoIndex, current.undoIndex) &&
+		state.undoHistory === current.undoHistory &&
+		state.undoCurrentSave === current.undoCurrentSave
+}
+
+function inspectionAnimationTiming(animation: any): SpringEvaluationInputV1['timing'] {
+	const renderSampleCount = renderSampleCountCache.get(animation, animation?.length)
+	if (renderSampleCount === null) {
+		throw Object.assign(new Error('animation render samples cannot be enumerated'), { code: 'EVALUATION_STATE_UNAVAILABLE' })
+	}
+	const loopMode = animation?.loop
+	const loopDelayFrames = Number(animation?.loop_delay) || 0
+	const violation = checkPreviewRestWindowTiming({ renderSampleCount, loopMode, loopDelayFrames })
+	if (violation !== null) {
+		throw Object.assign(new Error(`invalid animation timing: ${violation}`), { code: 'EVALUATION_STATE_UNAVAILABLE' })
+	}
+	const requestedFadeFrames = readRestFadeFrames(animation)
+	const displayedFinalFrame = deriveDisplayedFinalFrame({ renderSampleCount, loopMode, loopDelayFrames })
+	const resolvedFadeFrames = resolveFadeFrames(requestedFadeFrames, displayedFinalFrame)
+	return {
+		source_fps: 20,
+		simulation_fps: 60,
+		substeps_per_frame: 3,
+		animation_length_seconds: typeof animation?.length === 'number' ? animation.length : Number(animation?.length),
+		render_sample_count: renderSampleCount,
+		loop_mode: loopMode,
+		loop_delay_frames: loopDelayFrames,
+		rest_fade_frames: requestedFadeFrames,
+		displayed_final_frame: displayedFinalFrame,
+		resolved_fade_frames: resolvedFadeFrames,
+	}
+}
+
+function makeInspectionEvaluationInput(animation: any): SpringEvaluationInputV1 {
+	if (projectSwitchPending) {
+		throw Object.assign(new Error('project switch is still being synchronized'), {
+			code: 'EVALUATION_STATE_UNAVAILABLE',
+		})
+	}
+	const animationUuid = typeof animation?.uuid === 'string' ? animation.uuid : null
+	if (animationUuid === null) {
+		throw Object.assign(new Error('animation UUID is unavailable'), { code: 'EVALUATION_TARGET_NOT_FOUND' })
+	}
+	const timing = inspectionAnimationTiming(animation)
+	const overrides = readOverrides(animation)
+	const baked = isBakedAnimation(animation)
+	const springBones = Array.from(registry.values())
+		.sort((a, b) => a.group.uuid.localeCompare(b.group.uuid))
+		.map((entry) => {
+			const state = getSpringBoneState(entry.group)
+			const override = overrides[entry.group.uuid]
+			const effective = resolveEffective(entry.base, state, override, DEFAULT_CONFIG)
+			const dir = entry.geometry.restLocalDir
+			return {
+				uuid: entry.group.uuid,
+				parent_uuid: entry.parentUuid,
+				state,
+				enabled: effective.enabled && !baked,
+				drag: effective.drag,
+				stiffness: effective.stiffness,
+				gravity: effective.gravity,
+				rest_length: entry.geometry.restLength,
+				rest_direction: [dir.x, dir.y, dir.z] as [number, number, number],
+				override: override ? { ...override } : null,
+			}
+		})
+	const bakedFrom = animation?.[ANIM_BAKED_FROM_KEY]
+	const paramHash = animation?.[ANIM_BAKED_PARAM_HASH_KEY]
+	const sourceHash = animation?.[ANIM_BAKED_SOURCE_HASH_KEY]
+	const bakedVersion = animation?.[ANIM_BAKED_VERSION_KEY]
+	const displayedFinalFrame = timing.displayed_final_frame
+	return {
+		animation_uuid: animationUuid,
+		schema_version: normalizeSchemaVersion(animation?.[ANIM_SCHEMA_VERSION_KEY]),
+		rest_fade_frames: timing.rest_fade_frames,
+		baked: {
+			is_baked: baked,
+			baked_from: typeof bakedFrom === 'string' && bakedFrom.length > 0 ? bakedFrom : null,
+			param_hash: typeof paramHash === 'string' && paramHash.length > 0 ? paramHash : null,
+			source_hash: typeof sourceHash === 'string' && sourceHash.length > 0 ? sourceHash : null,
+			version: typeof bakedVersion === 'number' && Number.isFinite(bakedVersion) ? bakedVersion : null,
+		},
+		spring_bones: springBones,
+		timing,
+		rest_window: {
+			requested_fade_frames: timing.rest_fade_frames,
+			displayed_final_frame: displayedFinalFrame,
+			resolved_fade_frames: timing.resolved_fade_frames,
+		},
+		evaluation_basis: 'aj_export_single_animation',
+		load_provenance: inspectionLifecycle.loadObserved ? 'complete' : 'unverified_late_enable',
+		project_uuid: typeof Project?.uuid === 'string' ? Project.uuid : null,
+		provider_id: PLUGIN_ID,
+		provider_api_version: 1,
+		provider_version: PLUGIN_VERSION,
+		simulation_version: 'spring-runtime-v1',
+	}
+}
+
+let inspectionContext: PreviewAnimationContext | null = null
+
+// AJ animationRenderer.getAnimatableNodes() の順序に寄せた、単独 animation 用の
+// node 列挙。Outliner.elements が公開されない旧 BB では Project の配列へフォールバックする。
+// Group.all / Project.elements の重複は identity で除去し、同じ node を二度評価しない。
+function getInspectionAnimatableNodes(): readonly unknown[] {
+	const nodes: any[] = []
+	const seen = new Set<any>()
+	const candidates = [
+		...((Array.isArray((Group as any)?.all) ? (Group as any).all : []) as any[]),
+		...((Array.isArray(Outliner?.elements) ? Outliner?.elements : []) as any[]),
+		...(((Project as { elements?: unknown[] } | null)?.elements ?? []) as any[]),
+		...(((Project as { groups?: unknown[] } | null)?.groups ?? []) as any[]),
+	]
+	for (const node of candidates) {
+		if (node === null || node === undefined || seen.has(node)) continue
+		seen.add(node)
+		nodes.push(node)
+	}
+	return nodes
+}
+
+const evaluateInspectionSingleAnimation = createAjSingleAnimationEvaluator({
+	timeline: Timeline,
+	animator: Animator,
+	canvas: Canvas,
+	getAnimatableNodes: getInspectionAnimatableNodes,
+})
+
+const inspectionHost: InspectionHost<any, InspectionSceneState> = createInspectionHost({
+	provider_version: PLUGIN_VERSION,
+	simulation_version: 'spring-runtime-v1',
+	getProjectGeneration: () => inspectionLifecycle.generation,
+	getProjectUuid: () => typeof Project?.uuid === 'string' ? Project.uuid : null,
+	getAnimation: (animationUuid) => {
+		const all = Array.isArray(Animation?.all) ? Animation.all : []
+		return all.find((animation) => animation?.uuid === animationUuid) ?? null
+	},
+	getEvaluationInput: (animation) => makeInspectionEvaluationInput(animation),
+	getNodeUuids: () => {
+		const uuids = new Set<string>()
+		for (const node of [
+			...((Project as { groups?: unknown[] } | null)?.groups ?? []),
+			...((Project as { elements?: unknown[] } | null)?.elements ?? []),
+		]) {
+			const uuid = (node as { uuid?: unknown } | null)?.uuid
+			if (typeof uuid === 'string') uuids.add(uuid)
+		}
+		return Array.from(uuids).sort()
+	},
+	isModeSupported: () => Modes?.animate === true,
+	getMode: (_animation, input) => {
+		if (input.baked.is_baked) return 'baked_keyframes'
+		return input.spring_bones.some((bone) => bone.enabled) ? 'simulated' : 'no_active_spring'
+	},
+	getRuntimeOwner: () => runtimeOwner,
+	getRuntimeEvaluating: () => runtime.isEvaluating,
+	acquireRuntimeOwner: (owner) => {
+		if (runtimeOwner !== 'none' || exportGate.isExportActive || runtime.isEvaluating) return false
+		runtimeOwner = owner
+		return true
+	},
+	releaseRuntimeOwner: (owner) => {
+		if (runtimeOwner === owner) runtimeOwner = 'none'
+	},
+	isFaulted: (generation) => inspectionLifecycle.isFaulted(generation),
+	latchFault: (generation, reason) => {
+		inspectionLifecycle.latchFault(generation, reason)
+	},
+	captureState: () => captureInspectionState(),
+	restoreState: (state) => restoreInspectionState(state),
+	verifyState: (state) => verifyInspectionState(state),
+	suspendPreview: () => {
+		invalidatePreviewSession()
+		exportGate.suspend()
+	},
+	resumePreview: () => {
+		exportGate.resume()
+	},
+	refreshPreview: () => { invalidatePreviewSession() },
+	suppressEffects: (animation) => suppressInspectionEffects(animation),
+	beginEvaluation: (animation) => {
+		const input = makeInspectionEvaluationInput(animation)
+		inspectionContext = makeExportAnimationContext(animation, BAKE_EXCLUDED_NODES, {
+			timing: {
+				renderSampleCount: input.timing.render_sample_count,
+				loopMode: input.timing.loop_mode,
+				loopDelayFrames: input.timing.loop_delay_frames,
+			},
+			requestedFadeFrames: input.timing.rest_fade_frames,
+		})
+		runtime.beginAnimation(inspectionContext, (time, _context) => {
+			evaluateInspectionSingleAnimation(animation, time)
+		})
+	},
+	evaluateFrame: (animation, _frameIndex, stepIndex) => {
+		if (inspectionContext === null) throw new Error('inspection session not started')
+		evaluateInspectionFrame(
+			runtime,
+			(time) => evaluateInspectionSingleAnimation(animation, time),
+			stepIndex,
+		)
+	},
+	readPose: (nodeUuid): InspectionPoseRead | null => {
+		const springGroup = registry.get(nodeUuid)?.group
+		const projectNode = [
+			...((Project as { groups?: unknown[] } | null)?.groups ?? []),
+			...((Project as { elements?: unknown[] } | null)?.elements ?? []),
+		].find((node) => (node as { uuid?: unknown } | null)?.uuid === nodeUuid) as { mesh?: any } | undefined
+		const mesh = springGroup?.mesh ?? projectNode?.mesh
+		const matrix = mesh?.matrixWorld?.elements
+		const quaternion = mesh?.quaternion
+		if (!mesh || !matrix || !quaternion) return null
+		return {
+			local_quaternion: { x: quaternion.x, y: quaternion.y, z: quaternion.z, w: quaternion.w },
+			matrix_world: Array.from(matrix),
+		}
+	},
+	endEvaluation: () => {
+		try {
+			runtime.endAnimation()
+		} finally {
+			inspectionContext = null
+		}
+	},
+	isInputCurrent: (animation, input) => {
+		try {
+			return JSON.stringify(makeInspectionEvaluationInput(animation)) === JSON.stringify(input)
+		} catch {
+			return false
+		}
+	},
+})
+
+function installInspectionProvider(): () => void {
+	inspectionLifecycle.beginPluginLoad(Project as object | null)
+	const api = createSpringBoneInspectionApi(inspectionHost)
+	const target = window as unknown as { BlockbenchSpringBoneInspection?: unknown }
+	const cleanup = installInspectionGlobal(target, api)
+	return (): void => {
+		cleanup()
+		inspectionContext = null
+	}
+}
+
 // bake の結果 / 中断理由をユーザーへ伝える。 showMessageBox が使えない環境
 // (= 旧 BB / テスト) では console へ落とす。
 function showBakeMessage(title: string, message: string): void {
@@ -2611,6 +3006,10 @@ function runSpringBake(animation: any): void {
 		return
 	}
 	if (!animation) return
+	if (isInspectionFaulted()) {
+		showBakeMessage('Spring bake', 'Spring の評価復元に失敗しました。保存せず project を開き直してください')
+		return
+	}
 	// **animate モード限定** : bake は applyPoseAt (= showDefaultPose + stackAnimations) で
 	// scene を frame ごとに書き換える。 edit モードで走らせると編集中の pose を壊したまま、
 	// 後始末の Animator.preview も (edit モードでは呼べないため) 効かない。
@@ -2862,6 +3261,7 @@ Plugin.register(PLUGIN_ID, {
 		// input (= 数値 + NumSlider) が edit モードで自動生成される。
 		// tick loop は Property が生えている前提で config 値を読むため、 Property 登録が先。
 		registerProperties()
+		cleanups.push(installInspectionProvider())
 		cleanups.push(installTickLoop())
 		// animate モード用の専用 Panel を register (= edit モードは element_panel input に任せる)。
 		// 値変更時は onSpringPropertyChange 経由で registry sync + fingerprint invalidate される。
