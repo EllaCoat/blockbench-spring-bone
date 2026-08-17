@@ -103,8 +103,8 @@ export interface InspectionProjectLifecycle<Project extends object = object> {
 	readonly generation: number
 	readonly loadObserved: boolean
 	readonly fault: InspectionFault | null
-	beginPluginLoad(project: Project | null | undefined): void
-	observeProject(project: Project | null | undefined, loadObserved: boolean): void
+	beginPluginLoad(project: Project | 0 | null | undefined): void
+	observeProject(project: Project | 0 | null | undefined, loadObserved: boolean): void
 	latchFault(generation: number, reason: unknown): void
 	isFaulted(generation: number): boolean
 }
@@ -131,7 +131,7 @@ export function createInspectionProjectLifecycle<Project extends object = object
 		get loadObserved(): boolean { return loadObserved },
 		get fault(): InspectionFault | null { return currentFault },
 		beginPluginLoad(project): void {
-			const normalizedProject = project ?? null
+			const normalizedProject = typeof project === 'object' && project !== null ? project : null
 			generation++
 			generations = new WeakMap<Project, number>()
 			observedProjects = new WeakSet<Project>()
@@ -140,7 +140,7 @@ export function createInspectionProjectLifecycle<Project extends object = object
 			setCurrentProject(normalizedProject)
 		},
 		observeProject(project, projectWasLoaded): void {
-			const normalizedProject = project ?? null
+			const normalizedProject = typeof project === 'object' && project !== null ? project : null
 			if (normalizedProject === null) {
 				generation++
 				setCurrentProject(null)

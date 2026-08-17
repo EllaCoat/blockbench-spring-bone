@@ -97,7 +97,12 @@ declare const Blockbench: {
 	// bake の結果通知 / 密度警告に使う (= js/api.ts:235)。
 	showMessageBox?(options: Record<string, unknown>, callback?: (button: number | string) => void): unknown
 }
-declare const Project: { uuid?: string; groups?: unknown[]; elements?: unknown[]; saved?: boolean } | null
+declare const Project: {
+	uuid?: string
+	groups?: unknown[]
+	elements?: unknown[]
+	saved?: boolean
+} | 0 | null | undefined
 declare const Group: any
 declare const Canvas: { scene?: { updateMatrixWorld?(force?: boolean): void }; updateView?(opt: unknown): void }
 declare const Timeline: { time?: number; playing?: boolean }
@@ -2194,7 +2199,7 @@ function installTickLoop(): () => void {
 	// projectSwitchPending コメント参照)。
 	const onProjectSwitch = (loadObserved = false): void => {
 		if (loadObserved) {
-			const project = Project as object | null
+			const project = typeof Project === 'object' && Project !== null ? Project : null
 			// AJ's codec load can emit Blockbench's load_project and its own parsed
 			// event in one synchronous load. They are one provenance signal, not two
 			// project generations; keep the first signal's fault boundary intact.
@@ -2461,7 +2466,7 @@ function isInspectionFaulted(): boolean {
 }
 
 function markInspectionProjectGeneration(loadObserved: boolean): void {
-	inspectionLifecycle.observeProject(Project as object | null, loadObserved)
+	inspectionLifecycle.observeProject(Project, loadObserved)
 }
 
 // bake の除外 node 集合 (= 常に空)。 AJ export の excluded_nodes 相当の口だが、 bake は
@@ -2971,7 +2976,7 @@ const inspectionHost: InspectionHost<any, InspectionSceneState> = createInspecti
 })
 
 function installInspectionProvider(): () => void {
-	inspectionLifecycle.beginPluginLoad(Project as object | null)
+	inspectionLifecycle.beginPluginLoad(Project)
 	const api = createSpringBoneInspectionApi(inspectionHost)
 	const target = window as unknown as { BlockbenchSpringBoneInspection?: unknown }
 	const cleanup = installInspectionGlobal(target, api)
