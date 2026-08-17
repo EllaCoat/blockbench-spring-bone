@@ -18,6 +18,7 @@ export const INSPECTION_LIMITS = Object.freeze({
 
 export type InspectionRuntimeOwner = 'none' | 'aj_export' | 'bake' | 'inspection'
 export type InspectionMode = 'simulated' | 'baked_keyframes' | 'no_active_spring'
+export type InspectionPoseMode = 'source_pose' | 'spring_evaluated_pose'
 export type LoadProvenance = 'complete' | 'unverified_late_enable'
 
 export function isInspectionFaultedForGeneration(
@@ -112,6 +113,18 @@ export interface SpringPoseBatchV1 {
 	evaluation_input: SpringEvaluationInputV1
 }
 
+export interface VisitFrameV1 {
+	frame_index: number
+	time_seconds: number
+}
+
+export interface VisitSummaryV1 {
+	animation_uuid: string
+	pose_mode: InspectionPoseMode
+	frame_indices: number[]
+	visited_frames: number
+}
+
 export interface InspectionPoseRead {
 	local_quaternion: { x: number; y: number; z: number; w: number }
 	matrix_world: readonly number[]
@@ -143,8 +156,8 @@ export interface InspectionHost<Animation = unknown, State = unknown> {
 	resumePreview(): void
 	refreshPreview(): void
 	suppressEffects(animation: Animation): () => void
-	beginEvaluation(animation: Animation): void
-	evaluateFrame(animation: Animation, frameIndex: number, stepIndex: number): void
+	beginEvaluation(animation: Animation, poseMode?: InspectionPoseMode): void
+	evaluateFrame(animation: Animation, frameIndex: number, stepIndex: number, poseMode?: InspectionPoseMode): void
 	readPose(nodeUuid: string): InspectionPoseRead | null
 	endEvaluation(): void
 
@@ -157,10 +170,18 @@ export interface SpringBoneInspectionApiV1 {
 	readonly version: typeof INSPECTION_API_VERSION
 	readonly provider_id: typeof INSPECTION_PROVIDER_ID
 	readonly provider_version: string
-	readonly capabilities: { readonly evaluate_pose_batch: 1 }
+	readonly capabilities: { readonly evaluate_pose_batch: 1; readonly capture_pose_frames: 1 }
 	readonly limits: typeof INSPECTION_LIMITS
 	inspectAnimation(animationUuid: string): ProviderResult<SpringEvaluationInputV1>
 	evaluatePoseBatch(request: unknown): ProviderResult<SpringPoseBatchV1>
+	visitPoseFrames(
+		request: {
+			animation_uuid: string
+			pose_mode: InspectionPoseMode
+			frame_indices: number[]
+		},
+		visitor: (frame: VisitFrameV1) => void,
+	): ProviderResult<VisitSummaryV1>
 }
 
 function safeString(value: unknown): string {
@@ -188,7 +209,8 @@ function caughtError(error: unknown, fallbackCode = 'EVALUATION_FAILED'): Provid
 }
 
 function isRestoreFailure(error: unknown): boolean {
-	return (error as { code?: unknown } | null)?.code === 'EVALUATION_RESTORE_FAILED'
+	const code = (error as { code?: unknown } | null)?.code
+	return code === 'EVALUATION_RESTORE_FAILED'
 }
 
 function isSafeNonNegativeInteger(value: unknown): value is number {
@@ -290,6 +312,42 @@ function validateRequest(request: unknown): ProviderResult<{
 	} }
 }
 
+function validateVisitRequest(request: unknown): ProviderResult<{
+	animation_uuid: string
+	pose_mode: InspectionPoseMode
+	frame_indices: number[]
+}> {
+	if (typeof request !== 'object' || request === null || Array.isArray(request)) {
+		return errorResult('EVALUATION_INVALID_REQUEST', 'request must be an object')
+	}
+	const raw = request as Record<string, unknown>
+	if (typeof raw.animation_uuid !== 'string' || raw.animation_uuid.length === 0) {
+		return errorResult('EVALUATION_INVALID_REQUEST', 'animation_uuid must be a non-empty string')
+	}
+	if (raw.pose_mode !== 'source_pose' && raw.pose_mode !== 'spring_evaluated_pose') {
+		return errorResult('EVALUATION_MODE_UNSUPPORTED', 'pose_mode must be source_pose or spring_evaluated_pose')
+	}
+	const frames = validateUniqueNumbers(raw.frame_indices, 'frame_indices')
+	if (!frames.ok) return frames
+	if (frames.data.length > INSPECTION_LIMITS.max_frames_per_request) {
+		return errorResult('EVALUATION_LIMIT_EXCEEDED', `frame count exceeds ${INSPECTION_LIMITS.max_frames_per_request}`)
+	}
+	return { ok: true, data: {
+		animation_uuid: raw.animation_uuid,
+		pose_mode: raw.pose_mode,
+		frame_indices: frames.data,
+	} }
+}
+
+function isThenable(value: unknown): boolean {
+	if ((typeof value !== 'object' && typeof value !== 'function') || value === null) return false
+	try {
+		return typeof (value as { then?: unknown }).then === 'function'
+	} catch {
+		return true
+	}
+}
+
 function runCleanup(cleanups: Array<() => void>): unknown[] {
 	const failures: unknown[] = []
 	for (let i = cleanups.length - 1; i >= 0; i--) {
@@ -305,7 +363,9 @@ function runCleanup(cleanups: Array<() => void>): unknown[] {
 export function createSpringBoneInspectionApi<Animation = unknown, State = unknown>(
 	host: InspectionHost<Animation, State>,
 ): SpringBoneInspectionApiV1 {
-	const capabilities = Object.freeze({ evaluate_pose_batch: 1 as const })
+	const capabilities = Object.freeze({ evaluate_pose_batch: 1 as const, capture_pose_frames: 1 as const })
+	let visitInProgress = false
+	let visitReentryDetected = false
 
 	const inspectAnimation = (animationUuid: string): ProviderResult<SpringEvaluationInputV1> => {
 		try {
@@ -506,6 +566,185 @@ export function createSpringBoneInspectionApi<Animation = unknown, State = unkno
 		}
 	}
 
+	const visitPoseFrames = (request: unknown, visitor: unknown): ProviderResult<VisitSummaryV1> => {
+		if (visitInProgress) {
+			visitReentryDetected = true
+			return errorResult('EVALUATION_RUNTIME_BUSY', 'visitPoseFrames cannot be re-entered')
+		}
+		if (typeof visitor !== 'function') {
+			return errorResult('EVALUATION_INVALID_REQUEST', 'visitor must be a function')
+		}
+		let validated: ProviderResult<{
+			animation_uuid: string
+			pose_mode: InspectionPoseMode
+			frame_indices: number[]
+		}>
+		try {
+			validated = validateVisitRequest(request)
+		} catch (error) {
+			return caughtError(error, 'EVALUATION_INVALID_REQUEST')
+		}
+		if (!validated.ok) return validated
+
+		let generation: unknown
+		let animation: Animation | null = null
+		let input: SpringEvaluationInputV1
+		try {
+			generation = host.getProjectGeneration()
+			if (host.isFaulted(generation)) {
+				return errorResult(
+					'EVALUATION_RESTORE_FAILED',
+					'provider is faulted for the current project generation; do not save and reopen the project',
+				)
+			}
+			animation = host.getAnimation(validated.data.animation_uuid)
+			if (animation === null) {
+				return errorResult('EVALUATION_TARGET_NOT_FOUND', `animation ${validated.data.animation_uuid} was not found`)
+			}
+			if (host.isModeSupported && !host.isModeSupported(animation)) {
+				return errorResult('EVALUATION_MODE_UNSUPPORTED', 'current Blockbench mode cannot capture visual evidence')
+			}
+			if (host.getRuntimeOwner() !== 'none' || host.getRuntimeEvaluating()) {
+				return errorResult('EVALUATION_RUNTIME_BUSY', 'spring runtime is busy')
+			}
+			input = host.getEvaluationInput(animation)
+			if (input.animation_uuid !== validated.data.animation_uuid) {
+				return errorResult('EVALUATION_INPUT_STALE', 'provider returned an animation input for a different UUID')
+			}
+			if (input.load_provenance !== 'complete') {
+				return errorResult('EVALUATION_STATE_UNAVAILABLE', 'project load provenance is unverified; reopen the project with Spring enabled')
+			}
+			for (const frameIndex of validated.data.frame_indices) {
+				if (frameIndex >= input.timing.render_sample_count) {
+					return errorResult('EVALUATION_FRAME_OUT_OF_RANGE', `frame ${frameIndex} is outside render sample range`, {
+						render_sample_count: input.timing.render_sample_count,
+					})
+				}
+			}
+			if (validated.data.pose_mode === 'spring_evaluated_pose') {
+				const cost = preflightSubsteps(validated.data.frame_indices)
+				if (!cost.ok) return cost
+			}
+		} catch (error) {
+			return caughtError(error, 'EVALUATION_STATE_UNAVAILABLE')
+		}
+
+		const visitorFn = visitor as (frame: VisitFrameV1) => unknown
+		let releaseOwner: (() => void) | null = null
+		let restoreEffects: (() => void) | null = null
+		let resumePreview: (() => void) | null = null
+		let refreshPreview: (() => void) | null = null
+		let endEvaluation: (() => void) | null = null
+		let capturedState: State | null = null
+		let restoreState: (() => void) | null = null
+		let captureError: unknown = null
+		let cleanupFailures: unknown[] = []
+		let postconditionFailed = false
+		visitInProgress = true
+		visitReentryDetected = false
+		try {
+			if (!host.acquireRuntimeOwner('inspection')) {
+				captureError = Object.assign(new Error('spring runtime is busy'), { code: 'EVALUATION_RUNTIME_BUSY' })
+			} else {
+				releaseOwner = () => host.releaseRuntimeOwner('inspection')
+				capturedState = host.captureState()
+				restoreState = () => host.restoreState(capturedState as State)
+				restoreEffects = host.suppressEffects(animation as Animation)
+				host.suspendPreview()
+				resumePreview = () => host.resumePreview()
+				refreshPreview = () => host.refreshPreview()
+				host.beginEvaluation(animation as Animation, validated.data.pose_mode)
+				endEvaluation = () => host.endEvaluation()
+
+				for (const frameIndex of validated.data.frame_indices) {
+					const frame = { frame_index: frameIndex, time_seconds: frameIndex / 20 }
+					host.evaluateFrame(
+						animation as Animation,
+						frameIndex,
+						stepIndexFromFrame(frameIndex),
+						validated.data.pose_mode,
+					)
+					let visitorResult: unknown
+					try {
+						visitorResult = visitorFn(frame)
+					} catch (error) {
+						throw Object.assign(new Error('pose frame visitor failed'), {
+							code: 'EVALUATION_FAILED',
+							cause: error,
+						})
+					}
+					if (isThenable(visitorResult)) {
+						try {
+							Promise.resolve(visitorResult).catch(() => {})
+						} catch {
+							// A hostile thenable is still rejected as a synchronous-contract violation.
+						}
+						throw Object.assign(new Error('pose frame visitor must return synchronously'), {
+							code: 'EVALUATION_FAILED',
+						})
+					}
+					if (visitReentryDetected) {
+						throw Object.assign(new Error('visitPoseFrames cannot be re-entered'), {
+							code: 'EVALUATION_RUNTIME_BUSY',
+						})
+					}
+				}
+			}
+		} catch (error) {
+			captureError = error
+		} finally {
+			cleanupFailures = runCleanup(
+				[refreshPreview, releaseOwner, resumePreview, restoreState, restoreEffects, endEvaluation]
+					.filter((cleanup): cleanup is () => void => cleanup !== null),
+			)
+			if (capturedState !== null) {
+				try {
+					postconditionFailed = !host.verifyState(capturedState)
+				} catch (error) {
+					cleanupFailures.push(error)
+					postconditionFailed = true
+				}
+			}
+			visitInProgress = false
+			visitReentryDetected = false
+		}
+
+		if (cleanupFailures.length > 0 || postconditionFailed || isRestoreFailure(captureError)) {
+			try {
+				host.latchFault(
+					generation,
+					cleanupFailures[0] ?? captureError ?? new Error('visual capture postcondition failed'),
+				)
+			} catch {
+				// Restore failures remain fail-closed even if the host cannot persist the latch.
+			}
+			return errorResult(
+				'EVALUATION_RESTORE_FAILED',
+				'visual capture cleanup or postcondition verification failed; do not save and reopen the project',
+			)
+		}
+		if (captureError !== null) return caughtError(captureError, 'EVALUATION_FAILED')
+		try {
+			if (!Object.is(generation, host.getProjectGeneration())) {
+				return errorResult('EVALUATION_INPUT_STALE', 'project generation changed during visual capture')
+			}
+			if (host.isInputCurrent && !host.isInputCurrent(animation as Animation, input)) {
+				return errorResult('EVALUATION_INPUT_STALE', 'visual capture input changed during capture')
+			}
+		} catch (error) {
+			return caughtError(error, 'EVALUATION_INPUT_STALE')
+		}
+		return {
+			ok: true,
+			data: {
+				animation_uuid: validated.data.animation_uuid,
+				pose_mode: validated.data.pose_mode,
+				frame_indices: validated.data.frame_indices,
+				visited_frames: validated.data.frame_indices.length,
+			},
+		}
+	}
+
 	return Object.freeze({
 		version: INSPECTION_API_VERSION,
 		provider_id: INSPECTION_PROVIDER_ID,
@@ -514,6 +753,7 @@ export function createSpringBoneInspectionApi<Animation = unknown, State = unkno
 		limits: INSPECTION_LIMITS,
 		inspectAnimation,
 		evaluatePoseBatch,
+		visitPoseFrames,
 	})
 }
 
