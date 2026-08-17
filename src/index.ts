@@ -80,6 +80,7 @@ import {
 	installInspectionGlobal,
 	type InspectionHost,
 	type InspectionMode,
+	type InspectionPoseMode,
 	type InspectionRuntimeOwner,
 	type SpringEvaluationInputV1,
 	type InspectionPoseRead,
@@ -145,7 +146,7 @@ declare const window: {
 } | undefined
 
 const PLUGIN_ID = 'spring_bone'
-const PLUGIN_VERSION = '0.0.17'
+const PLUGIN_VERSION = '0.0.18'
 
 // name prefix `spring_` = **旧方式** (= v0.0.10 まで) の spring 化 truth。 現在の truth は
 // Group Property `spring_bone_enabled` (= enum 3 値) に移行済みで、 prefix は
@@ -2922,8 +2923,12 @@ const inspectionHost: InspectionHost<any, InspectionSceneState> = createInspecti
 	},
 	refreshPreview: () => { invalidatePreviewSession() },
 	suppressEffects: (animation) => suppressInspectionEffects(animation),
-	beginEvaluation: (animation) => {
+	beginEvaluation: (animation, poseMode: InspectionPoseMode = 'spring_evaluated_pose') => {
 		const input = makeInspectionEvaluationInput(animation)
+		if (poseMode === 'source_pose') {
+			inspectionContext = null
+			return
+		}
 		inspectionContext = makeExportAnimationContext(animation, BAKE_EXCLUDED_NODES, {
 			timing: {
 				renderSampleCount: input.timing.render_sample_count,
@@ -2936,7 +2941,11 @@ const inspectionHost: InspectionHost<any, InspectionSceneState> = createInspecti
 			evaluateInspectionSingleAnimation(animation, time)
 		})
 	},
-	evaluateFrame: (animation, _frameIndex, stepIndex) => {
+	evaluateFrame: (animation, _frameIndex, stepIndex, poseMode: InspectionPoseMode = 'spring_evaluated_pose') => {
+		if (poseMode === 'source_pose') {
+			evaluateInspectionSingleAnimation(animation, stepIndexToTime(stepIndex))
+			return
+		}
 		if (inspectionContext === null) throw new Error('inspection session not started')
 		evaluateInspectionFrame(
 			runtime,

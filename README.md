@@ -34,12 +34,13 @@ Personal-use plugin. Not distributed publicly. Issues / PRs may not be triaged.
 
 ## Inspection API
 
-Version 0.0.17 publishes a synchronous, read-only
+Version 0.0.18 publishes a synchronous, read-only
 `window.BlockbenchSpringBoneInspection` object on each plugin load. API version 1 exposes
-`inspectAnimation(animationUuid)` and `evaluatePoseBatch(request)` for the
-`aj_export_single_animation` basis. Requests are capped at 64 frames, 32 nodes, 512 pose
-samples, and 3,600 total Spring substeps; scene and editor state are restored before a result
-is returned.
+`inspectAnimation(animationUuid)`, `evaluatePoseBatch(request)`, and the synchronous
+`visitPoseFrames(request, visitor)` scene visitor for the `aj_export_single_animation` basis.
+The visitor supports `source_pose` and `spring_evaluated_pose`, and is capped at 64 ascending
+frames. Scene and editor state are restored before a result is returned; PNG, camera, and canvas
+composition remain the MCP adapter's responsibility.
 
 ## Roadmap
 

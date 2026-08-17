@@ -36,7 +36,7 @@ const input = (provenance = 'complete') => ({
 	evaluation_basis: 'aj_export_single_animation',
 	load_provenance: provenance,
 	project_uuid: 'project', provider_id: 'spring_bone', provider_api_version: 1,
-	provider_version: '0.0.17', simulation_version: 'spring-runtime-v1',
+	provider_version: '0.0.18', simulation_version: 'spring-runtime-v1',
 })
 
 function makeHost({
@@ -44,6 +44,7 @@ function makeHost({
 	mode = 'simulated',
 	owner = 'none',
 	fail = null,
+	modeSupported = true,
 	inputFactory = () => input(provenance),
 	} = {}) {
 	const calls = []
@@ -52,7 +53,7 @@ function makeHost({
 	let generation = 1
 	const animation = { uuid: 'anim' }
 	const host = {
-		provider_version: '0.0.17',
+		provider_version: '0.0.18',
 		simulation_version: 'spring-runtime-v1',
 		getProjectGeneration: () => generation,
 		getProjectUuid: () => 'project',
@@ -60,7 +61,7 @@ function makeHost({
 		getEvaluationInput: inputFactory,
 		getNodeUuids: () => ['node-b', 'node-a'],
 		getMode: () => mode,
-		isModeSupported: () => true,
+		isModeSupported: () => modeSupported,
 		getRuntimeOwner: () => currentOwner,
 		getRuntimeEvaluating: () => false,
 		acquireRuntimeOwner: () => {
@@ -83,8 +84,14 @@ function makeHost({
 		resumePreview: () => { calls.push('resume'); if (fail === 'resume') throw new Error('resume') },
 		refreshPreview: () => { calls.push('refresh'); if (fail === 'refresh') throw new Error('refresh') },
 		suppressEffects: () => { calls.push('suppress'); return () => { calls.push('effects-restore'); if (fail === 'effects') throw new Error('effects') } },
-		beginEvaluation: () => { calls.push('begin'); if (fail === 'begin') throw new Error('begin') },
-		evaluateFrame: (_animation, frame, step) => { calls.push(['frame', frame, step]); if (fail === 'evaluate') throw new Error('evaluate') },
+		beginEvaluation: (_animation, poseMode) => {
+			calls.push(poseMode === undefined ? 'begin' : ['begin', poseMode])
+			if (fail === 'begin') throw new Error('begin')
+		},
+			evaluateFrame: (_animation, frame, step, poseMode) => {
+				calls.push(poseMode === undefined ? ['frame', frame, step] : ['frame', frame, step, poseMode])
+				if (fail === 'evaluate') throw new Error('evaluate')
+			},
 		readPose: (uuid) => {
 			if (fail === 'read') throw new Error('read')
 			return { local_quaternion: { x: 0, y: 0, z: 0, w: 1 }, matrix_world: Array.from({ length: 16 }, (_, i) => i === 0 || i === 5 || i === 10 || i === 15 ? 1 : 0) }
@@ -298,7 +305,7 @@ test('inspection API exposes V1 identity, four limits, and canonical frame/node 
 	const { api, fixture } = apiFor()
 	assert.equal(api.version, 1)
 	assert.equal(api.provider_id, 'spring_bone')
-	assert.deepEqual(api.capabilities, { evaluate_pose_batch: 1 })
+	assert.deepEqual(api.capabilities, { evaluate_pose_batch: 1, capture_pose_frames: 1 })
 	assert.deepEqual(api.limits, INSPECTION_LIMITS)
 	const result = api.evaluatePoseBatch({
 		animation_uuid: 'anim', evaluation_basis: 'aj_export_single_animation',
@@ -314,6 +321,109 @@ test('inspection API exposes V1 identity, four limits, and canonical frame/node 
 	assert.deepEqual(fixture.calls.filter((call) => typeof call === 'string'), [
 		'acquire', 'capture', 'suppress', 'suspend', 'begin', 'end', 'effects-restore', 'restore', 'resume', 'release', 'refresh', 'verify',
 	])
+})
+
+test('capture visitor exposes both pose modes in ascending order and stays within 64 frames', () => {
+	for (const poseMode of ['source_pose', 'spring_evaluated_pose']) {
+		const { api, fixture } = apiFor()
+		const visited = []
+		const result = api.visitPoseFrames(
+			{ animation_uuid: 'anim', pose_mode: poseMode, frame_indices: [10, 0, 2] },
+			(frame) => { visited.push(frame) },
+		)
+		assert.equal(result.ok, true, poseMode)
+		assert.deepEqual(visited, [
+			{ frame_index: 0, time_seconds: 0 },
+			{ frame_index: 2, time_seconds: 0.1 },
+			{ frame_index: 10, time_seconds: 0.5 },
+		], poseMode)
+		assert.deepEqual(result.data, {
+			animation_uuid: 'anim',
+			pose_mode: poseMode,
+			frame_indices: [0, 2, 10],
+			visited_frames: 3,
+		}, poseMode)
+		assert.deepEqual(fixture.calls.filter((call) => Array.isArray(call) && call[0] === 'frame'), [
+			['frame', 0, 0, poseMode],
+			['frame', 2, 6, poseMode],
+			['frame', 10, 30, poseMode],
+		], poseMode)
+	}
+	const { api, fixture } = apiFor()
+	const tooMany = api.visitPoseFrames(
+		{ animation_uuid: 'anim', pose_mode: 'source_pose', frame_indices: Array.from({ length: 65 }, (_, i) => i) },
+		() => {},
+	)
+	assert.equal(tooMany.ok, false)
+	assert.equal(tooMany.error.code, 'EVALUATION_LIMIT_EXCEEDED')
+	assert.equal(fixture.calls.length, 0)
+})
+
+test('capture rejects unsupported mode and owner conflicts before mutation', () => {
+	const request = { animation_uuid: 'anim', pose_mode: 'source_pose', frame_indices: [0] }
+	for (const [options, code] of [
+		[{ modeSupported: false }, 'EVALUATION_MODE_UNSUPPORTED'],
+		[{ owner: 'aj_export' }, 'EVALUATION_RUNTIME_BUSY'],
+	]) {
+		const { api, fixture } = apiFor(options)
+		const result = api.visitPoseFrames(request, () => {})
+		assert.equal(result.ok, false, code)
+		assert.equal(result.error.code, code)
+		assert.equal(fixture.calls.length, 0, code)
+	}
+})
+
+test('capture rejects visitor throws and thenables after restoring the scene', () => {
+	for (const visitor of [
+		() => { throw new Error('visitor') },
+		() => Promise.resolve(),
+		() => Promise.reject(new Error('visitor rejection')),
+	]) {
+		const { api, fixture } = apiFor()
+		const result = api.visitPoseFrames(
+			{ animation_uuid: 'anim', pose_mode: 'spring_evaluated_pose', frame_indices: [0, 1] },
+			visitor,
+		)
+		assert.equal(result.ok, false)
+		assert.equal(result.error.code, 'EVALUATION_FAILED')
+		assert.equal(fixture.owner, 'none')
+		for (const cleanupCall of ['end', 'effects-restore', 'restore', 'resume', 'release', 'refresh', 'verify']) {
+			assert.ok(fixture.calls.includes(cleanupCall), cleanupCall)
+		}
+	}
+})
+
+test('capture rejects re-entry and faults only when restoration fails', () => {
+	const reentrant = apiFor()
+	let nested
+	const result = reentrant.api.visitPoseFrames(
+		{ animation_uuid: 'anim', pose_mode: 'source_pose', frame_indices: [0] },
+		() => {
+			nested = reentrant.api.visitPoseFrames(
+				{ animation_uuid: 'anim', pose_mode: 'source_pose', frame_indices: [0] },
+				() => {},
+			)
+		},
+	)
+	assert.equal(nested.error.code, 'EVALUATION_RUNTIME_BUSY')
+	assert.equal(result.ok, false)
+	assert.equal(result.error.code, 'EVALUATION_RUNTIME_BUSY')
+	assert.equal(reentrant.fixture.faulted, false)
+
+	const failed = apiFor({ fail: 'restore' })
+	const failedResult = failed.api.visitPoseFrames(
+		{ animation_uuid: 'anim', pose_mode: 'spring_evaluated_pose', frame_indices: [0] },
+		() => {},
+	)
+	assert.equal(failedResult.ok, false)
+	assert.equal(failedResult.error.code, 'EVALUATION_RESTORE_FAILED')
+	assert.equal(failed.fixture.faulted, true)
+	assert.equal(failed.fixture.owner, 'none')
+	const faultedResult = failed.api.visitPoseFrames(
+		{ animation_uuid: 'anim', pose_mode: 'spring_evaluated_pose', frame_indices: [0] },
+		() => {},
+	)
+	assert.equal(faultedResult.error.code, 'EVALUATION_RESTORE_FAILED')
 })
 
 test('inspection reports late-load provenance and refuses evaluation', () => {
