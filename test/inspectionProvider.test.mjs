@@ -225,18 +225,20 @@ test('project lifecycle keeps a fault across tab selection and clears it only on
 	assert.equal(lifecycle.loadObserved, false)
 })
 
-test('project lifecycle treats Blockbench undefined as no active project', () => {
-	const lifecycle = createInspectionProjectLifecycle()
+test('project lifecycle treats Blockbench no-project sentinels as no active project', () => {
+	for (const noProject of [undefined, 0]) {
+		const lifecycle = createInspectionProjectLifecycle()
 
-	lifecycle.beginPluginLoad(undefined)
-	assert.equal(lifecycle.generation, 1)
-	assert.equal(lifecycle.loadObserved, true)
-	assert.equal(lifecycle.fault, null)
+		lifecycle.beginPluginLoad(noProject)
+		assert.equal(lifecycle.generation, 1)
+		assert.equal(lifecycle.loadObserved, true)
+		assert.equal(lifecycle.fault, null)
 
-	lifecycle.observeProject(undefined, false)
-	assert.equal(lifecycle.generation, 2)
-	assert.equal(lifecycle.loadObserved, true)
-	assert.equal(lifecycle.fault, null)
+		lifecycle.observeProject(noProject, false)
+		assert.equal(lifecycle.generation, 2)
+		assert.equal(lifecycle.loadObserved, true)
+		assert.equal(lifecycle.fault, null)
+	}
 })
 
 test('effect suppression restores state and propagates restore and rollback failures', () => {
