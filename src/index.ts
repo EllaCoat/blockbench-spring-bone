@@ -146,7 +146,7 @@ declare const window: {
 } | undefined
 
 const PLUGIN_ID = 'spring_bone'
-const PLUGIN_VERSION = '0.0.18'
+const PLUGIN_VERSION = '0.0.19'
 
 // name prefix `spring_` = **旧方式** (= v0.0.10 まで) の spring 化 truth。 現在の truth は
 // Group Property `spring_bone_enabled` (= enum 3 値) に移行済みで、 prefix は
@@ -1744,18 +1744,7 @@ function composeSpringPose(
 	dt: number,
 	stepSim: boolean,
 	weight: number,
-	scratch: {
-		anchorWorld: any
-		boneAxisWorld: any
-		forward: any
-		parentQuat: any
-		parentInv: any
-		qBase: any
-		deltaP: any
-		identityQ: any
-		dAnimP: any
-		dSimP: any
-	},
+	scratch: ComposeScratch,
 ): void {
 	const mesh = entry.group?.mesh
 	const meshParent = mesh?.parent
@@ -1821,7 +1810,7 @@ function composeSpringPose(
 	mesh.updateMatrixWorld(true)
 }
 
-function makeComposeScratch(): {
+type ComposeScratch = {
 	anchorWorld: any
 	boneAxisWorld: any
 	forward: any
@@ -1832,8 +1821,13 @@ function makeComposeScratch(): {
 	identityQ: any
 	dAnimP: any
 	dSimP: any
-} {
-	return {
+}
+
+let composeScratch: ComposeScratch | null = null
+
+function makeComposeScratch(): ComposeScratch {
+	if (composeScratch !== null) return composeScratch
+	composeScratch = {
 		anchorWorld: new THREE.Vector3(),
 		boneAxisWorld: new THREE.Vector3(),
 		forward: new THREE.Vector3(),
@@ -1847,6 +1841,27 @@ function makeComposeScratch(): {
 		dAnimP: new THREE.Vector3(),
 		dSimP: new THREE.Vector3(),
 	}
+	return composeScratch
+}
+
+type ResetScratch = {
+	anchorWorld: any
+	boneAxisWorld: any
+	restTip: any
+	parentQuat: any
+}
+
+let resetScratch: ResetScratch | null = null
+
+function makeResetScratch(): ResetScratch {
+	if (resetScratch !== null) return resetScratch
+	resetScratch = {
+		anchorWorld: new THREE.Vector3(),
+		boneAxisWorld: new THREE.Vector3(),
+		restTip: new THREE.Vector3(),
+		parentQuat: new THREE.Quaternion(),
+	}
+	return resetScratch
 }
 
 // Phase 2 : chain 対応の逐次 topo 順 融合 pass。 stepAll + applyAll を 1 つに統合し、
@@ -1890,10 +1905,7 @@ function applyOnlyOrdered(weight: number): void {
 // rest 姿勢基準 = q_parentW × restLocalDir で restTip を計算。 own-rotation 独立化により
 // qBase は初期化から排除 (= scrub / replay 開始時の qBase 混入回避)。
 function resetAllToRest(): void {
-	const anchorWorld = new THREE.Vector3()
-	const boneAxisWorld = new THREE.Vector3()
-	const restTip = new THREE.Vector3()
-	const parentQuat = new THREE.Quaternion()
+	const scratch = makeResetScratch()
 	for (const uuid of topoOrder) {
 		const entry = registry.get(uuid)
 		// registry 全件 (= capable) を reset する。 Group 状態や animation override で
@@ -1903,14 +1915,14 @@ function resetAllToRest(): void {
 		const mesh = entry.group?.mesh
 		const meshParent = mesh?.parent
 		if (!mesh || !meshParent) continue
-		if (!getAnchorWorld(entry, anchorWorld)) continue
-		meshParent.getWorldQuaternion(parentQuat)
-		boneAxisWorld.copy(entry.geometry.restLocalDir).applyQuaternion(parentQuat)
+		if (!getAnchorWorld(entry, scratch.anchorWorld)) continue
+		meshParent.getWorldQuaternion(scratch.parentQuat)
+		scratch.boneAxisWorld.copy(entry.geometry.restLocalDir).applyQuaternion(scratch.parentQuat)
 		// restLength は effective (= config) から読む。 beginAnimation で resolveConfigs が
 		// 先に走るためここに来る時点では必ず最新の解決済み値 (= 後続の animation 単位
 		// override とも step が読む値と一致する)。
-		restTip.copy(anchorWorld).addScaledVector(boneAxisWorld, entry.config.restLength)
-		resetState(entry.state, restTip)
+		scratch.restTip.copy(scratch.anchorWorld).addScaledVector(scratch.boneAxisWorld, entry.config.restLength)
+		resetState(entry.state, scratch.restTip)
 	}
 }
 
@@ -2084,6 +2096,9 @@ function installTickLoop(): () => void {
 	// 直後の rescanRegistry が最新状態を作るので、 持ち越しの予約は捨てる (= reset は
 	// 予約された rescan を実行せずに落とす)。
 	exportGate.reset()
+	composeScratch = null
+	resetScratch = null
+	clearInspectionNodeCache()
 	rescanRegistry()
 	invalidatePreviewSession()
 	inhibitTick = false
@@ -2199,6 +2214,7 @@ function installTickLoop(): () => void {
 	// flag を見て即 return するため、 遅延中の評価は遮断される (= module スコープ側の
 	// projectSwitchPending コメント参照)。
 	const onProjectSwitch = (loadObserved = false): void => {
+		clearInspectionNodeCache()
 		if (loadObserved) {
 			const project = typeof Project === 'object' && Project !== null ? Project : null
 			// AJ's codec load can emit Blockbench's load_project and its own parsed
@@ -2320,6 +2336,9 @@ function installTickLoop(): () => void {
 		// export 中に unload されても flag を残さない (= 次の install / reload で preview が
 		// 止まったままになるのを防ぐ)。
 		exportGate.reset()
+		composeScratch = null
+		resetScratch = null
+		clearInspectionNodeCache()
 		Blockbench.removeListener?.('display_animation_frame', onAnimFrame)
 		Blockbench.removeListener?.('select_project', onProjectSelect)
 		Blockbench.removeListener?.('load_project', onProjectLoad)
@@ -2844,10 +2863,13 @@ function makeInspectionEvaluationInput(animation: any): SpringEvaluationInputV1 
 
 let inspectionContext: PreviewAnimationContext | null = null
 
+let inspectionAnimatableNodes: readonly unknown[] | null = null
+let inspectionNodeByUuid: Map<string, unknown> | null = null
+
 // AJ animationRenderer.getAnimatableNodes() の順序に寄せた、単独 animation 用の
 // node 列挙。Outliner.elements が公開されない旧 BB では Project の配列へフォールバックする。
 // Group.all / Project.elements の重複は identity で除去し、同じ node を二度評価しない。
-function getInspectionAnimatableNodes(): readonly unknown[] {
+function buildInspectionAnimatableNodes(): readonly unknown[] {
 	const nodes: any[] = []
 	const seen = new Set<any>()
 	const candidates = [
@@ -2862,6 +2884,34 @@ function getInspectionAnimatableNodes(): readonly unknown[] {
 		nodes.push(node)
 	}
 	return nodes
+}
+
+function getInspectionAnimatableNodes(): readonly unknown[] {
+	return inspectionAnimatableNodes ?? buildInspectionAnimatableNodes()
+}
+
+function beginInspectionNodeCache(): void {
+	const nodes = buildInspectionAnimatableNodes()
+	const byUuid = new Map<string, unknown>()
+	for (const node of nodes) {
+		const uuid = (node as { uuid?: unknown } | null)?.uuid
+		if (typeof uuid === 'string') byUuid.set(uuid, node)
+	}
+	inspectionAnimatableNodes = nodes
+	inspectionNodeByUuid = byUuid
+}
+
+function clearInspectionNodeCache(): void {
+	inspectionAnimatableNodes = null
+	inspectionNodeByUuid = null
+}
+
+function findInspectionNode(nodeUuid: string): unknown | null {
+	if (inspectionNodeByUuid !== null) return inspectionNodeByUuid.get(nodeUuid) ?? null
+	for (const node of buildInspectionAnimatableNodes()) {
+		if ((node as { uuid?: unknown } | null)?.uuid === nodeUuid) return node
+	}
+	return null
 }
 
 const evaluateInspectionSingleAnimation = createAjSingleAnimationEvaluator({
@@ -2924,22 +2974,30 @@ const inspectionHost: InspectionHost<any, InspectionSceneState> = createInspecti
 	refreshPreview: () => { invalidatePreviewSession() },
 	suppressEffects: (animation) => suppressInspectionEffects(animation),
 	beginEvaluation: (animation, poseMode: InspectionPoseMode = 'spring_evaluated_pose') => {
-		const input = makeInspectionEvaluationInput(animation)
-		if (poseMode === 'source_pose') {
+		clearInspectionNodeCache()
+		try {
+			beginInspectionNodeCache()
+			const input = makeInspectionEvaluationInput(animation)
+			if (poseMode === 'source_pose') {
+				inspectionContext = null
+				return
+			}
+			inspectionContext = makeExportAnimationContext(animation, BAKE_EXCLUDED_NODES, {
+				timing: {
+					renderSampleCount: input.timing.render_sample_count,
+					loopMode: input.timing.loop_mode,
+					loopDelayFrames: input.timing.loop_delay_frames,
+				},
+				requestedFadeFrames: input.timing.rest_fade_frames,
+			})
+			runtime.beginAnimation(inspectionContext, (time, _context) => {
+				evaluateInspectionSingleAnimation(animation, time)
+			})
+		} catch (error) {
 			inspectionContext = null
-			return
+			clearInspectionNodeCache()
+			throw error
 		}
-		inspectionContext = makeExportAnimationContext(animation, BAKE_EXCLUDED_NODES, {
-			timing: {
-				renderSampleCount: input.timing.render_sample_count,
-				loopMode: input.timing.loop_mode,
-				loopDelayFrames: input.timing.loop_delay_frames,
-			},
-			requestedFadeFrames: input.timing.rest_fade_frames,
-		})
-		runtime.beginAnimation(inspectionContext, (time, _context) => {
-			evaluateInspectionSingleAnimation(animation, time)
-		})
 	},
 	evaluateFrame: (animation, _frameIndex, stepIndex, poseMode: InspectionPoseMode = 'spring_evaluated_pose') => {
 		if (poseMode === 'source_pose') {
@@ -2955,10 +3013,7 @@ const inspectionHost: InspectionHost<any, InspectionSceneState> = createInspecti
 	},
 	readPose: (nodeUuid): InspectionPoseRead | null => {
 		const springGroup = registry.get(nodeUuid)?.group
-		const projectNode = [
-			...((Project as { groups?: unknown[] } | null)?.groups ?? []),
-			...((Project as { elements?: unknown[] } | null)?.elements ?? []),
-		].find((node) => (node as { uuid?: unknown } | null)?.uuid === nodeUuid) as { mesh?: any } | undefined
+		const projectNode = findInspectionNode(nodeUuid) as { mesh?: any } | null
 		const mesh = springGroup?.mesh ?? projectNode?.mesh
 		const matrix = mesh?.matrixWorld?.elements
 		const quaternion = mesh?.quaternion
@@ -2973,6 +3028,7 @@ const inspectionHost: InspectionHost<any, InspectionSceneState> = createInspecti
 			runtime.endAnimation()
 		} finally {
 			inspectionContext = null
+			clearInspectionNodeCache()
 		}
 	},
 	isInputCurrent: (animation, input) => {
@@ -2992,6 +3048,7 @@ function installInspectionProvider(): () => void {
 	return (): void => {
 		cleanup()
 		inspectionContext = null
+		clearInspectionNodeCache()
 	}
 }
 

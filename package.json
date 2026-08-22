@@ -1,6 +1,6 @@
 {
   "name": "blockbench-spring-bone",
-  "version": "0.0.18",
+  "version": "0.0.19",
   "private": false,
   "description": "Blockbench plugin: Spring bone physics simulation (Verlet integration + spring + damper) for hair / cloth / accessory bones. Real-time editor preview and AnimatedJava export bake.",
   "type": "module",
