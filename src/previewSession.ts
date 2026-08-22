@@ -53,9 +53,11 @@ export function createPreviewSession<C>(ops: PreviewSessionOps<C>): PreviewSessi
 				current.length === next.length &&
 				current.every((a, i) => a === next[i])
 			if (same) return
+			// 切り替え開始時に identity を落とす。 endAnimation / beginAnimation のどちらが
+			// throw しても inactive から再試行でき、失敗前の session を同一判定へ使わない。
+			previewSessionStack = null
+			previewSessionAnimation = null
 			ops.endAnimation()
-			// begin が throw した場合は state を更新しない (= 古い state が残るが、 そこへ来た
-			// 時点で同一判定は不成立と分かっているため、 次の ensure が必ず再試行する)。
 			ops.beginAnimation(context)
 			previewSessionStack = next
 			previewSessionAnimation = animation
