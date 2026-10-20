@@ -74,8 +74,6 @@ export function rescanRig(): void {
 	const present = new Set(capable.map((group) => group.uuid))
 	for (const uuid of [...bones.keys()]) if (!present.has(uuid)) bones.delete(uuid)
 	for (const group of capable) {
-		// 読み込みでは condition が偽の間に既定値が入らず、値の無い Property が残る。 値が無いまま Undo の控えを取ると
-		// 最初の変更を Undo しても戻らず、 element panel にも前に選んだ Group の値が残る。
 		for (const param of PARAMS) if (typeof group[param.property] !== 'number') group[param.property] = param.default
 		const { dir, length } = restGeometry(group)
 		const bone = bones.get(group.uuid)
