@@ -2,7 +2,7 @@
   "name": "blockbench-spring-bone",
   "version": "0.1.0",
   "private": false,
-  "description": "Blockbench plugin: spring bone physics (Verlet integration + spring + damper) for hair / cloth / accessory bones. Real-time editor preview and a bake into keyframes.",
+  "description": "Blockbench plugin: spring bone physics (Verlet integration + spring + damper) for hair / cloth / accessory bones. Real-time editor preview, baked into rigel-anim exports.",
   "type": "module",
   "packageManager": "pnpm@10.34.5",
   "scripts": {
