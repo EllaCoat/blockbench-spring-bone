@@ -27,26 +27,28 @@ export function refreshPreview(): void {
 
 export function installPreview(): () => void {
 	// keyframe を編集している間 (= Undo の編集中に keyframes がある) は値が毎フレーム変わり得るので、
-	// 毎回 step 0 からやり直す。 編集が終わった (Esc の取り消しを含む) ら 1 回描き直す。
+	// 毎回 step 0 からやり直す。 編集が終わった (Esc の取り消しを含む) 後の 1 回もやり直す。
 	let editing = false
 	// select_project と load_project は .bbmodel を読み終える前に来る。 Group ができるまで評価を止める。
 	let switching = false
 	let switchFrame: number | null = null
+	let springShown = false
 
+	const onDefaultPose = (): void => {
+		if (!isEvaluating()) springShown = false
+	}
 	const onFrame = (): void => {
-		if (isEvaluating() || switching) return
+		if (isEvaluating() || switching || springShown) return
 		try {
 			const active = Array.isArray(Undo.current_save?.aspects?.keyframes)
-			const ended = editing && !active
-			// refreshPreview の中の preview でこの関数へ戻ってくるので、 先に更新する。
+			if (active || editing) invalidate()
 			editing = active
-			if (active) invalidate()
-			else if (ended) refreshPreview()
 			if (!Modes.animate) {
 				invalidate()
 				return
 			}
 			evaluatePreview()
+			springShown = true
 		} catch (error) {
 			invalidate()
 			console.warn('[spring_bone] preview failed', error)
@@ -73,6 +75,7 @@ export function installPreview(): () => void {
 	}
 
 	const listeners: Array<[string, (event?: any) => void]> = [
+		['display_default_pose', onDefaultPose],
 		['display_animation_frame', onFrame],
 		['select_project', onProjectSwitch],
 		['load_project', onProjectSwitch],
