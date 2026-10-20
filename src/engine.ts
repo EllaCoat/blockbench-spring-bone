@@ -62,7 +62,6 @@ export function hasActiveBones(context: SpringContext): boolean {
 }
 
 function ensureSession(kind: string, context: SpringContext): void {
-	if (sessionKey === null) rescanRig()
 	const restWindow = context.restWindow ? `${context.restWindow.finalTick},${context.restWindow.fadeTicks}` : '-'
 	const overrides = overridesFingerprint(overridesOf(context.animation), [...rig.bones.keys()])
 	const key = [kind, rig.version, context.animation?.uuid ?? '-', context.stack.map((a) => a.uuid).join(','), restWindow, context.endTime ?? '-', overrides].join('|')
@@ -111,6 +110,7 @@ function previewContext(): SpringContext {
 
 // Blockbench が今の時刻の姿勢を当てた直後に呼ぶ。
 export function evaluatePreview(): void {
+	if (sessionKey === null) rescanRig()
 	const context = previewContext()
 	if (!hasActiveBones(context)) {
 		invalidate()
@@ -124,6 +124,7 @@ export function evaluatePreview(): void {
 // その tick の基底ポーズをここで当てる。
 export function evaluateAnimationTick(animation: any, tick: number, posed: boolean): void {
 	if (tick === 0) invalidate()
+	if (sessionKey === null) rescanRig()
 	const context = animationContext(animation)
 	if (!hasActiveBones(context)) return
 	ensureSession('animation', context)
@@ -134,5 +135,6 @@ export function evaluateAnimationTick(animation: any, tick: number, posed: boole
 // bake が対象を決めるため、 animation の設定で bone の enabled を解決する。
 export function beginAnimation(animation: any): void {
 	invalidate()
+	rescanRig()
 	ensureSession('animation', animationContext(animation))
 }
