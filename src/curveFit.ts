@@ -1,7 +1,7 @@
 // 物理シミュレーション結果 (= frame 単位の Euler 時系列) を、 Blockbench の bezier keyframe
 // 列へ落とすためのフィッティング層。
 //
-// この module は **Blockbench / THREE / AnimatedJava / window を実行時に一切参照しない**
+// この module は **Blockbench / THREE / window を実行時に一切参照しない**
 // (= node:test で BB 無しに検証可能)。 quaternion 演算だけは呼び出し側から ops として
 // 注入する (= THREE.Quaternion を直接触らないため)。
 //

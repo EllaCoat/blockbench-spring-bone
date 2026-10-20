@@ -57,7 +57,7 @@ class Vector3 {
 
 globalThis.THREE = { Vector3 }
 
-const { createState, resetState, step } = await import('../dist-test/springSim.mjs')
+const { createState, resetState, step } = await import('../dist-test/sim.mjs')
 
 const EPSILON = 1e-4
 

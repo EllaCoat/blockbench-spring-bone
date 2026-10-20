@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-const { normalizeOverrides, setOverrideField, clearOverrideField, overridesFingerprint } = await import('../dist-test/animOverrides.mjs')
+const { normalizeOverrides, setOverrideField, clearOverrideField, overridesFingerprint } = await import('../dist-test/overrides.mjs')
 
 // 正規化結果は prototype pollution 耐性のため null-prototype object (= Object.create(null))
 // で返る。 assert/strict の deepEqual は prototype も比較するため、 期待値 (= 通常の object

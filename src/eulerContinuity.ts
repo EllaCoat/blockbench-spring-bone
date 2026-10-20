@@ -1,6 +1,6 @@
 // quaternion から Euler (= degrees) へ変換した時系列を、 フィッティング前に連続化する。
 //
-// この module は **Blockbench / THREE / AnimatedJava / window を実行時に一切参照しない**
+// この module は **Blockbench / THREE / window を実行時に一切参照しない**
 // (= node:test で BB 無しに検証可能)。 入力は変換済みの Euler 系列だけを受け取る。
 //
 // なぜ必要か :
