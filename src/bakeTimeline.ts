@@ -1,71 +1,22 @@
-// spring 物理を timeline の bezier keyframe へ焼き付ける bake driver の純粋部分。
+// spring の揺れを bezier の keyframe に焼き込む bake の純粋な部分。 Blockbench には依存せず、
+// scene への作用 (= 物理の評価と bone の回転の読み取り) は BakeSceneOps で受け取る。
 //
-// この module は **Blockbench / THREE / AnimatedJava / window を実行時に一切参照しない**
-// (= node:test で BB 無しに検証可能)。 scene への作用 (= 物理 session の開始 / frame 評価 /
-// bone rotation の読み取り) はすべて呼び出し側 (= index.ts) が注入する BakeSceneOps 経由で行う。
-//
-// bake の流れ :
-//   1. 物理 session を張る (= scene.beginSession)
-//   2. 20fps 格子の frame ごとに評価し、 bone ごとの合成後 rotation を **絶対 Euler**
-//      (= degrees) で収集する (= scene.evaluateFrame → scene.readRotationDeg)
-//   3. continuifyEulerSeries で Euler 表現の飛びを潰す (= 偽の急変で keyframe が増えるのを防ぐ)
-//   4. fitSharedKnots で 3 軸共有 knot の bezier に落とす
-//   5. BB の keyframe data 配列を組み立てる。 **rest (= fix_rotation) の減算はここで初めて行う**
-//
-// **収集からフィッティングまでを絶対 Euler で通すのは意図的** : rest を引いた空間では
-// Euler 連続化の双対解の関係式 (= x+180, 180−y, z+180) も、 姿勢の geodesic 誤差も成立しない。
-// bezier は値方向の平行移動に対して不変 (= knot 値を一律にずらすと曲線全体が同じだけ動き
-// handle は変わらない) なので、 最後に rest を引いても曲線の形は完全に保たれる。
-//
-// **元 animation は一切変更しない** : 出来上がった keyframe は派生 animation
-// (= applyBakedCurvesToAnimationData で作る data) 側にだけ載る。 unbake = 派生 animation の削除。
+// 流れ: tick ごとに評価して bone の回転を絶対 Euler で集める → Euler の表現の飛びを潰す →
+// 3 軸で knot を共有する bezier に当てはめる → rest の回転を引いて keyframe にする。
+// rest を最後に引くのは、 Euler の双対解の関係式も姿勢の誤差も絶対 Euler の空間でしか成り立たないため
+// (= bezier は値の平行移動で形が変わらない)。
 
-import { EXPORT_FRAMES_PER_SECOND } from './springRuntime'
 import { continuifyEulerSeries } from './eulerContinuity'
 import { fitSharedKnots, type AxisTriple, type QuaternionOps } from './curveFit'
+import { TICKS_PER_SECOND } from './restWindow'
 
-// --- 派生 animation に載せる Animation Property の key ---
-// stale 検出 (= 元 animation や物理パラが変わった後の再 bake 促し) の UI は今回のスコープ外で、
-// 記録だけ行う。 値は「bake した瞬間の入力」 を表す。
-export const ANIM_BAKED_FROM_KEY = 'spring_bone_baked_from'
-export const ANIM_BAKED_PARAM_HASH_KEY = 'spring_bone_baked_param_hash'
-export const ANIM_BAKED_SOURCE_HASH_KEY = 'spring_bone_baked_source_hash'
-export const ANIM_BAKED_VERSION_KEY = 'spring_bone_baked_version'
+// 派生 animation に元の animation の uuid を記録する Property。
+export const BAKED_FROM_PROPERTY = 'spring_bone_baked_from'
 
-// bake の出力形式 version。 keyframe の作り方 (= handle の意味 / 収集する量) を変えたら上げる。
-export const BAKE_VERSION = 1
-
-// bake が作った派生 animation かどうかの **唯一の判定**。 メタデータを書くのがこの module
-// なので、 読む側もここに置く (= key の解釈が 2 箇所に分裂しないようにする)。
-// 派生 animation の rotation keyframe には「base pose + 物理 Δ」 が既に焼き込まれているため、
-// これを再生する間は物理を止めないと Δ が二重に載る。
+// 派生 animation の keyframe には揺れが焼き込まれているので、 再生中は物理を掛けない (= 二重に載る)。
 export function isBakedAnimation(animation: unknown): boolean {
-	const from = (animation as Record<string, unknown> | null)?.[ANIM_BAKED_FROM_KEY]
+	const from = (animation as Record<string, unknown> | null)?.[BAKED_FROM_PROPERTY]
 	return typeof from === 'string' && from.length > 0
-}
-
-// 物理の抑制判定に使う context の最小形 (= PreviewAnimationContext が構造的に満たす)。
-export interface BakedAnimationContextLike {
-	animation: unknown
-	animationStack?: readonly unknown[]
-}
-
-// この context で物理を止めるべきか。 **判定は必ずこの関数を通す** :
-// preview (= tick 入口) と export / bake (= effective の解決) の両方が同じ判定を共有しないと、
-// 片方の経路だけ抜けて Δ が二重に載る。
-//
-// **animation だけでなく animationStack も見る** : animation 未選択のまま複数 animation を
-// 再生している場合 (= makePreviewAnimationContext の playing filter 経路) は context.animation が
-// null のままで、 baked animation は stack 側にしか現れない。 animation だけを見ていると
-// この経路で抑制が丸ごと外れる。
-export function isBakedAnimationContext(context: BakedAnimationContextLike): boolean {
-	if (isBakedAnimation(context.animation)) return true
-	const stack = context.animationStack
-	if (!Array.isArray(stack)) return false
-	for (const entry of stack) {
-		if (isBakedAnimation(entry)) return true
-	}
-	return false
 }
 
 // フィッティングの既定閾値 (= 合成姿勢の角度差、 degrees)。 spike の実測で
@@ -109,7 +60,7 @@ export interface BakeSceneOps {
 }
 
 export interface BakeOptions<Q> extends QuaternionOps<Q> {
-	// 評価する frame 数 (= 20fps 格子の sample 数、 export の renderSampleCount と同じ)
+	// 評価する frame 数 (= tick 0 から最後の tick まで)
 	frameCount: number
 	// フィッティングの角度閾値 (= 省略時 DEFAULT_BAKE_MAX_ANGLE_DEG)
 	maxAngleDeg?: number
@@ -200,7 +151,7 @@ export function bakeSpringRotations<Q>(scene: BakeSceneOps, options: BakeOptions
 	if (!Number.isSafeInteger(frameCount) || frameCount < 1) {
 		throw new RangeError(`bakeSpringRotations: frameCount must be a positive safe integer, got ${frameCount}`)
 	}
-	const fps = EXPORT_FRAMES_PER_SECOND
+	const fps = TICKS_PER_SECOND
 	const durationSeconds = (frameCount - 1) / fps
 
 	const times = new Array<number>(frameCount)
@@ -374,21 +325,4 @@ export function applyBakedCurvesToAnimationData(
 	}
 
 	return data
-}
-
-// --- 決定的な fingerprint ---
-
-// bake 時の入力を記録するための短い hash。 JSON.stringify した値の FNV-1a 32bit を
-// 8 桁の hex にする。 **暗号用途ではない** : 「入力が変わったか」 の検出だけに使う。
-// JSON.stringify の key 順は insertion 順なので、 呼び出し側が uuid 昇順など
-// 決定的な順序で配列を作って渡すこと (= object の key 順に依存させない)。
-export function hashFingerprint(value: unknown): string {
-	const text = JSON.stringify(value) ?? 'undefined'
-	let hash = 0x811c9dc5
-	for (let i = 0; i < text.length; i++) {
-		hash ^= text.charCodeAt(i)
-		// FNV prime 16777619 の乗算を 32bit で回す (= Math.imul で桁溢れを切る)
-		hash = Math.imul(hash, 0x01000193)
-	}
-	return (hash >>> 0).toString(16).padStart(8, '0')
 }

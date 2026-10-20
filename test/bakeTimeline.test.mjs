@@ -8,7 +8,7 @@ const {
 	BAKE_VERSION,
 	DEFAULT_BAKE_MAX_ANGLE_DEG,
 	BAKE_DENSITY_WARN_KF_PER_SECOND,
-	ANIM_BAKED_FROM_KEY,
+	BAKED_FROM_PROPERTY,
 	isBakedAnimation,
 	isBakedAnimationContext,
 } = await import('../dist-test/bakeTimeline.mjs')
@@ -87,21 +87,20 @@ function sampleBakedValue(keyframes, time, axis) {
 
 // --- 定数 ---
 
-test('bake 定数 : version / 既定閾値 / 密度警告の値', () => {
-	assert.equal(BAKE_VERSION, 1)
+test('bake 定数 : 既定閾値 / 密度警告の値', () => {
 	assert.equal(DEFAULT_BAKE_MAX_ANGLE_DEG, 0.5)
 	assert.equal(BAKE_DENSITY_WARN_KF_PER_SECOND, 8)
-	assert.equal(ANIM_BAKED_FROM_KEY, 'spring_bone_baked_from')
+	assert.equal(BAKED_FROM_PROPERTY, 'spring_bone_baked_from')
 })
 
 // --- bake 由来 animation の判定 (= 物理の二重適用防止) ---
 
 function baked(uuid = 'source-uuid') {
-	return { uuid: 'baked', [ANIM_BAKED_FROM_KEY]: uuid }
+	return { uuid: 'baked', [BAKED_FROM_PROPERTY]: uuid }
 }
 
 function plain(name = 'walk') {
-	return { uuid: 'plain', name, [ANIM_BAKED_FROM_KEY]: '' }
+	return { uuid: 'plain', name, [BAKED_FROM_PROPERTY]: '' }
 }
 
 test('isBakedAnimation: baked_from が非空文字なら bake 由来', () => {
@@ -112,33 +111,7 @@ test('isBakedAnimation: baked_from が非空文字なら bake 由来', () => {
 	assert.equal(isBakedAnimation(null), false)
 	assert.equal(isBakedAnimation(undefined), false)
 	// 文字列以外は印として扱わない
-	assert.equal(isBakedAnimation({ [ANIM_BAKED_FROM_KEY]: 1 }), false)
-})
-
-test('isBakedAnimationContext: 選択中 animation が bake 由来なら抑制', () => {
-	assert.equal(isBakedAnimationContext({ animation: baked(), animationStack: [baked()] }), true)
-	assert.equal(isBakedAnimationContext({ animation: plain(), animationStack: [plain()] }), false)
-})
-
-test('isBakedAnimationContext: 複数 animation 再生 (= animation 未選択) でも stack から検出する', () => {
-	// animation 未選択のまま複数再生している状況 : context.animation は null のままで、
-	// baked animation は animationStack にしか現れない
-	const context = { animation: null, animationStack: [plain('walk'), baked(), plain('idle')] }
-
-	assert.equal(isBakedAnimationContext(context), true)
-})
-
-test('isBakedAnimationContext: stack に bake 由来が無ければ抑制しない', () => {
-	const context = { animation: null, animationStack: [plain('walk'), plain('idle')] }
-
-	assert.equal(isBakedAnimationContext(context), false)
-	assert.equal(isBakedAnimationContext({ animation: null, animationStack: [] }), false)
-})
-
-test('isBakedAnimationContext: animationStack が無い context でも animation で判定する', () => {
-	assert.equal(isBakedAnimationContext({ animation: baked() }), true)
-	assert.equal(isBakedAnimationContext({ animation: plain() }), false)
-	assert.equal(isBakedAnimationContext({ animation: null }), false)
+	assert.equal(isBakedAnimation({ [BAKED_FROM_PROPERTY]: 1 }), false)
 })
 
 // --- session の契約 ---
@@ -549,22 +522,4 @@ test('applyBakedCurvesToAnimationData: animators を持たない data でも動�
 
 	assert.equal(data.name, 'empty')
 	assert.equal(data.animators['bone-a'].keyframes.length, 1)
-})
-
-// --- fingerprint ---
-
-test('hashFingerprint: 同じ入力は同じ hash、違えば変わる', () => {
-	const a = hashFingerprint([{ uuid: 'a', drag: 0.05 }])
-	const b = hashFingerprint([{ uuid: 'a', drag: 0.05 }])
-	const c = hashFingerprint([{ uuid: 'a', drag: 0.06 }])
-
-	assert.equal(a, b)
-	assert.notEqual(a, c)
-	assert.match(a, /^[0-9a-f]{8}$/)
-	assert.match(c, /^[0-9a-f]{8}$/)
-})
-
-test('hashFingerprint: undefined でも落ちない', () => {
-	assert.match(hashFingerprint(undefined), /^[0-9a-f]{8}$/)
-	assert.match(hashFingerprint(null), /^[0-9a-f]{8}$/)
 })

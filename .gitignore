@@ -2,4 +2,6 @@ node_modules/
 dist/
 dist-test/
 docs/
+.test-logs/
 *.log
+spring_bone.js

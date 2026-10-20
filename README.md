@@ -2,54 +2,49 @@
 
 Blockbench plugin: Spring bone physics simulation for hair / cloth / accessory bones.
 
-Provides real-time preview of secondary motion (= hair / cloak / chain / accessory bones
-following a parent bone via spring + damper physics) directly in the Blockbench editor,
-and bakes the simulation result into the AnimatedJava export pipeline so the motion
-shows up in-game on Minecraft Java Edition (= datapack).
+Adds secondary motion (hair / cloak / chain / accessory bones following their parent through spring + damper
+physics) to the animation preview in the Blockbench editor, and to the poses
+[rigel-anim](https://github.com/EllaCoat/rigel-anim) exports, so the motion shows up in Minecraft Java Edition.
 
 ## Status
 
 Personal-use plugin. Not distributed publicly. Issues / PRs may not be triaged.
 
+## Usage
+
+- Right-click a group in the Outliner and choose **Spring 化** (or **Spring 化 (子孫含む)** for the group and all
+  groups below it). **Spring 解除** turns it off again. Spring groups are tinted in the Outliner. Group names are
+  never changed.
+- In animate mode, the **Spring Bone** panel edits the selected bone's parameters, and with an animation selected:
+  - **In this animation** (継承 / 有効 / 無効) turns the bone's spring on or off for that animation only.
+  - **Override** makes a parameter slider write to the selected animation instead of the group.
+  - **Rest fade (ticks)** sets how many ticks before the end of the animation the spring motion fades out, so the
+    last tick shows the keyframed pose and loops and animation changes do not jump.
+- In edit mode the parameters are in the element panel.
+- With rigel-anim installed, exporting a Rigel project includes the spring motion. Nothing needs to be set up.
+- Right-click an animation and choose **Spring を bake (派生 animation)** to write the motion into keyframes of a new
+  animation `<name>_baked`. The original animation is not changed, and the plugin does not add the spring again
+  when the baked animation plays.
+
 ## Approach
 
-- **Verlet integration** + spring + damper, fixed dt with sub-stepping for stability
-- Chain solving: root → leaf order, supports parent → child → grandchild bone trees
+- **Verlet integration** + spring + damper on a fixed 1/60 s step (three steps per Minecraft tick).
+- The pose at a time is the result of stepping from the start of the animation, so it does not depend on how the
+  timeline was scrubbed.
+- Chain solving: root → leaf order. A bone points at its first child group's pivot; a bone without one points up.
 - Per-bone parameters:
-  - `drag` — inertia decay factor between sub-steps
-  - `stiffness` — force coefficient toward the rest direction (= parent bone orientation)
-  - `gravity` — force coefficient in world -Y
-  - `restLength` — distance from anchor to virtual tip. Auto-computed from the first
-    child group's origin; not directly editable at the moment
-- Per-animation overrides: each animation can override `enabled` / `drag` / `stiffness` /
-  `gravity` per bone. Resolution order is animation override → Group property default →
-  plugin default, per field. Overrides are stored on the animation as
-  `spring_bone_overrides` (= a record keyed by bone UUID) and travel with the `.bbmodel`
-  file. In animate mode, the Spring Bone panel edits the shared Group defaults; while an
-  animation is selected, an "In this animation" selector (継承 / 有効 / 無効) and per-field
-  override checkboxes appear, and dragging a slider with its override checkbox on writes
-  to the selected animation instead of the Group default
-- AnimatedJava integration: bake simulated transforms into the export pipeline so the
-  motion is reproducible in-game
+  - `drag` — inertia decay between steps
+  - `stiffness` — force toward the rest direction (the parent bone's orientation)
+  - `gravity` — force toward world -Y
+- Per-animation overrides of `enabled` / `drag` / `stiffness` / `gravity`, per bone. Each field resolves as
+  animation override → group value → plugin default. Overrides are stored on the animation as
+  `spring_bone_overrides` (a record keyed by bone UUID) and travel with the `.bbmodel` file.
 
-## Inspection API
+## rigel-anim
 
-Version 0.0.18 publishes a synchronous, read-only
-`window.BlockbenchSpringBoneInspection` object on each plugin load. API version 1 exposes
-`inspectAnimation(animationUuid)`, `evaluatePoseBatch(request)`, and the synchronous
-`visitPoseFrames(request, visitor)` scene visitor for the `aj_export_single_animation` basis.
-The visitor supports `source_pose` and `spring_evaluated_pose`, and is capped at 64 ascending
-frames. Scene and editor state are restored before a result is returned; PNG, camera, and canvas
-composition remain the MCP adapter's responsibility.
-
-## Roadmap
-
-- Phase 0 — plugin skeleton + Blockbench load
-- Phase 1 — single bone PoC (Verlet + spring + damper, real-time preview)
-- Phase 2 — chain support (gravity / drag, root → leaf solving)
-- Phase 3 — editor UI (Outliner toggle, Property panel, reset action)
-- Phase 5 — AnimatedJava export bake
-- Future — Cloth simulation (= mass-spring grid with distance constraints)
+rigel-anim dispatches the Blockbench event `rigel_export_pose` with `{ animation, tick }` after it poses each tick
+of an export, before it reads the bones. This plugin adds the spring motion there, using the same tick count and
+end fade as the preview. An error while evaluating the spring stops the export.
 
 ## Build
 
@@ -57,14 +52,17 @@ composition remain the MCP adapter's responsibility.
 pnpm install
 pnpm build       # production build (minified)
 pnpm dev         # dev build with inline sourcemap
+pnpm typecheck
+pnpm test
 ```
 
 Output: `dist/spring_bone.js`
 
 ## Compatibility
 
-- Designed for the AnimatedJava (TSB fork) workflow on Blockbench 5.x (desktop variant).
-- No project-format gate; activates on any project that exposes the animator panel.
+- Blockbench 5.x (desktop).
+- No project-format gate: the preview and bake work in any project with animation mode. Only rigel-anim exports
+  include the motion; other exporters do not (bake the animation for them).
 
 ## License
 
