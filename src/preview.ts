@@ -32,13 +32,8 @@ export function installPreview(): () => void {
 	// select_project と load_project は .bbmodel を読み終える前に来る。 Group ができるまで評価を止める。
 	let switching = false
 	let switchFrame: number | null = null
-	let springShown = false
-
-	const onDefaultPose = (): void => {
-		if (!isEvaluating()) springShown = false
-	}
 	const onFrame = (): void => {
-		if (isEvaluating() || switching || springShown) return
+		if (isEvaluating() || switching) return
 		try {
 			const active = Array.isArray(Undo.current_save?.aspects?.keyframes)
 			if (active || editing) invalidate()
@@ -48,7 +43,6 @@ export function installPreview(): () => void {
 				return
 			}
 			evaluatePreview()
-			springShown = true
 		} catch (error) {
 			invalidate()
 			console.warn('[spring_bone] preview failed', error)
@@ -75,7 +69,6 @@ export function installPreview(): () => void {
 	}
 
 	const listeners: Array<[string, (event?: any) => void]> = [
-		['display_default_pose', onDefaultPose],
 		['display_animation_frame', onFrame],
 		['select_project', onProjectSwitch],
 		['load_project', onProjectSwitch],

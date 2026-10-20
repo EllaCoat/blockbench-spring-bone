@@ -107,8 +107,24 @@ export function stepAndApply(dt: number, weight: number): void {
 	for (const bone of rig.ordered) if (bone.enabled) composeBone(bone, dt, true, weight)
 }
 
+const shown = new Map<any, { before: number[]; after: number[] }>()
+
 export function applyOnly(weight: number): void {
-	for (const bone of rig.ordered) if (bone.enabled && bone.state.initialized) composeBone(bone, 0, false, weight)
+	shown.clear()
+	for (const bone of rig.ordered) {
+		const mesh = bone.group.mesh
+		if (!bone.enabled || !bone.state.initialized || !mesh) continue
+		const before = mesh.quaternion.toArray()
+		composeBone(bone, 0, false, weight)
+		shown.set(mesh, { before, after: mesh.quaternion.toArray() })
+	}
+}
+
+export function takeOffShownSpring(): void {
+	for (const [mesh, { before, after }] of shown) {
+		if (mesh.quaternion.toArray().every((value: number, i: number) => value === after[i])) mesh.quaternion.fromArray(before)
+	}
+	shown.clear()
 }
 
 // 物理を掛けない bone も含めて先端を静止位置へ置く。 無効の間の慣性が、 有効に戻した瞬間に出ないようにする。

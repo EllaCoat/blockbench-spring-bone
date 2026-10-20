@@ -5,7 +5,7 @@ import { mkdirSync, readdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import esbuild from 'esbuild'
 
-const MODULES = ['config', 'overrides', 'sim', 'restWindow', 'runtime', 'rig', 'bakeTimeline', 'curveFit', 'eulerContinuity']
+const MODULES = ['config', 'overrides', 'sim', 'restWindow', 'runtime', 'rig', 'engine', 'bakeTimeline', 'curveFit', 'eulerContinuity']
 const LOG_DIR = '.test-logs'
 const LOG = join(LOG_DIR, 'test.log')
 const MAX_FAILURE_LINES = 200

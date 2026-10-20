@@ -3,7 +3,7 @@
 import { isBakedAnimation } from './bakeTimeline'
 import { paramsOf, resolveEffective, resolveEnabled, stateOf } from './config'
 import { overridesFingerprint } from './overrides'
-import { applyBasePose, applyOnly, capturePose, resetAllToRest, restorePose, stepAndApply, type PoseSnapshot } from './pose'
+import { applyBasePose, applyOnly, capturePose, resetAllToRest, restorePose, stepAndApply, takeOffShownSpring, type PoseSnapshot } from './pose'
 import { overridesOf, restFadeOf } from './properties'
 import { restWindowOf, SUBSTEPS_PER_TICK, TICKS_PER_SECOND, type RestWindow } from './restWindow'
 import { rescanRig, rig } from './rig'
@@ -117,6 +117,7 @@ export function evaluatePreview(): void {
 		return
 	}
 	ensureSession('preview', context)
+	takeOffShownSpring()
 	runtime.evaluateSample(Number.isFinite(Timeline.time) ? Timeline.time : 0)
 }
 

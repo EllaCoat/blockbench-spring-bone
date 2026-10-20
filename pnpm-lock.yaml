@@ -11,6 +11,9 @@ importers:
       esbuild:
         specifier: ^0.21.5
         version: 0.21.5
+      three:
+        specifier: 0.129.0
+        version: 0.129.0
       typescript:
         specifier: ^5.9.3
         version: 5.9.3
@@ -160,6 +163,9 @@ packages:
     engines: {node: '>=12'}
     hasBin: true
 
+  three@0.129.0:
+    resolution: {integrity: sha512-wiWio1yVRg2Oj6WEWsTHQo5eSzYpEwSBtPSi3OofNpvFbf26HFfb9kw4FZJNjII4qxzp0b1xLB11+tKkBGB1ZA==}
+
   typescript@5.9.3:
     resolution: {integrity: sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==}
     engines: {node: '>=14.17'}
@@ -261,5 +267,7 @@ snapshots:
       '@esbuild/win32-arm64': 0.21.5
       '@esbuild/win32-ia32': 0.21.5
       '@esbuild/win32-x64': 0.21.5
+
+  three@0.129.0: {}
 
   typescript@5.9.3: {}
